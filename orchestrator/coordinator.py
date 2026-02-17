@@ -1,18 +1,32 @@
 """
 Coordinator — the central orchestrator for the News Trading System.
 
-The Coordinator wires together all data sources, agents, and storage into a
-single, reproducible analysis pipeline:
+Single-agent pipeline (unchanged, backward-compatible):
 
-    1. NewsFeed     → fetch headlines for a ticker
-    2. MarketData   → fetch current price and fundamentals (optional context)
+    1. NewsFeed       → fetch headlines for a ticker
+    2. MarketData     → fetch current price and fundamentals
     3. SentimentAgent → score each headline via Claude
-    4. Aggregate scores → compute average sentiment score
-    5. Signal       → map average score to BUY / SELL / HOLD
-    6. Database     → persist the run and every individual score
+    4. Aggregate      → compute average sentiment score → BUY / SELL / HOLD
+    5. Database       → persist run + headline scores
 
-The coordinator owns no business logic itself; it delegates to its
-collaborators and assembles their outputs into a structured report dict.
+Combined pipeline (run_combined):
+
+    1–5 above (sentiment)
+    6. TechnicalAgent → RSI, MACD, Bollinger, SMA → BUY / SELL / HOLD
+    7. Fusion         → combine both signals into STRONG BUY / WEAK SELL / etc.
+    8. Database       → persist to combined_signals table
+
+Signal fusion matrix
+--------------------
+Sentiment  Technical  Combined
+─────────  ─────────  ─────────────
+BUY        BUY        STRONG BUY
+SELL       SELL       STRONG SELL
+BUY        HOLD       WEAK BUY
+SELL       HOLD       WEAK SELL
+BUY        SELL       CONFLICTING
+SELL       BUY        CONFLICTING
+HOLD       *          HOLD
 """
 
 from __future__ import annotations
@@ -20,10 +34,24 @@ from __future__ import annotations
 import json
 
 from agents.sentiment_agent import SentimentAgent
+from agents.technical_agent import TechnicalAgent
 from config.settings import BUY_THRESHOLD, SELL_THRESHOLD
 from data.market_data import MarketData
 from data.news_feed import NewsFeed
 from storage.database import Database
+
+# Maps (sentiment_signal, technical_signal) → combined label
+_FUSION_TABLE: dict[tuple[str, str], str] = {
+    ("BUY",  "BUY"):  "STRONG BUY",
+    ("SELL", "SELL"): "STRONG SELL",
+    ("BUY",  "HOLD"): "WEAK BUY",
+    ("SELL", "HOLD"): "WEAK SELL",
+    ("BUY",  "SELL"): "CONFLICTING",
+    ("SELL", "BUY"):  "CONFLICTING",
+    ("HOLD", "BUY"):  "HOLD",
+    ("HOLD", "SELL"): "HOLD",
+    ("HOLD", "HOLD"): "HOLD",
+}
 
 
 class Coordinator:
@@ -31,18 +59,23 @@ class Coordinator:
     Orchestrates agents and data sources to produce a trading signal.
 
     Args:
-        news_feed:       NewsFeed instance. Created automatically if omitted.
-        market_data:     MarketData instance. Created automatically if omitted.
-        sentiment_agent: SentimentAgent instance. Created automatically if omitted.
-        db:              Database instance. Created automatically if omitted.
+        news_feed:        NewsFeed instance.  Created automatically if omitted.
+        market_data:      MarketData instance. Created automatically if omitted.
+        sentiment_agent:  SentimentAgent.      Created automatically if omitted.
+        technical_agent:  TechnicalAgent.      Created automatically if omitted.
+        db:               Database.            Created automatically if omitted.
 
-    All collaborators accept constructor injection so they can be replaced
-    with test doubles in unit tests without touching application code.
+    All collaborators accept constructor injection for testing.
 
-    Example::
+    Examples::
 
+        # Combined (default) mode
+        report = Coordinator().run_combined("AAPL")
+        print(report["combined_signal"])  # "STRONG BUY", "WEAK SELL", ...
+
+        # Sentiment only (backward-compatible)
         report = Coordinator().run("AAPL")
-        print(report["signal"])  # "BUY" | "SELL" | "HOLD"
+        print(report["signal"])           # "BUY" | "SELL" | "HOLD"
     """
 
     def __init__(
@@ -50,12 +83,15 @@ class Coordinator:
         news_feed: NewsFeed | None = None,
         market_data: MarketData | None = None,
         sentiment_agent: SentimentAgent | None = None,
+        technical_agent: TechnicalAgent | None = None,
         db: Database | None = None,
     ) -> None:
+        self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
         self.market_data = market_data or MarketData()
         self.sentiment_agent = sentiment_agent or SentimentAgent()
-        self.db = db or Database()
+        # Share the same DB instance so both agents write to the same file
+        self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -76,31 +112,72 @@ class Coordinator:
         return "HOLD"
 
     # ------------------------------------------------------------------
+    # Signal fusion (static — easily unit-testable)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def combine_signals(sentiment_signal: str, technical_signal: str) -> str:
+        """
+        Fuse sentiment and technical signals into a combined label.
+
+        Args:
+            sentiment_signal: "BUY" | "SELL" | "HOLD"
+            technical_signal: "BUY" | "SELL" | "HOLD"
+
+        Returns:
+            One of: STRONG BUY, STRONG SELL, WEAK BUY, WEAK SELL,
+                    CONFLICTING, HOLD
+        """
+        return _FUSION_TABLE.get((sentiment_signal, technical_signal), "HOLD")
+
+    @staticmethod
+    def confidence(combined_signal: str, avg_score: float) -> float:
+        """
+        Compute a confidence score (0.0–1.0) for the combined signal.
+
+        STRONG signals scale with |avg_score| in the upper half [0.6, 1.0].
+        WEAK signals scale with |avg_score| in the lower half [0.0, 0.6].
+        CONFLICTING is fixed at 0.10 (agents actively disagree).
+        HOLD is fixed at 0.25 (no directional conviction).
+
+        Args:
+            combined_signal: Output of combine_signals().
+            avg_score:       Raw sentiment average (−1.0 to +1.0).
+
+        Returns:
+            Confidence float rounded to two decimal places.
+        """
+        strength = abs(avg_score)  # 0.0 – 1.0
+        if combined_signal in ("STRONG BUY", "STRONG SELL"):
+            return round(min(1.0, 0.6 + strength * 0.4), 2)
+        if combined_signal in ("WEAK BUY", "WEAK SELL"):
+            return round(min(0.6, 0.2 + strength * 0.4), 2)
+        if combined_signal == "CONFLICTING":
+            return 0.10
+        return 0.25  # HOLD
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def run(self, ticker: str, verbose: bool = True) -> dict:
         """
-        Execute the full analysis pipeline for *ticker*.
+        Execute the sentiment-only pipeline for *ticker*.
+
+        Unchanged from the original implementation — fully backward-compatible.
 
         Args:
             ticker:  Stock ticker symbol (e.g. "AAPL").
             verbose: When True, print step-by-step progress to stdout.
 
         Returns:
-            dict with keys:
-                ticker             (str):   The analysed ticker.
-                market             (dict):  Output of MarketData.fetch().
-                headlines_fetched  (int):   Raw count from NewsFeed.
-                scored             (list):  List of per-headline score dicts.
-                avg_score          (float): Aggregated sentiment score.
-                signal             (str):   BUY / SELL / HOLD.
-                run_id             (int):   Database primary key for this run.
+            dict with keys: ticker, market, headlines_fetched, scored,
+                            avg_score, signal, run_id
         """
         ticker = ticker.upper()
 
         # Step 1 — market context
-        market = {}
+        market: dict = {}
         try:
             market = self.market_data.fetch(ticker)
             if verbose and market.get("price"):
@@ -134,13 +211,11 @@ class Coordinator:
                 if verbose:
                     print(f"         [!] Skipped ({exc})")
 
-        # Step 4 — aggregate
+        # Step 4 — aggregate + signal
         avg_score = self._aggregate(scored)
-
-        # Step 5 — signal
         signal = self._signal(avg_score)
 
-        # Step 6 — persist
+        # Step 5 — persist
         run_id = self.db.log_run(
             ticker=ticker,
             headlines_fetched=len(headlines),
@@ -165,4 +240,65 @@ class Coordinator:
             "avg_score": avg_score,
             "signal": signal,
             "run_id": run_id,
+        }
+
+    def run_combined(self, ticker: str, verbose: bool = True) -> dict:
+        """
+        Run both sentiment and technical agents, then fuse their signals.
+
+        Args:
+            ticker:  Stock ticker symbol (e.g. "AAPL").
+            verbose: When True, print step-by-step progress to stdout.
+
+        Returns:
+            dict with keys:
+                ticker           (str):   The analysed ticker.
+                sentiment        (dict):  Full output of run() — sentiment pipeline.
+                technical        (dict):  Full output of TechnicalAgent.run().
+                combined_signal  (str):   Fused signal label.
+                confidence       (float): Confidence score 0.0–1.0.
+                combined_id      (int):   DB primary key for the combined_signals row.
+        """
+        ticker = ticker.upper()
+
+        # --- Sentiment pipeline ---
+        if verbose:
+            print(f"\n[1/2] Sentiment analysis for {ticker}...")
+        sentiment = self.run(ticker, verbose=verbose)
+
+        # --- Technical pipeline ---
+        if verbose:
+            print(f"\n[2/2] Technical analysis for {ticker}...")
+        technical = self.technical_agent.run(ticker)
+        if verbose:
+            ind = technical["indicators"]
+            p = ind.get("price")
+            r = ind.get("rsi")
+            fmt_p = f"{p:.2f}" if p is not None else "N/A"
+            fmt_r = f"{r:.1f}" if r is not None else "N/A"
+            print(f"  Price: {fmt_p}  RSI: {fmt_r}  →  {technical['signal']}")
+
+        # --- Fuse ---
+        combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
+        conf = self.confidence(combined_signal, sentiment["avg_score"])
+
+        # --- Persist ---
+        combined_id = self.db.log_combined_signal(
+            ticker=ticker,
+            combined_signal=combined_signal,
+            sentiment_signal=sentiment["signal"],
+            technical_signal=technical["signal"],
+            sentiment_score=sentiment["avg_score"],
+            confidence=conf,
+            run_id=sentiment["run_id"],
+            technical_id=technical["signal_id"],
+        )
+
+        return {
+            "ticker": ticker,
+            "sentiment": sentiment,
+            "technical": technical,
+            "combined_signal": combined_signal,
+            "confidence": conf,
+            "combined_id": combined_id,
         }

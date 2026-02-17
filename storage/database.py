@@ -23,6 +23,34 @@ headline_scores
     sentiment       TEXT     bullish / bearish / neutral
     score           INTEGER  Numeric score (+1 / 0 / -1)
     reason          TEXT     One-sentence explanation from Claude
+
+technical_signals
+    id              INTEGER  Primary key
+    ticker          TEXT     Stock ticker symbol
+    signal          TEXT     BUY / SELL / HOLD
+    rsi             REAL     RSI-14 value
+    macd            REAL     MACD line value
+    macd_signal     REAL     MACD signal line value
+    macd_hist       REAL     MACD histogram value
+    sma_20          REAL     20-period simple moving average
+    sma_50          REAL     50-period simple moving average
+    bb_upper        REAL     Upper Bollinger Band (20, 2σ)
+    bb_lower        REAL     Lower Bollinger Band (20, 2σ)
+    price           REAL     Latest close price
+    reasoning       TEXT     Human-readable list of triggered conditions
+    created_at      TEXT     ISO-8601 UTC timestamp
+
+combined_signals
+    id               INTEGER  Primary key
+    ticker           TEXT     Stock ticker symbol
+    combined_signal  TEXT     STRONG BUY / STRONG SELL / WEAK BUY / WEAK SELL / CONFLICTING / HOLD
+    sentiment_signal TEXT     BUY / SELL / HOLD from SentimentAgent
+    technical_signal TEXT     BUY / SELL / HOLD from TechnicalAgent
+    sentiment_score  REAL     Avg sentiment score (-1.0 to +1.0)
+    confidence       REAL     Confidence score (0.0 to 1.0)
+    run_id           INTEGER  Foreign key → runs.id
+    technical_id     INTEGER  Foreign key → technical_signals.id
+    created_at       TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -76,6 +104,36 @@ class Database:
                     sentiment   TEXT    NOT NULL,
                     score       INTEGER NOT NULL,
                     reason      TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS technical_signals (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker      TEXT    NOT NULL,
+                    signal      TEXT    NOT NULL,
+                    rsi         REAL,
+                    macd        REAL,
+                    macd_signal REAL,
+                    macd_hist   REAL,
+                    sma_20      REAL,
+                    sma_50      REAL,
+                    bb_upper    REAL,
+                    bb_lower    REAL,
+                    price       REAL,
+                    reasoning   TEXT,
+                    created_at  TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS combined_signals (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT    NOT NULL,
+                    combined_signal  TEXT    NOT NULL,
+                    sentiment_signal TEXT    NOT NULL,
+                    technical_signal TEXT    NOT NULL,
+                    sentiment_score  REAL,
+                    confidence       REAL,
+                    run_id           INTEGER REFERENCES runs(id),
+                    technical_id     INTEGER REFERENCES technical_signals(id),
+                    created_at       TEXT    NOT NULL
                 );
                 """
             )
@@ -143,6 +201,101 @@ class Database:
                 """,
                 (run_id, headline, sentiment, score, reason),
             )
+
+    def log_technical_signal(
+        self,
+        ticker: str,
+        signal: str,
+        reasoning: str,
+        rsi: "float | None" = None,
+        macd: "float | None" = None,
+        macd_signal: "float | None" = None,
+        macd_hist: "float | None" = None,
+        sma_20: "float | None" = None,
+        sma_50: "float | None" = None,
+        bb_upper: "float | None" = None,
+        bb_lower: "float | None" = None,
+        price: "float | None" = None,
+    ) -> int:
+        """
+        Persist a technical analysis signal and return its auto-generated ID.
+
+        Args:
+            ticker:      Stock ticker symbol.
+            signal:      BUY / SELL / HOLD.
+            reasoning:   Semicolon-separated list of triggered conditions.
+            rsi:         RSI-14 value.
+            macd:        MACD line value.
+            macd_signal: MACD signal line value.
+            macd_hist:   MACD histogram value.
+            sma_20:      20-period SMA.
+            sma_50:      50-period SMA.
+            bb_upper:    Upper Bollinger Band.
+            bb_lower:    Lower Bollinger Band.
+            price:       Latest close price.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO technical_signals
+                    (ticker, signal, rsi, macd, macd_signal, macd_hist,
+                     sma_20, sma_50, bb_upper, bb_lower, price, reasoning, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, signal, rsi, macd, macd_signal, macd_hist,
+                    sma_20, sma_50, bb_upper, bb_lower, price, reasoning, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_combined_signal(
+        self,
+        ticker: str,
+        combined_signal: str,
+        sentiment_signal: str,
+        technical_signal: str,
+        sentiment_score: float,
+        confidence: float,
+        run_id: int,
+        technical_id: int,
+    ) -> int:
+        """
+        Persist a combined analysis result and return its auto-generated ID.
+
+        Args:
+            ticker:           Stock ticker symbol.
+            combined_signal:  STRONG BUY / STRONG SELL / WEAK BUY / WEAK SELL /
+                              CONFLICTING / HOLD.
+            sentiment_signal: BUY / SELL / HOLD from SentimentAgent.
+            technical_signal: BUY / SELL / HOLD from TechnicalAgent.
+            sentiment_score:  Averaged sentiment score (−1.0 to +1.0).
+            confidence:       Confidence score (0.0 to 1.0).
+            run_id:           FK to the sentiment run in runs table.
+            technical_id:     FK to the technical result in technical_signals table.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO combined_signals
+                    (ticker, combined_signal, sentiment_signal, technical_signal,
+                     sentiment_score, confidence, run_id, technical_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, combined_signal, sentiment_signal, technical_signal,
+                    sentiment_score, confidence, run_id, technical_id, now,
+                ),
+            )
+            return cur.lastrowid
 
     def get_recent_runs(self, limit: int = 10) -> list[dict]:
         """
