@@ -51,6 +51,24 @@ combined_signals
     run_id           INTEGER  Foreign key → runs.id
     technical_id     INTEGER  Foreign key → technical_signals.id
     created_at       TEXT     ISO-8601 UTC timestamp
+
+risk_calculations
+    id                INTEGER  Primary key
+    ticker            TEXT     Stock ticker symbol
+    signal            TEXT     Combined signal that triggered sizing
+    confidence        REAL     Confidence score 0–100
+    current_price     REAL     Price per share at time of calculation
+    account_balance   REAL     Total account value used for sizing
+    position_size_usd REAL     Dollar value to deploy (0 if skipped)
+    shares            INTEGER  Whole shares to trade (0 if skipped)
+    stop_loss         REAL     Stop-loss price (NULL if skipped)
+    take_profit       REAL     Take-profit price (NULL if skipped)
+    risk_amount       REAL     Max loss if stop-loss is hit
+    kelly_fraction    REAL     Half-Kelly fraction used
+    stop_pct          REAL     Stop-loss percentage (NULL if skipped)
+    skipped           INTEGER  1 = no position taken, 0 = position taken
+    skip_reason       TEXT     Explanation when skipped (NULL otherwise)
+    created_at        TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -134,6 +152,25 @@ class Database:
                     run_id           INTEGER REFERENCES runs(id),
                     technical_id     INTEGER REFERENCES technical_signals(id),
                     created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS risk_calculations (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker            TEXT    NOT NULL,
+                    signal            TEXT    NOT NULL,
+                    confidence        REAL    NOT NULL,
+                    current_price     REAL    NOT NULL,
+                    account_balance   REAL    NOT NULL,
+                    position_size_usd REAL    NOT NULL DEFAULT 0,
+                    shares            INTEGER NOT NULL DEFAULT 0,
+                    stop_loss         REAL,
+                    take_profit       REAL,
+                    risk_amount       REAL    NOT NULL DEFAULT 0,
+                    kelly_fraction    REAL,
+                    stop_pct          REAL,
+                    skipped           INTEGER NOT NULL DEFAULT 0,
+                    skip_reason       TEXT,
+                    created_at        TEXT    NOT NULL
                 );
                 """
             )
@@ -293,6 +330,65 @@ class Database:
                 (
                     ticker, combined_signal, sentiment_signal, technical_signal,
                     sentiment_score, confidence, run_id, technical_id, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_risk_calculation(
+        self,
+        ticker: str,
+        signal: str,
+        confidence: float,
+        current_price: float,
+        account_balance: float,
+        position_size_usd: float = 0.0,
+        shares: int = 0,
+        stop_loss: "float | None" = None,
+        take_profit: "float | None" = None,
+        risk_amount: float = 0.0,
+        kelly_fraction: float = 0.0,
+        stop_pct: "float | None" = None,
+        skipped: bool = False,
+        skip_reason: "str | None" = None,
+    ) -> int:
+        """
+        Persist a risk calculation result and return its auto-generated ID.
+
+        Args:
+            ticker:            Stock ticker symbol.
+            signal:            Combined signal string.
+            confidence:        Signal confidence 0–100.
+            current_price:     Price per share at calculation time.
+            account_balance:   Total account value used for sizing.
+            position_size_usd: Dollar value to deploy.
+            shares:            Whole shares to trade.
+            stop_loss:         Stop-loss price (None when skipped).
+            take_profit:       Take-profit price (None when skipped).
+            risk_amount:       Max dollar loss if stop-loss is hit.
+            kelly_fraction:    Half-Kelly fraction used.
+            stop_pct:          Stop-loss percentage (None when skipped).
+            skipped:           True when no position is recommended.
+            skip_reason:       Explanation when skipped.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO risk_calculations
+                    (ticker, signal, confidence, current_price, account_balance,
+                     position_size_usd, shares, stop_loss, take_profit,
+                     risk_amount, kelly_fraction, stop_pct,
+                     skipped, skip_reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, signal, confidence, current_price, account_balance,
+                    position_size_usd, shares, stop_loss, take_profit,
+                    risk_amount, kelly_fraction, stop_pct,
+                    int(skipped), skip_reason, now,
                 ),
             )
             return cur.lastrowid

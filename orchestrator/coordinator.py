@@ -14,7 +14,8 @@ Combined pipeline (run_combined):
     1–5 above (sentiment)
     6. TechnicalAgent → RSI, MACD, Bollinger, SMA → BUY / SELL / HOLD
     7. Fusion         → combine both signals into STRONG BUY / WEAK SELL / etc.
-    8. Database       → persist to combined_signals table
+    8. RiskAgent      → position size, stop-loss, take-profit
+    9. Database       → persist to combined_signals + risk_calculations tables
 
 Signal fusion matrix
 --------------------
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import json
 
+from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from config.settings import BUY_THRESHOLD, SELL_THRESHOLD
@@ -84,14 +86,16 @@ class Coordinator:
         market_data: MarketData | None = None,
         sentiment_agent: SentimentAgent | None = None,
         technical_agent: TechnicalAgent | None = None,
+        risk_agent: RiskAgent | None = None,
         db: Database | None = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
         self.market_data = market_data or MarketData()
         self.sentiment_agent = sentiment_agent or SentimentAgent()
-        # Share the same DB instance so both agents write to the same file
+        # All agents share the same DB instance
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
+        self.risk_agent = risk_agent or RiskAgent(db=self.db)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -242,13 +246,19 @@ class Coordinator:
             "run_id": run_id,
         }
 
-    def run_combined(self, ticker: str, verbose: bool = True) -> dict:
+    def run_combined(
+        self,
+        ticker: str,
+        verbose: bool = True,
+        account_balance: float = 10_000.0,
+    ) -> dict:
         """
-        Run both sentiment and technical agents, then fuse their signals.
+        Run sentiment, technical, and risk agents, then fuse their signals.
 
         Args:
-            ticker:  Stock ticker symbol (e.g. "AAPL").
-            verbose: When True, print step-by-step progress to stdout.
+            ticker:          Stock ticker symbol (e.g. "AAPL").
+            verbose:         When True, print step-by-step progress to stdout.
+            account_balance: Account size in USD used for position sizing.
 
         Returns:
             dict with keys:
@@ -257,18 +267,19 @@ class Coordinator:
                 technical        (dict):  Full output of TechnicalAgent.run().
                 combined_signal  (str):   Fused signal label.
                 confidence       (float): Confidence score 0.0–1.0.
-                combined_id      (int):   DB primary key for the combined_signals row.
+                combined_id      (int):   DB primary key for combined_signals row.
+                risk             (dict):  Full output of RiskAgent.run().
         """
         ticker = ticker.upper()
 
         # --- Sentiment pipeline ---
         if verbose:
-            print(f"\n[1/2] Sentiment analysis for {ticker}...")
+            print(f"\n[1/3] Sentiment analysis for {ticker}...")
         sentiment = self.run(ticker, verbose=verbose)
 
         # --- Technical pipeline ---
         if verbose:
-            print(f"\n[2/2] Technical analysis for {ticker}...")
+            print(f"\n[2/3] Technical analysis for {ticker}...")
         technical = self.technical_agent.run(ticker)
         if verbose:
             ind = technical["indicators"]
@@ -282,7 +293,7 @@ class Coordinator:
         combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
         conf = self.confidence(combined_signal, sentiment["avg_score"])
 
-        # --- Persist ---
+        # --- Persist combined ---
         combined_id = self.db.log_combined_signal(
             ticker=ticker,
             combined_signal=combined_signal,
@@ -294,6 +305,30 @@ class Coordinator:
             technical_id=technical["signal_id"],
         )
 
+        # --- Risk sizing ---
+        if verbose:
+            print(f"\n[3/3] Risk sizing for {ticker}...")
+        # Prefer live market price; fall back to technical close price
+        price = (sentiment.get("market") or {}).get("price") \
+            or technical["indicators"].get("price")
+        risk = self.risk_agent.run(
+            ticker=ticker,
+            signal=combined_signal,
+            confidence=conf * 100,          # convert 0–1 → 0–100
+            current_price=price,
+            account_balance=account_balance,
+        )
+        if verbose:
+            if risk["skipped"]:
+                print(f"  No position — {risk['skip_reason']}")
+            else:
+                print(
+                    f"  ${risk['position_size_usd']:,.2f}  "
+                    f"({risk['shares']} shares)  "
+                    f"SL: ${risk['stop_loss']:.2f}  "
+                    f"TP: ${risk['take_profit']:.2f}"
+                )
+
         return {
             "ticker": ticker,
             "sentiment": sentiment,
@@ -301,4 +336,6 @@ class Coordinator:
             "combined_signal": combined_signal,
             "confidence": conf,
             "combined_id": combined_id,
+            "risk": risk,
+            "account_balance": account_balance,
         }

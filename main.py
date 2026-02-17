@@ -3,23 +3,19 @@ News Trading System — command-line entry point.
 
 Usage
 -----
-    python main.py <TICKER>                   # combined mode (default)
-    python main.py <TICKER> --agent sentiment # sentiment only
-    python main.py <TICKER> --agent technical # technical only
+    python main.py <TICKER> [--balance N] [--agent sentiment|technical]
 
 Examples
 --------
-    python main.py AAPL
-    python main.py NVDA --agent technical
-    python main.py TSLA --agent sentiment
+    python main.py AAPL                          # combined mode, $10k account
+    python main.py NVDA --balance 25000          # combined mode, $25k account
+    python main.py TSLA --agent sentiment        # sentiment only
+    python main.py AAPL --agent technical        # technical only
 """
 
 import argparse
 
 from orchestrator.coordinator import Coordinator
-
-# Signal labels that carry a directional view
-_DIRECTIONAL = {"STRONG BUY", "STRONG SELL", "WEAK BUY", "WEAK SELL", "CONFLICTING"}
 
 
 def _fmt(val: "float | None", decimals: int = 2) -> str:
@@ -31,18 +27,20 @@ def _fmt(val: "float | None", decimals: int = 2) -> str:
 # ---------------------------------------------------------------------------
 
 def print_combined_report(report: dict) -> None:
-    """Print the full combined (sentiment + technical + fusion) report."""
-    sent  = report["sentiment"]
-    tech  = report["technical"]
-    ind   = tech["indicators"]
-    sig   = report["combined_signal"]
-    conf  = report["confidence"]
+    """Print the full combined (sentiment + technical + risk) report."""
+    sent = report["sentiment"]
+    tech = report["technical"]
+    ind  = tech["indicators"]
+    risk = report["risk"]
+    sig  = report["combined_signal"]
+    conf = report["confidence"]
 
-    scored  = sent["scored"]
+    scored = sent["scored"]
     counts: dict[str, int] = {"bullish": 0, "bearish": 0, "neutral": 0}
     for s in scored:
         counts[s["sentiment"]] = counts.get(s["sentiment"], 0) + 1
 
+    balance = report.get("account_balance") or 0.0
     bar = "=" * 62
 
     print(f"\n{bar}")
@@ -59,18 +57,36 @@ def print_combined_report(report: dict) -> None:
 
     # -- Technical section --
     print("\n  [TECHNICAL]")
-    print(f"  Price     : {_fmt(ind.get('price'))}  |  "
-          f"RSI (14): {_fmt(ind.get('rsi'))}")
-    print(f"  MACD      : {_fmt(ind.get('macd'))}  |  "
-          f"Signal: {_fmt(ind.get('macd_signal'))}")
+    print(f"  Price     : {_fmt(ind.get('price'))}  |  RSI (14): {_fmt(ind.get('rsi'))}")
+    print(f"  MACD      : {_fmt(ind.get('macd'))}  |  Signal: {_fmt(ind.get('macd_signal'))}")
     print(f"  SMA 20/50 : {_fmt(ind.get('sma_20'))} / {_fmt(ind.get('sma_50'))}")
     print(f"  Bollinger : {_fmt(ind.get('bb_lower'))} — {_fmt(ind.get('bb_upper'))}")
     print(f"  Notes     : {tech['reasoning'][0]}")
     print(f"              →   {tech['signal']}")
 
-    # -- Combined section --
+    # -- Combined signal --
     print(f"\n  [COMBINED SIGNAL]")
     print(f"  {sig}   (confidence: {conf:.0%})")
+
+    # -- Risk section --
+    print(f"\n  [RISK MANAGEMENT]  (account: ${balance:,.2f})")
+    if risk["skipped"]:
+        print(f"  No position — {risk['skip_reason']}")
+    else:
+        pct_of_acct = (risk["risk_amount"] / balance * 100) if balance else 0
+        sl_pct  = risk["stop_pct"] * 100 if risk["stop_pct"] else 0
+        tp_pct  = sl_pct * 2
+        direction_arrow = "▲" if risk["direction"] == "BUY" else "▼"
+        print(f"  Direction     : {direction_arrow} {risk['direction']}")
+        print(f"  Position Size : ${risk['position_size_usd']:,.2f}  "
+              f"({risk['shares']} shares @ ${_fmt(ind.get('price'))})")
+        print(f"  Stop Loss     : ${risk['stop_loss']:.2f}  (-{sl_pct:.2f}%)")
+        print(f"  Take Profit   : ${risk['take_profit']:.2f}  (+{tp_pct:.2f}%)")
+        print(f"  Risk Amount   : ${risk['risk_amount']:.2f}  "
+              f"({pct_of_acct:.2f}% of portfolio)")
+        print(f"  Kelly Frac.   : {risk['kelly_fraction']:.2%}  "
+              f"(capped at {min(risk['kelly_fraction'], 0.10):.2%})")
+
     print(f"\n{bar}\n")
 
 
@@ -131,7 +147,14 @@ def main() -> None:
         "--agent",
         choices=["sentiment", "technical"],
         default=None,
-        help="Run a single agent only. Omit to run both (combined mode).",
+        help="Run a single agent only. Omit to run both agents (combined mode).",
+    )
+    parser.add_argument(
+        "--balance",
+        type=float,
+        default=10_000.0,
+        metavar="USD",
+        help="Account balance in USD for position sizing (default: 10000).",
     )
     args = parser.parse_args()
 
@@ -149,8 +172,7 @@ def main() -> None:
         print_technical_report(result)
 
     else:
-        # Default: combined mode
-        report = coordinator.run_combined(ticker)
+        report = coordinator.run_combined(ticker, account_balance=args.balance)
         print_combined_report(report)
 
 
