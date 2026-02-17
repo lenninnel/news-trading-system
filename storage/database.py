@@ -25,6 +25,8 @@ headline_scores
     reason          TEXT     One-sentence explanation from Claude
 """
 
+from __future__ import annotations
+
 import sqlite3
 from datetime import datetime, timezone
 

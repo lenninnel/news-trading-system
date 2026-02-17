@@ -9,6 +9,8 @@ The class is intentionally thin — it owns only I/O concerns (HTTP request,
 JSON parsing, error propagation) and has no dependency on agents or storage.
 """
 
+from __future__ import annotations
+
 import requests
 
 from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL

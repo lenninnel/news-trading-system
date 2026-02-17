@@ -15,6 +15,8 @@ The coordinator owns no business logic itself; it delegates to its
 collaborators and assembles their outputs into a structured report dict.
 """
 
+from __future__ import annotations
+
 import json
 
 from agents.sentiment_agent import SentimentAgent

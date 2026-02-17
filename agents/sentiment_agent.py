@@ -9,6 +9,8 @@ The agent is intentionally stateless between calls so it can be reused
 across many headlines without side-effects.
 """
 
+from __future__ import annotations
+
 import json
 
 import anthropic
@@ -21,7 +23,7 @@ _PROMPT_TEMPLATE = (
     "classify the following headline as exactly one of: bullish, bearish, or neutral.\n\n"
     'Headline: "{headline}"\n\n'
     "Respond with ONLY valid JSON (no markdown) in this format:\n"
-    '{"sentiment": "bullish|bearish|neutral", "reason": "<one sentence>"}'
+    '{{"sentiment": "bullish|bearish|neutral", "reason": "<one sentence>"}}'
 )
 
 
