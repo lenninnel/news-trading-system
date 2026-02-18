@@ -91,13 +91,15 @@ class Database:
         """
         self.db_path = db_path
         self._init_schema()
+        self._migrate_schema()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        # timeout=5.0 — wait up to 5 s when the DB is locked by another writer
+        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -216,15 +218,35 @@ class Database:
                     exchange     TEXT,
                     country      TEXT,
                     hotness      REAL,
+                    price        REAL,
                     price_change REAL,
                     volume_ratio REAL,
+                    volume       REAL,
                     rsi          REAL,
                     market_cap   REAL,
                     avg_volume   REAL,
                     metrics      TEXT,
                     created_at   TEXT    NOT NULL
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_screener_run_ticker
+                    ON screener_results (run_at, ticker);
                 """
+            )
+
+    def _migrate_schema(self) -> None:
+        """Idempotently add columns/indices introduced after the initial schema."""
+        with self._connect() as conn:
+            # Add price and volume columns to screener_results if they don't exist yet
+            for col_def in ("price REAL", "volume REAL"):
+                try:
+                    conn.execute(f"ALTER TABLE screener_results ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists — safe to skip
+            # Unique index (safe no-op if the table was just created above)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_screener_run_ticker "
+                "ON screener_results (run_at, ticker)"
             )
 
     # ------------------------------------------------------------------
@@ -558,8 +580,10 @@ class Database:
                 r.get("exchange"),
                 r.get("country"),
                 r.get("hotness"),
+                r.get("price"),
                 r.get("price_change"),
                 r.get("volume_ratio"),
+                r.get("volume"),
                 r.get("rsi"),
                 r.get("market_cap"),
                 r.get("avg_volume"),
@@ -571,11 +595,11 @@ class Database:
         with self._connect() as conn:
             conn.executemany(
                 """
-                INSERT INTO screener_results
+                INSERT OR IGNORE INTO screener_results
                     (run_at, ticker, name, market, exchange, country,
-                     hotness, price_change, volume_ratio, rsi, market_cap,
-                     avg_volume, metrics, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     hotness, price, price_change, volume_ratio, volume,
+                     rsi, market_cap, avg_volume, metrics, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )

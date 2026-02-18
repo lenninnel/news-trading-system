@@ -67,6 +67,12 @@ from storage.database import Database
 
 log = logging.getLogger(__name__)
 
+# Suppress yfinance's ERROR-level noise for delisted / invalid tickers.
+# Those failures are handled gracefully — we don't need the stack traces.
+for _yf_logger_name in ("yfinance", "yfinance.base", "yfinance.utils",
+                         "yfinance.scrapers.history", "peewee"):
+    logging.getLogger(_yf_logger_name).setLevel(logging.CRITICAL)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Universe definitions
 # Note: Lists are approximate and require periodic updates.
@@ -77,7 +83,7 @@ log = logging.getLogger(__name__)
 _DAX_40: list[str] = [
     "SAP.DE",  "SIE.DE",  "ALV.DE",  "MUV2.DE", "BMW.DE",  "VOW3.DE",
     "MBG.DE",  "DTE.DE",  "BAYN.DE", "BAS.DE",  "ADS.DE",  "RWE.DE",
-    "EOAN.DE", "DBK.DE",  "IFX.DE",  "DPW.DE",  "DB1.DE",  "LIN.DE",
+    "EOAN.DE", "DBK.DE",  "IFX.DE",  "DHL.DE",  "DB1.DE",  "LIN.DE",
     "MRK.DE",  "HEI.DE",  "HEN3.DE", "FRE.DE",  "ZAL.DE",  "CON.DE",
     "VNA.DE",  "RHM.DE",  "AIR.DE",  "PAH3.DE", "P911.DE", "BNR.DE",
     "MTX.DE",  "SRT3.DE", "DHER.DE", "FME.DE",  "CBK.DE",  "HNR1.DE",
@@ -93,7 +99,7 @@ _MDAX: list[str] = [
     "S92.DE",  "HAB.DE",  "LHA.DE",  "NDA.DE",  "SIX2.DE", "TKA.DE",
     "UTDI.DE", "1U1.DE",  "ECV.DE",  "LXS.DE",  "MBB.DE",  "GFT.DE",
     "HLAG.DE", "WAF.DE",  "SFQ.DE",  "KBX.DE",  "SGL.DE",  "OHB.DE",
-    "FRA.DE",  "SZU.DE",  "MAN.DE",
+    "FRA.DE",  "SZU.DE",  "GXI.DE",
 ]
 
 # SDAX — German small-cap (~70 stocks, XETRA)
@@ -435,6 +441,32 @@ class ScreenerAgent(BaseAgent):
     # Data fetching
     # ------------------------------------------------------------------
 
+    def _download_with_retry(
+        self, chunk: list[str], max_retries: int = 2
+    ) -> pd.DataFrame:
+        """Download OHLCV for *chunk* with exponential-backoff retries."""
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(max_retries + 1):
+            try:
+                return yf.download(
+                    chunk,
+                    period=self._HISTORY_PERIOD,
+                    interval="1d",
+                    progress=False,
+                    auto_adjust=True,
+                    group_by="ticker",
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    wait = 2 ** attempt          # 1 s, 2 s …
+                    log.debug(
+                        "Download attempt %d/%d failed (%s) — retrying in %ds",
+                        attempt + 1, max_retries + 1, exc, wait,
+                    )
+                    time.sleep(wait)
+        raise last_exc
+
     def _fetch_batch_history(self, tickers: list[str]) -> dict[str, pd.DataFrame]:
         """
         Batch-download 1-month daily OHLCV for all tickers using the 5-min cache.
@@ -453,17 +485,13 @@ class ScreenerAgent(BaseAgent):
             else:
                 to_fetch.append(t)
 
+        total_chunks = math.ceil(len(to_fetch) / self._BATCH_SIZE) or 1
         for i in range(0, len(to_fetch), self._BATCH_SIZE):
-            chunk = to_fetch[i : i + self._BATCH_SIZE]
+            chunk     = to_fetch[i : i + self._BATCH_SIZE]
+            chunk_idx = i // self._BATCH_SIZE + 1
+            log.info("Scanning chunk %d/%d (%d tickers)…", chunk_idx, total_chunks, len(chunk))
             try:
-                raw = yf.download(
-                    chunk,
-                    period=self._HISTORY_PERIOD,
-                    interval="1d",
-                    progress=False,
-                    auto_adjust=True,
-                    group_by="ticker",
-                )
+                raw = self._download_with_retry(chunk)
                 if raw.empty:
                     continue
 
@@ -474,8 +502,12 @@ class ScreenerAgent(BaseAgent):
                         result[t] = df
 
             except Exception as exc:
-                log.warning("Batch download failed (chunk %d..%d): %s",
-                             i, i + len(chunk), exc)
+                log.warning("Batch download failed (chunk %d/%d): %s",
+                            chunk_idx, total_chunks, exc)
+
+            # Brief pause between chunks to avoid hammering the API
+            if i + self._BATCH_SIZE < len(to_fetch):
+                time.sleep(0.1)
 
         return result
 
