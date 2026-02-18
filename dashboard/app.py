@@ -7,7 +7,7 @@ Run from the project root:
 
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
@@ -73,7 +73,7 @@ def badge(sig: str) -> str:
 st.sidebar.title("📈 Trading System")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Signals", "Portfolio", "History", "Agents"],
+    ["Overview", "Signals", "Portfolio", "History", "Agents", "Backtesting"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"DB: `{DB_PATH}`")
@@ -500,3 +500,273 @@ elif page == "Agents":
                 "Skipped", "Skip Reason",
             ]
             st.dataframe(d, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: BACKTESTING
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Backtesting":
+    st.title("Backtesting")
+
+    tab_run, tab_saved = st.tabs(["▶  Run Backtest", "📋  Saved Results"])
+
+    # ── Tab: Run ──────────────────────────────────────────────────────────────
+    with tab_run:
+        COMMON_TICKERS = [
+            "AAPL", "NVDA", "TSLA", "MSFT", "GOOGL",
+            "AMZN", "META", "NFLX", "AMD", "INTC",
+            "SPY", "QQQ", "JPM", "BAC", "COIN",
+        ]
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            bt_ticker = st.selectbox("Ticker", COMMON_TICKERS, key="bt_ticker")
+        with c2:
+            bt_start = st.date_input("Start date", value=date(2024, 1, 1), key="bt_start")
+        with c3:
+            bt_end = st.date_input("End date", value=date(2025, 1, 1), key="bt_end")
+        with c4:
+            bt_sentiment = st.selectbox(
+                "Sentiment mode",
+                ["random", "bullish", "bearish", "neutral"],
+                key="bt_sentiment",
+                help=(
+                    "random — per-date seeded random signal (reproducible)\n"
+                    "bullish/bearish/neutral — fixed sentiment every day"
+                ),
+            )
+
+        c5, _ = st.columns([1, 3])
+        with c5:
+            bt_balance = st.number_input(
+                "Initial balance ($)", min_value=1_000, max_value=1_000_000,
+                value=10_000, step=1_000, key="bt_balance",
+            )
+
+        run_clicked = st.button("▶  Run Backtest", type="primary")
+
+        if run_clicked:
+            if bt_start >= bt_end:
+                st.error("Start date must be before end date.")
+            else:
+                with st.spinner(
+                    f"Running {bt_ticker} backtest "
+                    f"({bt_start} → {bt_end}, sentiment={bt_sentiment})…"
+                ):
+                    try:
+                        from backtest.engine import BacktestEngine  # lazy import
+                        engine = BacktestEngine(
+                            ticker          = bt_ticker,
+                            start_date      = str(bt_start),
+                            end_date        = str(bt_end),
+                            initial_balance = float(bt_balance),
+                            sentiment_mode  = bt_sentiment,
+                            verbose         = False,
+                        )
+                        result = engine.run()
+                        fig    = engine.plot(result, show=False, save_path=None)
+                        st.session_state["bt_result"] = result
+                        st.session_state["bt_engine"] = engine
+                        st.session_state["bt_fig"]    = fig
+                        st.cache_data.clear()   # refresh saved-results tab
+                        st.success(
+                            f"Backtest complete — "
+                            f"{result.total_return_pct:+.2f}% return  |  "
+                            f"{result.total_trades} trades  |  "
+                            f"saved to DB #{result.db_id}"
+                        )
+                    except Exception as exc:
+                        st.error(f"Backtest failed: {exc}")
+                        st.session_state.pop("bt_result", None)
+
+        # ── Results ───────────────────────────────────────────────────────────
+        if "bt_result" in st.session_state:
+            result = st.session_state["bt_result"]
+            fig    = st.session_state["bt_fig"]
+            alpha  = result.total_return_pct - result.buy_and_hold_return_pct
+
+            st.markdown("---")
+            st.subheader(
+                f"{result.ticker}  ·  {result.start_date} → {result.end_date}  "
+                f"·  sentiment: {st.session_state['bt_sentiment']}"
+            )
+
+            # ── KPI strip ─────────────────────────────────────────────────────
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric(
+                "Total Return", f"{result.total_return_pct:+.2f}%",
+                delta=f"{alpha:+.1f}% vs B&H", delta_color="normal",
+            )
+            k2.metric("Buy & Hold",   f"{result.buy_and_hold_return_pct:+.2f}%")
+            k3.metric("Sharpe Ratio", f"{result.sharpe_ratio:.3f}")
+            k4.metric("Max Drawdown", f"{result.max_drawdown_pct:.2f}%")
+            k5.metric("Win Rate",     f"{result.win_rate_pct:.1f}%")
+            k6.metric("Trades",       result.total_trades,
+                      help=f"W: {result.winning_trades}  L: {result.losing_trades}")
+
+            # ── Chart (equity + drawdown + heatmap) ───────────────────────────
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+
+            # ── Stats + trade log side by side ────────────────────────────────
+            col_stats, col_trades = st.columns([1, 1.6])
+
+            with col_stats:
+                st.subheader("Performance Summary")
+                rows = [
+                    ("Ticker",            result.ticker),
+                    ("Period",            f"{result.start_date} → {result.end_date}"),
+                    ("Initial Capital",   fmt_usd(result.initial_balance)),
+                    ("Final Capital",     fmt_usd(result.final_balance)),
+                    ("Total Return",      f"{result.total_return_pct:+.2f}%"),
+                    ("Buy & Hold Return", f"{result.buy_and_hold_return_pct:+.2f}%"),
+                    ("Alpha",             f"{alpha:+.2f}%"),
+                    ("Sharpe Ratio",      f"{result.sharpe_ratio:.3f}"),
+                    ("Max Drawdown",      f"{result.max_drawdown_pct:.2f}%"),
+                    ("Total Trades",      str(result.total_trades)),
+                    ("Winning Trades",    str(result.winning_trades)),
+                    ("Losing Trades",     str(result.losing_trades)),
+                    ("Win Rate",          f"{result.win_rate_pct:.1f}%"),
+                    ("Avg Win",           fmt_usd(result.avg_win)),
+                    ("Avg Loss",          fmt_usd(result.avg_loss)),
+                ]
+                st.dataframe(
+                    pd.DataFrame(rows, columns=["Metric", "Value"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with col_trades:
+                st.subheader(f"Trade Log ({result.total_trades} trades)")
+                if result.trades:
+                    trade_rows = []
+                    for t in result.trades:
+                        trade_rows.append({
+                            "Entry Date":  str(t.entry_date.date()),
+                            "Exit Date":   str(t.exit_date.date()) if t.exit_date else "open",
+                            "Signal":      t.signal,
+                            "Conf.":       f"{t.confidence:.0f}%",
+                            "Shares":      t.shares,
+                            "Entry $":     fmt_usd(t.entry_price),
+                            "Exit $":      fmt_usd(t.exit_price),
+                            "P&L":         f"+${t.pnl:.2f}" if t.pnl >= 0 else f"-${abs(t.pnl):.2f}",
+                            "Exit Reason": t.exit_reason,
+                        })
+                    st.dataframe(
+                        pd.DataFrame(trade_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=440,
+                    )
+                else:
+                    st.info("No trades were executed in this period.")
+
+            # ── Download ──────────────────────────────────────────────────────
+            st.markdown("---")
+            dl1, dl2 = st.columns(2)
+
+            if result.trades:
+                csv_data = pd.DataFrame([
+                    {
+                        "ticker":       result.ticker,
+                        "entry_date":   str(t.entry_date.date()),
+                        "exit_date":    str(t.exit_date.date()) if t.exit_date else "",
+                        "signal":       t.signal,
+                        "confidence":   t.confidence,
+                        "shares":       t.shares,
+                        "entry_price":  t.entry_price,
+                        "exit_price":   t.exit_price if t.exit_price else "",
+                        "stop_loss":    t.stop_loss,
+                        "take_profit":  t.take_profit,
+                        "pnl":          t.pnl,
+                        "exit_reason":  t.exit_reason,
+                    }
+                    for t in result.trades
+                ]).to_csv(index=False)
+
+                with dl1:
+                    st.download_button(
+                        label="⬇  Download Trade Log (CSV)",
+                        data=csv_data,
+                        file_name=(
+                            f"backtest_{result.ticker}_"
+                            f"{result.start_date}_{result.end_date}.csv"
+                        ),
+                        mime="text/csv",
+                    )
+
+            # Download equity curve
+            eq_csv = result.equity_curve.rename("portfolio_value").reset_index()
+            eq_csv.columns = ["date", "portfolio_value"]
+            with dl2:
+                st.download_button(
+                    label="⬇  Download Equity Curve (CSV)",
+                    data=eq_csv.to_csv(index=False),
+                    file_name=(
+                        f"equity_{result.ticker}_"
+                        f"{result.start_date}_{result.end_date}.csv"
+                    ),
+                    mime="text/csv",
+                )
+
+    # ── Tab: Saved Results ────────────────────────────────────────────────────
+    with tab_saved:
+        st.subheader("Saved Backtest Results")
+        saved = query(
+            "SELECT * FROM backtest_results ORDER BY created_at DESC"
+        )
+
+        if saved.empty:
+            st.info("No saved backtests yet. Run one using the ▶ Run Backtest tab.")
+        else:
+            # Filters
+            sf1, sf2 = st.columns(2)
+            saved_tickers = ["All"] + sorted(saved["ticker"].unique().tolist())
+            saved_sents   = ["All", "random", "bullish", "bearish", "neutral"]
+            with sf1:
+                sel_st = st.selectbox("Ticker", saved_tickers, key="saved_bt_ticker")
+            with sf2:
+                sel_ss = st.selectbox("Sentiment mode", saved_sents, key="saved_bt_sent")
+
+            filt = saved.copy()
+            if sel_st != "All":
+                filt = filt[filt["ticker"] == sel_st]
+            if sel_ss != "All":
+                filt = filt[filt["sentiment_mode"] == sel_ss]
+
+            st.caption(f"{len(filt)} saved backtest(s)")
+
+            d = filt[[
+                "created_at", "ticker", "start_date", "end_date",
+                "initial_balance", "final_balance",
+                "total_return_pct", "buy_and_hold_return_pct",
+                "sharpe_ratio", "max_drawdown_pct",
+                "win_rate_pct", "total_trades", "sentiment_mode",
+            ]].copy()
+
+            d["initial_balance"]         = d["initial_balance"].apply(fmt_usd)
+            d["final_balance"]           = d["final_balance"].apply(fmt_usd)
+            d["total_return_pct"]        = d["total_return_pct"].apply(lambda x: f"{x:+.2f}%")
+            d["buy_and_hold_return_pct"] = d["buy_and_hold_return_pct"].apply(lambda x: f"{x:+.2f}%")
+            d["sharpe_ratio"]            = d["sharpe_ratio"].apply(lambda x: f"{x:.3f}")
+            d["max_drawdown_pct"]        = d["max_drawdown_pct"].apply(lambda x: f"{x:.2f}%")
+            d["win_rate_pct"]            = d["win_rate_pct"].apply(lambda x: f"{x:.1f}%")
+            d["created_at"]              = pd.to_datetime(d["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+
+            d.columns = [
+                "Run At", "Ticker", "Start", "End",
+                "Initial $", "Final $",
+                "Return", "B&H Return",
+                "Sharpe", "Max DD",
+                "Win Rate", "Trades", "Sentiment",
+            ]
+            st.dataframe(d, use_container_width=True, hide_index=True)
+
+            # Download all saved results
+            st.download_button(
+                label="⬇  Download All Results (CSV)",
+                data=filt.drop(columns=["trades_json"], errors="ignore").to_csv(index=False),
+                file_name="backtest_results_all.csv",
+                mime="text/csv",
+            )
