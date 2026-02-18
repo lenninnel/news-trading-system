@@ -1,137 +1,415 @@
 # News Trading System
 
-A multi-agent system that fetches financial headlines, scores their sentiment
-using Claude, and produces a **BUY / SELL / HOLD** trading signal. Every
-analysis run is persisted to a local SQLite database for auditing and
-back-testing.
+A multi-agent AI system that monitors financial news, analyses technical indicators, sizes positions with Kelly Criterion, and produces actionable **BUY / SELL / HOLD** signals — all running locally on your machine with a live Streamlit dashboard.
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## Architecture
+## Features
 
-```
-news-trading-system/
-├── agents/
-│   ├── base_agent.py        # Abstract base class for all agents
-│   └── sentiment_agent.py   # Claude-powered headline classifier
-├── data/
-│   ├── news_feed.py         # NewsAPI headlines fetcher
-│   └── market_data.py       # Yahoo Finance price/fundamentals fetcher
-├── storage/
-│   └── database.py          # SQLite persistence layer
-├── orchestrator/
-│   └── coordinator.py       # Wires everything into a single pipeline
-├── config/
-│   └── settings.py          # Environment variables & constants
-├── main.py                  # CLI entry point
-├── main_old.py              # Original single-file implementation (reference)
-└── requirements.txt
-```
-
-### Pipeline
-
-```
-NewsFeed ──► SentimentAgent (×N headlines) ──► Aggregate ──► Signal
-                                                                │
-                                                           Database
-```
+| Category | What it does |
+|---|---|
+| **Sentiment Analysis** | Classifies up to 10 recent headlines per ticker using Claude (Anthropic) as bullish / bearish / neutral |
+| **Technical Analysis** | Computes RSI-14, MACD, SMA-20/50, Bollinger Bands and derives a deterministic signal |
+| **Signal Fusion** | Combines sentiment + technical into STRONG BUY / STRONG SELL / WEAK BUY / WEAK SELL / CONFLICTING / HOLD |
+| **Risk Sizing** | Half-Kelly Criterion position sizing with stop-loss and 2:1 take-profit targets |
+| **Paper Trading** | Simulated order execution and portfolio tracking stored in SQLite |
+| **Stock Screener** | Scans 400+ tickers across DAX, MDAX, SDAX, TecDAX, S&P 500, NASDAQ 100, EURO STOXX 50, FTSE 100, CAC 40 and ranks by a composite hotness score |
+| **Backtesting** | Day-by-day historical simulation with Sharpe ratio, max drawdown, win rate |
+| **Daily Scheduler** | Runs the full pipeline automatically at market open (daemon or cron) |
+| **Telegram Alerts** | Real-time trade signals and end-of-day summaries via Telegram bot |
+| **Dashboard** | Interactive Streamlit UI with seven pages: Overview, Signals, Portfolio, History, Agents, Backtesting, Screener |
 
 ---
 
-## Setup
+## Quick Start (5 Steps)
 
-### 1. Install dependencies
+### Step 1 — Clone & enter the project
+
+```bash
+git clone https://github.com/your-username/news-trading-system.git
+cd news-trading-system
+```
+
+### Step 2 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment variables
+> Requires **Python 3.9+**. Using a virtual environment is recommended.
+
+### Step 3 — Add your API keys
 
 Create a `.env` file in the project root:
 
 ```env
 NEWSAPI_KEY=your_newsapi_key_here
 ANTHROPIC_API_KEY=your_anthropic_key_here
-# Optional — defaults to news_trading.db in the working directory
-# DB_PATH=news_trading.db
 ```
 
-- **NEWSAPI_KEY** — get a free key at <https://newsapi.org>
-- **ANTHROPIC_API_KEY** — get a key at <https://console.anthropic.com>
+Get free keys at [newsapi.org](https://newsapi.org) and [console.anthropic.com](https://console.anthropic.com).
 
----
-
-## Usage
-
-```bash
-python main.py <TICKER>
-```
-
-**Example:**
+### Step 4 — Analyse your first ticker
 
 ```bash
 python main.py AAPL
 ```
 
-**Sample output:**
-
-```
-  AAPL  |  Apple Inc.  |  189.30 USD
-
-Fetching headlines for AAPL...
-Found 10 headline(s).
-
-[1/10] Analysing: Apple hits all-time high on strong iPhone demand
-         [+] BULLISH — Strong consumer demand signals positive revenue growth.
-[2/10] Analysing: Analysts warn of Apple supply chain risks
-         [-] BEARISH — Supply disruptions could weigh on near-term earnings.
-...
-
-============================================================
-  Ticker:       AAPL
-  Run ID:       42
-  Headlines:    10 analysed
-  Bullish:      6
-  Bearish:      2
-  Neutral:      2
-  Avg Score:    +0.40  (range -1.00 to +1.00)
-  Signal:       BUY
-============================================================
-```
-
----
-
-## Signal thresholds
-
-| Avg Score      | Signal |
-|----------------|--------|
-| ≥ +0.30        | BUY    |
-| ≤ −0.30        | SELL   |
-| Between        | HOLD   |
-
-Thresholds are configurable in `config/settings.py`.
-
----
-
-## Database
-
-Results are stored in `news_trading.db` (SQLite). Two tables:
-
-- **runs** — one row per `main.py` invocation (ticker, signal, avg score, timestamp)
-- **headline_scores** — one row per headline with sentiment, score, and Claude's reasoning
-
-Query example:
+### Step 5 — Open the dashboard
 
 ```bash
-sqlite3 news_trading.db "SELECT ticker, signal, avg_score, created_at FROM runs ORDER BY id DESC LIMIT 10;"
+streamlit run dashboard/app.py
+# → http://localhost:8501
 ```
 
 ---
 
-## Extending the system
+## Usage Examples
 
-- **Add a new data source**: create a class in `data/` (no base class required).
-- **Add a new agent**: subclass `BaseAgent`, implement `name` and `run()`.
-- **Change the model**: update `CLAUDE_MODEL` in `config/settings.py`.
-- **Change thresholds**: update `BUY_THRESHOLD` / `SELL_THRESHOLD` in `config/settings.py`.
+### Single-ticker analysis
+
+```bash
+# Full pipeline: sentiment + technical + risk sizing
+python main.py AAPL
+
+# Sentiment only
+python main.py AAPL --agent sentiment
+
+# Technical only
+python main.py AAPL --agent technical
+
+# With paper-trade execution and custom balance
+python main.py AAPL --execute --balance 25000
+
+# With Telegram notifications
+python main.py AAPL --execute --notify
+```
+
+### Daily scheduler
+
+```bash
+# Run the full watchlist once immediately (great for cron jobs)
+python3 scheduler/daily_runner.py --now
+
+# Run as a daemon (fires at schedule.time in watchlist.yaml every weekday)
+python3 scheduler/daily_runner.py
+
+# Override watchlist and balance for a single run
+python3 scheduler/daily_runner.py --now --watchlist AAPL NVDA TSLA --balance 50000
+
+# Analysis only — no paper trades
+python3 scheduler/daily_runner.py --now --no-execute
+```
+
+### Stock screener
+
+```bash
+# Scan German markets, return top 5
+python3 -m agents.screener_agent --markets DE --top 5
+
+# Full multi-market scan, focus on German stocks
+python3 -m agents.screener_agent --markets US DE EU --focus DE --top 40
+
+# US only, no DB logging, verbose output
+python3 -m agents.screener_agent --markets US --top 20 --no-db -v
+```
+
+### Backtester
+
+```bash
+python3 backtest/engine.py --ticker AAPL \
+    --start 2024-01-01 --end 2025-01-01 \
+    --balance 10000 --sentiment random
+```
+
+### Dashboard
+
+```bash
+streamlit run dashboard/app.py
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Entry Points                              │
+│   main.py (CLI)   ·   daily_runner.py   ·   dashboard/app.py   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Coordinator (orchestrator/)                  │
+│  Wires agents, data sources, execution layer, and notifications  │
+└───────────┬──────────────┬──────────────┬───────────────────────┘
+            │              │              │
+            ▼              ▼              ▼
+┌───────────────┐  ┌───────────────┐  ┌──────────────────────────┐
+│  Data Layer   │  │  Agent Layer  │  │   Screener (standalone)  │
+│               │  │               │  │                          │
+│  NewsFeed     │  │  Sentiment    │  │  ScreenerAgent           │
+│  (NewsAPI)    │  │  Agent        │  │  ┌ DAX / MDAX / SDAX     │
+│               │  │  (Claude AI)  │  │  ├ TecDAX                │
+│  MarketData   │  │               │  │  ├ S&P 500 / NASDAQ 100  │
+│  (yfinance)   │  │  Technical    │  │  ├ EURO STOXX 50         │
+│               │  │  Agent        │  │  ├ FTSE 100 / CAC 40     │
+└───────────────┘  │  (yfinance+ta)│  │  └ Hotness score 0–10    │
+                   │               │  └──────────────────────────┘
+                   │  Risk Agent   │
+                   │  (Kelly)      │
+                   └───────┬───────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Storage Layer                                │
+│              SQLite  ·  news_trading.db  (10 tables)            │
+└───────────┬─────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Execution & Notification Layer                       │
+│         PaperTrader  ·  TelegramNotifier  ·  Email (SMTP)       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Signal pipeline (per ticker)
+
+```
+NewsAPI headlines
+      │
+      ▼
+SentimentAgent × N   ──►  avg_score  ──►  sentiment_signal (BUY/SELL/HOLD)
+                                                     │
+yfinance OHLCV                                       │
+      │                                              ▼
+TechnicalAgent  ──────────────────────►  combine_signals()
+(RSI, MACD, BB,                               │
+ SMA-20/50)                                   ▼
+                               combined_signal (STRONG BUY … HOLD)
+                                              │
+                                         confidence score
+                                              │
+                                              ▼
+                                        RiskAgent
+                                   (half-Kelly position size,
+                                    stop-loss, take-profit)
+                                              │
+                                              ▼
+                                       PaperTrader
+                                   (optional execution log)
+                                              │
+                                              ▼
+                                     TelegramNotifier
+                                     (optional alert)
+```
+
+---
+
+## Configuration
+
+Edit `config/watchlist.yaml` to customise the daily scheduler:
+
+```yaml
+watchlist:
+  - AAPL
+  - NVDA
+  - TSLA
+  - MSFT
+  - GOOGL
+
+account:
+  balance: 10000.0         # Paper-trading account size (USD)
+
+execution:
+  enabled: true            # false = analysis only, no trade logs
+
+schedule:
+  time: "09:30"            # HH:MM local machine time
+  weekdays_only: true
+
+screener:
+  markets: [US, DE, EU]
+  focus_market: DE
+  top_candidates: 40
+```
+
+All thresholds live in `config/settings.py`:
+
+```python
+BUY_THRESHOLD  = 0.30    # avg_score ≥ +0.30 → BUY
+SELL_THRESHOLD = -0.30   # avg_score ≤ −0.30 → SELL
+MAX_HEADLINES  = 10      # headlines per ticker from NewsAPI
+```
+
+---
+
+## Signal Reference
+
+### Sentiment score
+
+| Avg Score | Signal |
+|---|---|
+| ≥ +0.30 | BUY |
+| ≤ −0.30 | SELL |
+| Between  | HOLD |
+
+### Combined signal fusion
+
+| Sentiment | Technical | Combined Signal |
+|---|---|---|
+| BUY | BUY | STRONG BUY |
+| SELL | SELL | STRONG SELL |
+| BUY | HOLD | WEAK BUY |
+| SELL | HOLD | WEAK SELL |
+| BUY | SELL | CONFLICTING |
+| SELL | BUY | CONFLICTING |
+| HOLD | any | HOLD |
+
+### Position sizing rules
+
+- **Minimum confidence**: 30% to open any position
+- **Max position**: 10% of account balance
+- **Max risk per trade**: 2% of account balance
+- **Stop-loss**: 2% (STRONG signals) / 1% (WEAK signals)
+- **Take-profit**: 2:1 reward-to-risk ratio
+
+---
+
+## Screenshots
+
+### Terminal output
+
+```
+============================================================
+  AAPL  |  Apple Inc.  |  $189.30
+============================================================
+  Sentiment signal:   BUY   (avg score: +0.45)
+  Technical signal:   BUY   (RSI: 28.4 · MACD bullish crossover)
+  Combined signal:    STRONG BUY
+  Confidence:         78%
+------------------------------------------------------------
+  Position size:      $820.00  (4 shares)
+  Stop-loss:          $185.52  (−2.0%)
+  Take-profit:        $196.36  (+3.7%)
+  Max risk:           $20.00
+============================================================
+```
+
+### Dashboard pages
+
+| Page | Contents |
+|---|---|
+| Overview | Portfolio KPIs, recent signals, open positions |
+| Signals | Full combined signal history with filters |
+| Portfolio | Open positions, P&L summary |
+| History | All paper trades with date-range filter |
+| Agents | Sentiment runs, technical signals, risk calculations |
+| Backtesting | Run engine, equity curve, metrics |
+| Screener | Live multi-market scan, hotness rankings |
+
+---
+
+## Project Structure
+
+```
+news-trading-system/
+├── agents/                  # AI and analysis agents
+│   ├── base_agent.py        # Abstract base class
+│   ├── sentiment_agent.py   # Claude-powered headline classifier
+│   ├── technical_agent.py   # RSI / MACD / BB / SMA signals
+│   ├── risk_agent.py        # Half-Kelly position sizing
+│   └── screener_agent.py    # Multi-market momentum screener
+├── backtest/
+│   └── engine.py            # Historical backtesting engine
+├── config/
+│   ├── settings.py          # Constants and environment variables
+│   └── watchlist.yaml       # Scheduler and screener configuration
+├── dashboard/
+│   └── app.py               # Streamlit 7-page dashboard
+├── data/
+│   ├── news_feed.py         # NewsAPI headlines
+│   └── market_data.py       # Yahoo Finance price data
+├── execution/
+│   └── paper_trader.py      # Simulated order execution
+├── notifications/
+│   └── telegram_bot.py      # Real-time Telegram alerts
+├── orchestrator/
+│   └── coordinator.py       # Pipeline wiring
+├── scheduler/
+│   ├── daily_runner.py      # Daemon / cron scheduler
+│   └── install_cron.sh      # Cron setup helper
+├── storage/
+│   └── database.py          # SQLite persistence (10 tables)
+├── tests/                   # Unit tests
+├── docs/                    # Extended documentation
+│   ├── USER_MANUAL.md
+│   ├── ARCHITECTURE.md
+│   ├── SETUP_GUIDE.md
+│   ├── OPERATIONS.md
+│   └── DEVELOPMENT.md
+├── main.py                  # CLI entry point
+├── requirements.txt
+├── CHANGELOG.md
+└── .env                     # API keys (git-ignored)
+```
+
+---
+
+## Documentation
+
+| Document | Audience | Contents |
+|---|---|---|
+| [docs/USER_MANUAL.md](docs/USER_MANUAL.md) | End users | How to start, read signals, use the dashboard, FAQ |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | All | System design, agent descriptions, data flow, DB schema |
+| [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) | New users | Detailed install for Mac / Linux / Windows, API setup |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Operators | Daily checklist, monitoring, risk management |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Contributors | Code structure, adding agents, testing, git workflow |
+
+---
+
+## Contributing
+
+Contributions are welcome. Please read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before opening a pull request.
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/your-feature`
+3. Write tests for new logic in `tests/`
+4. Open a pull request against `main`
+
+Please use the [issue template](.github/ISSUE_TEMPLATE.md) for bug reports and feature requests.
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+
+```
+MIT License
+
+Copyright (c) 2026 News Trading System Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+> **Disclaimer**: This software is for educational and research purposes only. It does not constitute financial advice. Always do your own research before making investment decisions.
