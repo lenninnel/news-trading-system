@@ -3,3 +3,6 @@ requests
 python-dotenv
 yfinance
 ta
+streamlit
+streamlit-autorefresh
+plotly
