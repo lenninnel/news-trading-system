@@ -42,10 +42,11 @@ from data.market_data import MarketData
 from data.news_feed import NewsFeed
 from storage.database import Database
 
-# Optional — only imported when execute mode is active to avoid circular deps
+# Optional — only imported when execute/notify mode is active to avoid circular deps
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from execution.paper_trader import PaperTrader
+    from notifications.telegram_bot import TelegramNotifier
 
 # Maps (sentiment_signal, technical_signal) → combined label
 _FUSION_TABLE: dict[tuple[str, str], str] = {
@@ -94,6 +95,7 @@ class Coordinator:
         risk_agent: RiskAgent | None = None,
         db: Database | None = None,
         paper_trader: "PaperTrader | None" = None,
+        notifier: "TelegramNotifier | None" = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -103,6 +105,7 @@ class Coordinator:
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
         self.paper_trader = paper_trader
+        self.notifier = notifier
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -312,6 +315,24 @@ class Coordinator:
             technical_id=technical["signal_id"],
         )
 
+        # --- Telegram: signal alert ---
+        if self.notifier is not None:
+            # Build a short reasoning string from the top headline scores
+            top = sorted(
+                sentiment.get("scored", []),
+                key=lambda s: abs(s.get("score", 0)),
+                reverse=True,
+            )[:2]
+            reasoning = "  |  ".join(
+                h.get("headline", "")[:80] for h in top if h.get("headline")
+            )
+            self.notifier.send_signal(
+                ticker=ticker,
+                signal=combined_signal,
+                confidence=conf * 100,
+                reasoning=reasoning,
+            )
+
         # --- Risk sizing ---
         if verbose:
             print(f"\n[3/3] Risk sizing for {ticker}...")
@@ -349,6 +370,17 @@ class Coordinator:
             )
             if verbose:
                 print(f"\n  [PAPER TRADE LOGGED]  trade_history id=#{trade_id}")
+
+            # --- Telegram: trade executed alert ---
+            if self.notifier is not None:
+                self.notifier.send_trade_executed(
+                    ticker=ticker,
+                    action=risk["direction"],
+                    shares=risk["shares"],
+                    price=price,
+                    stop_loss=risk["stop_loss"],
+                    take_profit=risk["take_profit"],
+                )
 
         return {
             "ticker": ticker,

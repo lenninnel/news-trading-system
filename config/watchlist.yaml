@@ -33,3 +33,11 @@ email:
   from_address: ""          # sender address
   to_address: ""            # recipient address
   # Set the SMTP password in the environment:  export SMTP_PASSWORD="yourpassword"
+
+# ── Telegram notifications (optional) ────────────────────────────────────────
+telegram:
+  enabled: false
+  bot_token: "${TELEGRAM_BOT_TOKEN}"   # set via environment variable
+  chat_id: "${TELEGRAM_CHAT_ID}"       # set via environment variable
+  dashboard_url: ""                    # e.g. "http://localhost:8501" — shown as inline button
+  # See notifications/README.md for full setup instructions

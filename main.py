@@ -164,6 +164,13 @@ def main() -> None:
              "Only applies to combined mode. Without this flag the "
              "recommendation is shown but nothing is recorded.",
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Telegram notifications for signals and trades. "
+             "Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars "
+             "and telegram.enabled=true in config/watchlist.yaml.",
+    )
     args = parser.parse_args()
 
     ticker = args.ticker.upper()
@@ -184,7 +191,20 @@ def main() -> None:
             from execution.paper_trader import PaperTrader
             paper_trader = PaperTrader()
 
-        coordinator = Coordinator(paper_trader=paper_trader)
+        notifier = None
+        if args.notify:
+            import yaml
+            from pathlib import Path
+            from notifications.telegram_bot import TelegramNotifier
+            _cfg_path = Path(__file__).parent / "config" / "watchlist.yaml"
+            with open(_cfg_path, encoding="utf-8") as _fh:
+                _cfg = yaml.safe_load(_fh)
+            _cfg.setdefault("telegram", {})["enabled"] = True
+            notifier = TelegramNotifier.from_config(_cfg)
+            if notifier is None:
+                print("  [warn] --notify: Telegram credentials missing — notifications disabled.")
+
+        coordinator = Coordinator(paper_trader=paper_trader, notifier=notifier)
         report = coordinator.run_combined(ticker, account_balance=args.balance)
         print_combined_report(report)
 

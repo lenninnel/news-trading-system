@@ -39,6 +39,7 @@ import yaml  # noqa: E402 — needs path setup first
 
 from config.settings import DB_PATH  # noqa: E402
 from execution.paper_trader import PaperTrader  # noqa: E402
+from notifications.telegram_bot import TelegramNotifier  # noqa: E402
 from orchestrator.coordinator import Coordinator  # noqa: E402
 from storage.database import Database  # noqa: E402
 
@@ -90,6 +91,7 @@ def _load_config() -> dict:
     cfg.setdefault("schedule", {}).setdefault("time", "09:30")
     cfg["schedule"].setdefault("weekdays_only", True)
     cfg.setdefault("email", {}).setdefault("enabled", False)
+    cfg.setdefault("telegram", {}).setdefault("enabled", False)
     return cfg
 
 
@@ -123,7 +125,7 @@ def _send_failure_email(cfg: dict, subject: str, body: str) -> None:
 
 # ── Core run logic ────────────────────────────────────────────────────────────
 
-def run_daily(cfg: dict | None = None) -> None:
+def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None) -> None:
     """Run one full analysis cycle for every ticker in the watchlist."""
     if cfg is None:
         cfg = _load_config()
@@ -150,7 +152,7 @@ def run_daily(cfg: dict | None = None) -> None:
     for ticker in tickers:
         log.info("── %s ─────────────────────────────────────", ticker)
         try:
-            coordinator = Coordinator(paper_trader=paper_trader)
+            coordinator = Coordinator(paper_trader=paper_trader, notifier=notifier)
             report = coordinator.run_combined(
                 ticker,
                 verbose=False,
@@ -258,13 +260,26 @@ def run_daily(cfg: dict | None = None) -> None:
             body=summary,
         )
 
+    # ── Telegram daily summary ────────────────────────────────────────────────
+    if notifier is not None:
+        notifier.send_daily_summary(
+            signals_count=signals_generated,
+            trades_count=trades_executed,
+            portfolio_value=portfolio_value,
+            results=results,
+            errors=errors,
+            status=status,
+        )
+
     log.info("Done in %.1fs  |  status=%s", duration, status)
 
 
 # ── Scheduler loop (daemon mode) ──────────────────────────────────────────────
 
-def _run_daemon(cfg: dict) -> None:
+def _run_daemon(cfg: dict, notifier: TelegramNotifier | None = None) -> None:
     """Block forever, firing run_daily() at the configured time each day."""
+    import functools
+
     try:
         import schedule  # type: ignore[import]
     except ImportError:
@@ -273,13 +288,14 @@ def _run_daemon(cfg: dict) -> None:
 
     run_time      = cfg["schedule"]["time"]      # e.g. "09:30"
     weekdays_only = cfg["schedule"]["weekdays_only"]
+    job           = functools.partial(run_daily, cfg, notifier=notifier)
 
     if weekdays_only:
         for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-            getattr(schedule.every(), day).at(run_time).do(run_daily, cfg=cfg)
+            getattr(schedule.every(), day).at(run_time).do(job)
         log.info("Daemon started — will run Mon–Fri at %s (local time).", run_time)
     else:
-        schedule.every().day.at(run_time).do(run_daily, cfg=cfg)
+        schedule.every().day.at(run_time).do(job)
         log.info("Daemon started — will run daily at %s (local time).", run_time)
 
     while True:
@@ -317,6 +333,12 @@ def main() -> None:
         action="store_true",
         help="Analysis only — do not log paper trades.",
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Telegram notifications (requires telegram section in watchlist.yaml "
+             "and TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars).",
+    )
     args = parser.parse_args()
 
     cfg = _load_config()
@@ -328,11 +350,17 @@ def main() -> None:
         cfg["account"]["balance"] = args.balance
     if args.no_execute:
         cfg["execution"]["enabled"] = False
+    if args.notify:
+        cfg["telegram"]["enabled"] = True
+
+    notifier = TelegramNotifier.from_config(cfg)
+    if notifier:
+        log.info("Telegram notifications enabled.")
 
     if args.now:
-        run_daily(cfg)
+        run_daily(cfg, notifier=notifier)
     else:
-        _run_daemon(cfg)
+        _run_daemon(cfg, notifier=notifier)
 
 
 if __name__ == "__main__":
