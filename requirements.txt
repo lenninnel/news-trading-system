@@ -6,3 +6,5 @@ ta
 streamlit
 streamlit-autorefresh
 plotly
+pyyaml
+schedule

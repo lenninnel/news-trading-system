@@ -172,6 +172,20 @@ class Database:
                     skip_reason       TEXT,
                     created_at        TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS scheduler_logs (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at            TEXT    NOT NULL,
+                    tickers           TEXT    NOT NULL,
+                    signals_generated INTEGER NOT NULL DEFAULT 0,
+                    trades_executed   INTEGER NOT NULL DEFAULT 0,
+                    portfolio_value   REAL    NOT NULL DEFAULT 0,
+                    duration_seconds  REAL,
+                    errors            TEXT,
+                    status            TEXT    NOT NULL,
+                    summary           TEXT,
+                    created_at        TEXT    NOT NULL
+                );
                 """
             )
 
@@ -424,3 +438,58 @@ class Database:
                 "SELECT * FROM headline_scores WHERE run_id = ?", (run_id,)
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def log_scheduler_run(
+        self,
+        run_at: str,
+        tickers: list[str],
+        signals_generated: int,
+        trades_executed: int,
+        portfolio_value: float,
+        duration_seconds: float,
+        errors: list[str],
+        status: str,
+        summary: str,
+    ) -> int:
+        """
+        Persist a scheduler run summary and return its auto-generated ID.
+
+        Args:
+            run_at:            ISO-8601 timestamp when the run started.
+            tickers:           List of tickers that were analysed.
+            signals_generated: Number of combined signals produced.
+            trades_executed:   Number of paper trades logged.
+            portfolio_value:   Total open portfolio value at end of run.
+            duration_seconds:  Wall-clock time for the full run.
+            errors:            List of error strings (empty when clean).
+            status:            "success" | "partial" | "failed".
+            summary:           Human-readable one-paragraph summary.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        import json
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO scheduler_logs
+                    (run_at, tickers, signals_generated, trades_executed,
+                     portfolio_value, duration_seconds, errors, status,
+                     summary, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_at,
+                    json.dumps(tickers),
+                    signals_generated,
+                    trades_executed,
+                    portfolio_value,
+                    duration_seconds,
+                    json.dumps(errors),
+                    status,
+                    summary,
+                    now,
+                ),
+            )
+            return cur.lastrowid

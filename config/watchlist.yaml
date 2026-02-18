@@ -1,0 +1,35 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# News Trading System — daily scheduler configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Tickers to analyse every day
+watchlist:
+  - AAPL
+  - NVDA
+  - TSLA
+  - MSFT
+  - GOOGL
+
+# ── Account ───────────────────────────────────────────────────────────────────
+account:
+  balance: 10000.0          # USD — used for position sizing
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+execution:
+  enabled: true             # true → paper-trade when signal is strong enough
+                            # false → analysis only, nothing written to portfolio
+
+# ── Schedule (daemon mode only — ignored when running with --now) ─────────────
+schedule:
+  time: "09:30"             # HH:MM in LOCAL machine time
+                            # Set this to the local equivalent of 9:30 AM US/Eastern
+  weekdays_only: true       # true → skip Sat/Sun
+
+# ── Email notifications (optional) ───────────────────────────────────────────
+email:
+  enabled: false
+  smtp_host: smtp.gmail.com
+  smtp_port: 587            # STARTTLS
+  from_address: ""          # sender address
+  to_address: ""            # recipient address
+  # Set the SMTP password in the environment:  export SMTP_PASSWORD="yourpassword"
