@@ -3,7 +3,7 @@ News Trading System — command-line entry point.
 
 Usage
 -----
-    python main.py <TICKER> [--balance N] [--agent sentiment|technical]
+    python main.py <TICKER> [--balance N] [--agent sentiment|technical] [--execute]
 
 Examples
 --------
@@ -11,6 +11,7 @@ Examples
     python main.py NVDA --balance 25000          # combined mode, $25k account
     python main.py TSLA --agent sentiment        # sentiment only
     python main.py AAPL --agent technical        # technical only
+    python main.py AAPL --balance 10000 --execute  # combined + log to DB
 """
 
 import argparse
@@ -156,13 +157,19 @@ def main() -> None:
         metavar="USD",
         help="Account balance in USD for position sizing (default: 10000).",
     )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Log the trade to the database (paper execution). "
+             "Only applies to combined mode. Without this flag the "
+             "recommendation is shown but nothing is recorded.",
+    )
     args = parser.parse_args()
 
     ticker = args.ticker.upper()
-    coordinator = Coordinator()
 
     if args.agent == "sentiment":
-        report = coordinator.run(ticker)
+        report = Coordinator().run(ticker)
         print_sentiment_report(report)
 
     elif args.agent == "technical":
@@ -172,8 +179,31 @@ def main() -> None:
         print_technical_report(result)
 
     else:
+        paper_trader = None
+        if args.execute:
+            from execution.paper_trader import PaperTrader
+            paper_trader = PaperTrader()
+
+        coordinator = Coordinator(paper_trader=paper_trader)
         report = coordinator.run_combined(ticker, account_balance=args.balance)
         print_combined_report(report)
+
+        if args.execute:
+            trade_id = report.get("trade_id")
+            if trade_id is not None:
+                print(f"  Paper trade logged  (trade_history id=#{trade_id})")
+                positions = paper_trader.get_portfolio()
+                if positions:
+                    print("\n  Current portfolio:")
+                    for pos in positions:
+                        print(
+                            f"    {pos['ticker']:6s}  "
+                            f"{pos['shares']} shares @ "
+                            f"${pos['avg_price']:.2f}  "
+                            f"(value: ${pos['current_value']:,.2f})"
+                        )
+            else:
+                print("  No trade logged (signal skipped or no position).")
 
 
 if __name__ == "__main__":

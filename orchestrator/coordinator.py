@@ -42,6 +42,11 @@ from data.market_data import MarketData
 from data.news_feed import NewsFeed
 from storage.database import Database
 
+# Optional — only imported when execute mode is active to avoid circular deps
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from execution.paper_trader import PaperTrader
+
 # Maps (sentiment_signal, technical_signal) → combined label
 _FUSION_TABLE: dict[tuple[str, str], str] = {
     ("BUY",  "BUY"):  "STRONG BUY",
@@ -88,6 +93,7 @@ class Coordinator:
         technical_agent: TechnicalAgent | None = None,
         risk_agent: RiskAgent | None = None,
         db: Database | None = None,
+        paper_trader: "PaperTrader | None" = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -96,6 +102,7 @@ class Coordinator:
         # All agents share the same DB instance
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
+        self.paper_trader = paper_trader
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -329,6 +336,20 @@ class Coordinator:
                     f"TP: ${risk['take_profit']:.2f}"
                 )
 
+        # --- Paper execution ---
+        trade_id = None
+        if self.paper_trader is not None and not risk["skipped"]:
+            trade_id = self.paper_trader.track_trade(
+                ticker=ticker,
+                action=risk["direction"],
+                shares=risk["shares"],
+                price=price,
+                stop_loss=risk["stop_loss"],
+                take_profit=risk["take_profit"],
+            )
+            if verbose:
+                print(f"\n  [PAPER TRADE LOGGED]  trade_history id=#{trade_id}")
+
         return {
             "ticker": ticker,
             "sentiment": sentiment,
@@ -338,4 +359,5 @@ class Coordinator:
             "combined_id": combined_id,
             "risk": risk,
             "account_balance": account_balance,
+            "trade_id": trade_id,
         }
