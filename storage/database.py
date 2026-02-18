@@ -186,6 +186,26 @@ class Database:
                     summary           TEXT,
                     created_at        TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker                  TEXT    NOT NULL,
+                    start_date              TEXT    NOT NULL,
+                    end_date                TEXT    NOT NULL,
+                    initial_balance         REAL    NOT NULL,
+                    final_balance           REAL    NOT NULL,
+                    total_return_pct        REAL,
+                    buy_and_hold_return_pct REAL,
+                    sharpe_ratio            REAL,
+                    max_drawdown_pct        REAL,
+                    win_rate_pct            REAL,
+                    avg_win                 REAL,
+                    avg_loss                REAL,
+                    total_trades            INTEGER NOT NULL DEFAULT 0,
+                    sentiment_mode          TEXT,
+                    trades_json             TEXT,
+                    created_at              TEXT    NOT NULL
+                );
                 """
             )
 
@@ -490,6 +510,67 @@ class Database:
                     status,
                     summary,
                     now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_backtest_result(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        initial_balance: float,
+        final_balance: float,
+        total_return_pct: float,
+        buy_and_hold_return_pct: float,
+        sharpe_ratio: float,
+        max_drawdown_pct: float,
+        win_rate_pct: float,
+        avg_win: float,
+        avg_loss: float,
+        total_trades: int,
+        sentiment_mode: str,
+        trades_json: str,
+    ) -> int:
+        """
+        Persist a backtest run summary and return its auto-generated ID.
+
+        Args:
+            ticker:                  Stock ticker symbol.
+            start_date:              Backtest start date string "YYYY-MM-DD".
+            end_date:                Backtest end date string "YYYY-MM-DD".
+            initial_balance:         Starting capital in USD.
+            final_balance:           Ending capital in USD.
+            total_return_pct:        Strategy total return %.
+            buy_and_hold_return_pct: Buy-and-hold return % over same period.
+            sharpe_ratio:            Annualised Sharpe ratio.
+            max_drawdown_pct:        Maximum drawdown % (negative value).
+            win_rate_pct:            Percentage of winning closed trades.
+            avg_win:                 Average profit on winning trades.
+            avg_loss:                Average loss on losing trades.
+            total_trades:            Number of closed trades.
+            sentiment_mode:          Sentiment simulation mode used.
+            trades_json:             JSON-serialised list of individual trades.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO backtest_results
+                    (ticker, start_date, end_date, initial_balance, final_balance,
+                     total_return_pct, buy_and_hold_return_pct, sharpe_ratio,
+                     max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
+                     total_trades, sentiment_mode, trades_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, start_date, end_date, initial_balance, final_balance,
+                    total_return_pct, buy_and_hold_return_pct, sharpe_ratio,
+                    max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
+                    total_trades, sentiment_mode, trades_json, now,
                 ),
             )
             return cur.lastrowid
