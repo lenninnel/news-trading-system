@@ -73,7 +73,7 @@ def badge(sig: str) -> str:
 st.sidebar.title("📈 Trading System")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Signals", "Portfolio", "History", "Agents", "Backtesting"],
+    ["Overview", "Signals", "Portfolio", "History", "Agents", "Backtesting", "Screener"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"DB: `{DB_PATH}`")
@@ -768,5 +768,464 @@ elif page == "Backtesting":
                 label="⬇  Download All Results (CSV)",
                 data=filt.drop(columns=["trades_json"], errors="ignore").to_csv(index=False),
                 file_name="backtest_results_all.csv",
+                mime="text/csv",
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: SCREENER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Screener":
+    st.title("🔍 Stock Screener")
+    st.caption(
+        "Scans DAX 40 · MDAX · SDAX · TecDAX · S&P 500 · NASDAQ 100 · "
+        "EURO STOXX 50 · FTSE 100 · CAC 40 for momentum candidates."
+    )
+
+    tab_run, tab_saved = st.tabs(["▶  Run Screener", "📋  Saved Runs"])
+
+    # ── Shared colour maps ─────────────────────────────────────────────────────
+    COUNTRY_COLORS = {
+        "DE": "#1565c0", "US": "#b71c1c", "GB": "#880e4f",
+        "FR": "#1b5e20", "EU": "#37474f",
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab: Run Screener
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_run:
+        # ── Controls ──────────────────────────────────────────────────────────
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sc_markets = st.multiselect(
+                "Markets to scan",
+                options=["US", "DE", "EU"],
+                default=["US", "DE", "EU"],
+                key="sc_markets",
+            )
+        with c2:
+            sc_focus = st.selectbox(
+                "Focus market",
+                options=["DE", "US", "EU", "None"],
+                index=0,
+                key="sc_focus",
+                help="Gets +0.2 priority bonus and a minimum 10-stock quota in results.",
+            )
+        with c3:
+            sc_top = st.slider(
+                "Top candidates", min_value=10, max_value=80,
+                value=40, step=5, key="sc_top",
+            )
+
+        st.caption(
+            "**Tip:** Live fetch of 150–500 tickers from yfinance. "
+            "Expect 30–90 s depending on network speed and selected markets."
+        )
+
+        if st.button("▶  Run Screener", type="primary", key="sc_run_btn"):
+            if not sc_markets:
+                st.error("Select at least one market to scan.")
+            else:
+                focus_val = None if sc_focus == "None" else sc_focus
+                with st.spinner(
+                    f"Scanning {', '.join(sc_markets)} "
+                    f"(focus: {focus_val or '—'}, top {sc_top})…"
+                ):
+                    try:
+                        from agents.screener_agent import ScreenerAgent  # lazy import
+                        sc_result = ScreenerAgent().run(
+                            markets=sc_markets,
+                            focus_market=focus_val,
+                            top=sc_top,
+                        )
+                        st.session_state["sc_result"] = sc_result
+                        st.cache_data.clear()
+                        st.success(
+                            f"Done — {sc_result['screened']} candidates from "
+                            f"{sc_result['universe_size']} tickers → "
+                            f"top {len(sc_result['candidates'])} returned."
+                        )
+                    except Exception as exc:
+                        st.error(f"Screener failed: {exc}")
+                        st.session_state.pop("sc_result", None)
+
+        # ── Results ───────────────────────────────────────────────────────────
+        if "sc_result" in st.session_state:
+            sc_result  = st.session_state["sc_result"]
+            candidates = sc_result["candidates"]
+
+            if not candidates:
+                st.warning(
+                    "No candidates passed the filters. "
+                    "Markets may be closed or the move thresholds weren't met."
+                )
+            else:
+                df = pd.DataFrame(candidates)
+
+                st.markdown("---")
+
+                # ── KPI strip ─────────────────────────────────────────────────
+                de_count  = int((df["country"] == "DE").sum())
+                us_count  = int((df["country"] == "US").sum())
+                top_row   = df.iloc[0]
+
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                k1.metric("Universe",      sc_result["universe_size"])
+                k2.metric("Passed filters", sc_result["screened"])
+                k3.metric("Returned",      len(candidates))
+                k4.metric("🇩🇪 DE stocks",  de_count)
+                k5.metric("🇺🇸 US stocks",  us_count)
+                k6.metric(
+                    "Top pick",
+                    top_row["ticker"],
+                    help=f"Hotness {top_row['hotness']:.2f}  |  "
+                         f"{top_row['price_change']:+.2f}%  |  "
+                         f"{top_row['volume_ratio']:.1f}× vol",
+                )
+
+                st.markdown("---")
+
+                # ── Charts row ────────────────────────────────────────────────
+                ch1, ch2, ch3 = st.columns([2, 1, 1])
+
+                with ch1:
+                    st.subheader("Hotness Ranking — Top 20")
+                    top20 = df.head(20).copy()
+                    fig_bar = px.bar(
+                        top20.sort_values("hotness"),
+                        x="hotness",
+                        y="ticker",
+                        color="market",
+                        orientation="h",
+                        labels={"hotness": "Hotness (0–10)", "ticker": ""},
+                        hover_data=["price_change", "volume_ratio", "rsi",
+                                    "country", "exchange"],
+                        height=520,
+                    )
+                    fig_bar.update_layout(
+                        margin=dict(t=10, b=10, l=10, r=10),
+                        yaxis={"categoryorder": "total ascending"},
+                        legend=dict(
+                            orientation="h", yanchor="bottom",
+                            y=1.02, xanchor="right", x=1,
+                        ),
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
+                with ch2:
+                    st.subheader("By Country")
+                    ctry = df["country"].value_counts().reset_index()
+                    ctry.columns = ["Country", "Count"]
+                    fig_pie = px.pie(
+                        ctry,
+                        names="Country",
+                        values="Count",
+                        color="Country",
+                        color_discrete_map=COUNTRY_COLORS,
+                        hole=0.4,
+                        height=260,
+                    )
+                    fig_pie.update_layout(margin=dict(t=10, b=10))
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+                    st.subheader("By Index")
+                    mkts = df["market"].value_counts().reset_index()
+                    mkts.columns = ["Index", "Count"]
+                    fig_idx = px.bar(
+                        mkts.sort_values("Count"),
+                        x="Count",
+                        y="Index",
+                        orientation="h",
+                        labels={"Count": "Candidates", "Index": ""},
+                        height=240,
+                    )
+                    fig_idx.update_layout(
+                        margin=dict(t=10, b=10),
+                        yaxis={"categoryorder": "total ascending"},
+                    )
+                    st.plotly_chart(fig_idx, use_container_width=True)
+
+                with ch3:
+                    st.subheader("RSI Distribution")
+                    rsi_df = df["rsi"].dropna()
+                    if not rsi_df.empty:
+                        fig_rsi = px.histogram(
+                            df.dropna(subset=["rsi"]),
+                            x="rsi",
+                            nbins=15,
+                            color="country",
+                            color_discrete_map=COUNTRY_COLORS,
+                            labels={"rsi": "RSI", "count": "Count"},
+                            height=240,
+                        )
+                        fig_rsi.add_vline(x=30, line_dash="dash",
+                                          line_color="green", opacity=0.7,
+                                          annotation_text="Oversold")
+                        fig_rsi.add_vline(x=70, line_dash="dash",
+                                          line_color="red", opacity=0.7,
+                                          annotation_text="Overbought")
+                        fig_rsi.update_layout(
+                            margin=dict(t=10, b=10),
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_rsi, use_container_width=True)
+                    else:
+                        st.info("No RSI data.")
+
+                    st.subheader("Price Change Distribution")
+                    fig_chg = px.histogram(
+                        df,
+                        x="price_change",
+                        nbins=15,
+                        color="country",
+                        color_discrete_map=COUNTRY_COLORS,
+                        labels={"price_change": "Price Change (%)", "count": "Count"},
+                        height=240,
+                    )
+                    fig_chg.add_vline(x=0, line_dash="dash",
+                                      line_color="gray", opacity=0.5)
+                    fig_chg.update_layout(
+                        margin=dict(t=10, b=10),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_chg, use_container_width=True)
+
+                st.markdown("---")
+
+                # ── Volume spike vs price move scatter ────────────────────────
+                st.subheader("Volume Spike vs. Price Move")
+                fig_sc = px.scatter(
+                    df,
+                    x="volume_ratio",
+                    y="price_change",
+                    size="hotness",
+                    color="market",
+                    text="ticker",
+                    hover_data=["rsi", "hotness", "country", "exchange", "avg_volume"],
+                    labels={
+                        "volume_ratio": "Volume Ratio  (today ÷ 20-day avg)",
+                        "price_change": "Price Change (%)",
+                    },
+                    height=440,
+                    size_max=30,
+                )
+                fig_sc.update_traces(textposition="top center", textfont_size=9)
+                fig_sc.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.4)
+                fig_sc.update_layout(margin=dict(t=20, b=20))
+                st.plotly_chart(fig_sc, use_container_width=True)
+
+                st.markdown("---")
+
+                # ── Candidates table ──────────────────────────────────────────
+                st.subheader(f"All Candidates ({len(df)})")
+
+                tf1, tf2, tf3 = st.columns(3)
+                with tf1:
+                    tbl_mkts = st.multiselect(
+                        "Filter by index",
+                        options=sorted(df["market"].unique().tolist()),
+                        default=[],
+                        key="sc_tbl_mkt",
+                        placeholder="All indices",
+                    )
+                with tf2:
+                    tbl_ctry = st.multiselect(
+                        "Filter by country",
+                        options=sorted(df["country"].unique().tolist()),
+                        default=[],
+                        key="sc_tbl_ctry",
+                        placeholder="All countries",
+                    )
+                with tf3:
+                    min_hot = st.slider(
+                        "Min hotness", 0.0, 10.0, 0.0, 0.5, key="sc_min_hot"
+                    )
+
+                tbl = df.copy()
+                if tbl_mkts:
+                    tbl = tbl[tbl["market"].isin(tbl_mkts)]
+                if tbl_ctry:
+                    tbl = tbl[tbl["country"].isin(tbl_ctry)]
+                tbl = tbl[tbl["hotness"] >= min_hot]
+
+                st.caption(f"{len(tbl)} candidate(s) shown")
+
+                d = tbl[[
+                    "ticker", "market", "exchange", "country",
+                    "hotness", "price_change", "volume_ratio", "rsi", "avg_volume", "price",
+                ]].copy()
+                d["hotness"]      = d["hotness"].apply(lambda x: f"{x:.2f}")
+                d["price_change"] = d["price_change"].apply(lambda x: f"{x:+.2f}%")
+                d["volume_ratio"] = d["volume_ratio"].apply(lambda x: f"{x:.1f}×")
+                d["rsi"]          = d["rsi"].apply(
+                    lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                )
+                d["avg_volume"]   = d["avg_volume"].apply(
+                    lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+                )
+                d["price"]        = d["price"].apply(
+                    lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                )
+                d.columns = [
+                    "Ticker", "Index", "Exchange", "Country",
+                    "Hotness", "Chg%", "Vol×", "RSI", "Avg Vol", "Price",
+                ]
+                st.dataframe(d, use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    label="⬇  Download Candidates (CSV)",
+                    data=tbl.to_csv(index=False),
+                    file_name=f"screener_{sc_result['run_at'][:10]}.csv",
+                    mime="text/csv",
+                )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab: Saved Runs
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_saved:
+        st.subheader("Saved Screener Runs")
+        saved = query(
+            "SELECT * FROM screener_results ORDER BY run_at DESC, hotness DESC"
+        )
+
+        if saved.empty:
+            st.info(
+                "No saved runs yet. "
+                "Use the ▶ Run Screener tab — results are persisted automatically."
+            )
+        else:
+            # ── Run selector ──────────────────────────────────────────────────
+            run_dates = sorted(saved["run_at"].unique().tolist(), reverse=True)
+            run_labels = {
+                r: (
+                    f"{r[:19].replace('T', ' ')} UTC  "
+                    f"({int((saved['run_at'] == r).sum())} stocks)"
+                )
+                for r in run_dates[:50]
+            }
+
+            sv1, sv2, sv3 = st.columns(3)
+            with sv1:
+                sel_run = st.selectbox(
+                    "Select run",
+                    options=list(run_labels.keys()),
+                    format_func=lambda r: run_labels.get(r, r),
+                    key="sc_saved_run",
+                )
+            with sv2:
+                sv_mkts = st.multiselect(
+                    "Filter by index",
+                    options=sorted(saved["market"].unique().tolist()),
+                    default=[],
+                    key="sc_sv_mkt",
+                    placeholder="All indices",
+                )
+            with sv3:
+                sv_ctry = st.multiselect(
+                    "Filter by country",
+                    options=sorted(saved["country"].dropna().unique().tolist()),
+                    default=[],
+                    key="sc_sv_ctry",
+                    placeholder="All countries",
+                )
+
+            run_df = saved[saved["run_at"] == sel_run].copy()
+            if sv_mkts:
+                run_df = run_df[run_df["market"].isin(sv_mkts)]
+            if sv_ctry:
+                run_df = run_df[run_df["country"].isin(sv_ctry)]
+            run_df = run_df.sort_values("hotness", ascending=False)
+
+            st.caption(f"{len(run_df)} candidate(s) in this run")
+
+            # ── Table ─────────────────────────────────────────────────────────
+            d = run_df[[
+                "ticker", "name", "market", "exchange", "country",
+                "hotness", "price_change", "volume_ratio", "rsi", "avg_volume",
+            ]].copy()
+            d["hotness"]      = d["hotness"].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+            )
+            d["price_change"] = d["price_change"].apply(
+                lambda x: f"{x:+.2f}%" if pd.notna(x) else "—"
+            )
+            d["volume_ratio"] = d["volume_ratio"].apply(
+                lambda x: f"{x:.1f}×" if pd.notna(x) else "—"
+            )
+            d["rsi"]          = d["rsi"].apply(
+                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+            )
+            d["avg_volume"]   = d["avg_volume"].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+            )
+            d.columns = [
+                "Ticker", "Name", "Index", "Exchange", "Country",
+                "Hotness", "Chg%", "Vol×", "RSI", "Avg Vol",
+            ]
+            st.dataframe(d, use_container_width=True, hide_index=True)
+
+            # ── Charts for saved run ───────────────────────────────────────────
+            if len(run_df) >= 3:
+                st.markdown("---")
+                sv_ch1, sv_ch2 = st.columns([1.6, 1])
+
+                with sv_ch1:
+                    st.subheader("Hotness Ranking — Top 20")
+                    top20_sv = run_df.head(20).copy()
+                    fig_sv = px.bar(
+                        top20_sv.sort_values("hotness"),
+                        x="hotness",
+                        y="ticker",
+                        color="market",
+                        orientation="h",
+                        labels={"hotness": "Hotness Score", "ticker": ""},
+                        height=460,
+                    )
+                    fig_sv.update_layout(
+                        margin=dict(t=10, b=10),
+                        yaxis={"categoryorder": "total ascending"},
+                    )
+                    st.plotly_chart(fig_sv, use_container_width=True)
+
+                with sv_ch2:
+                    st.subheader("By Country")
+                    ctry_sv = run_df["country"].value_counts().reset_index()
+                    ctry_sv.columns = ["Country", "Count"]
+                    fig_sv_pie = px.pie(
+                        ctry_sv,
+                        names="Country",
+                        values="Count",
+                        color="Country",
+                        color_discrete_map=COUNTRY_COLORS,
+                        hole=0.4,
+                        height=220,
+                    )
+                    fig_sv_pie.update_layout(margin=dict(t=10, b=10))
+                    st.plotly_chart(fig_sv_pie, use_container_width=True)
+
+                    st.subheader("By Index")
+                    mkt_sv = run_df["market"].value_counts().reset_index()
+                    mkt_sv.columns = ["Index", "Count"]
+                    fig_sv_idx = px.bar(
+                        mkt_sv.sort_values("Count"),
+                        x="Count",
+                        y="Index",
+                        orientation="h",
+                        labels={"Count": "Stocks", "Index": ""},
+                        height=220,
+                    )
+                    fig_sv_idx.update_layout(
+                        margin=dict(t=10, b=10),
+                        yaxis={"categoryorder": "total ascending"},
+                    )
+                    st.plotly_chart(fig_sv_idx, use_container_width=True)
+
+            # ── Download ──────────────────────────────────────────────────────
+            st.download_button(
+                label="⬇  Download This Run (CSV)",
+                data=run_df.drop(
+                    columns=["id", "metrics", "created_at"], errors="ignore"
+                ).to_csv(index=False),
+                file_name=f"screener_{sel_run[:10]}.csv",
                 mime="text/csv",
             )
