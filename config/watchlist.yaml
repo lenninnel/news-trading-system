@@ -34,6 +34,17 @@ email:
   to_address: ""            # recipient address
   # Set the SMTP password in the environment:  export SMTP_PASSWORD="yourpassword"
 
+# ── Screener ──────────────────────────────────────────────────────────────────
+screener:
+  markets: [US, DE, EU]          # market groups to scan
+  focus_market: DE               # gets priority weighting + minimum quota
+  top_candidates: 40             # how many stocks to return
+  german_indices: [DAX, MDAX, SDAX, TecDAX]
+  # Thresholds override (optional — defaults come from screener_agent.py)
+  # blue_chip_min_volume_ratio: 2.0
+  # mid_cap_min_volume_ratio: 1.5
+  # min_price_change_pct: 3.0
+
 # ── Telegram notifications (optional) ────────────────────────────────────────
 telegram:
   enabled: false

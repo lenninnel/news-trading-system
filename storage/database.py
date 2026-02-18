@@ -206,6 +206,24 @@ class Database:
                     trades_json             TEXT,
                     created_at              TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS screener_results (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at       TEXT    NOT NULL,
+                    ticker       TEXT    NOT NULL,
+                    name         TEXT,
+                    market       TEXT    NOT NULL,
+                    exchange     TEXT,
+                    country      TEXT,
+                    hotness      REAL,
+                    price_change REAL,
+                    volume_ratio REAL,
+                    rsi          REAL,
+                    market_cap   REAL,
+                    avg_volume   REAL,
+                    metrics      TEXT,
+                    created_at   TEXT    NOT NULL
+                );
                 """
             )
 
@@ -513,6 +531,55 @@ class Database:
                 ),
             )
             return cur.lastrowid
+
+    def log_screener_results(self, run_at: str, results: list[dict]) -> int:
+        """
+        Persist a batch of screener candidates and return the row count inserted.
+
+        Args:
+            run_at:  ISO-8601 timestamp of the screener run.
+            results: List of candidate dicts — each must contain at minimum
+                     'ticker' and 'market'.  Optional keys: name, exchange,
+                     country, hotness, price_change, volume_ratio, rsi,
+                     market_cap, avg_volume.  The full dict is also stored
+                     as a JSON blob in the ``metrics`` column.
+
+        Returns:
+            Number of rows inserted.
+        """
+        import json
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                run_at,
+                r.get("ticker", ""),
+                r.get("name"),
+                r.get("market", ""),
+                r.get("exchange"),
+                r.get("country"),
+                r.get("hotness"),
+                r.get("price_change"),
+                r.get("volume_ratio"),
+                r.get("rsi"),
+                r.get("market_cap"),
+                r.get("avg_volume"),
+                json.dumps(r),
+                now,
+            )
+            for r in results
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO screener_results
+                    (run_at, ticker, name, market, exchange, country,
+                     hotness, price_change, volume_ratio, rsi, market_cap,
+                     avg_volume, metrics, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
 
     def log_backtest_result(
         self,
