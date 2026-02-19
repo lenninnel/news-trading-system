@@ -17,6 +17,7 @@ load_dotenv()
 
 NEWSAPI_KEY: str = os.environ.get("NEWSAPI_KEY", "")
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+ALPHA_VANTAGE_KEY: str = os.environ.get("ALPHA_VANTAGE_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Claude model

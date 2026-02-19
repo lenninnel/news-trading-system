@@ -45,6 +45,7 @@ from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from config.settings import BUY_THRESHOLD, SELL_THRESHOLD
 from data.market_data import MarketData
+from data.news_aggregator import NewsAggregator
 from data.news_feed import NewsFeed
 from storage.database import Database
 
@@ -95,7 +96,7 @@ class Coordinator:
 
     def __init__(
         self,
-        news_feed: NewsFeed | None = None,
+        news_feed: "NewsFeed | NewsAggregator | None" = None,
         market_data: MarketData | None = None,
         sentiment_agent: SentimentAgent | None = None,
         technical_agent: TechnicalAgent | None = None,
@@ -106,7 +107,7 @@ class Coordinator:
         strategy_coordinator: "StrategyCoordinator | None" = None,
     ) -> None:
         self.db = db or Database()
-        self.news_feed = news_feed or NewsFeed()
+        self.news_feed = news_feed or NewsAggregator(db=self.db)
         self.market_data = market_data or MarketData()
         self.sentiment_agent = sentiment_agent or SentimentAgent()
         # All agents share the same DB instance

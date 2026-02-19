@@ -71,6 +71,13 @@ health_monitor:
   memory_max_pct: 80.0      # maximum memory usage %
   scheduler_max_age_h: 24   # alert if scheduler hasn't run in this many hours
 
+# ── Fallback chain configuration ─────────────────────────────────────────────
+fallbacks:
+  enabled: true                  # true → enable all multi-source fallback chains
+  prefer_cached_over_fallback: false  # true → serve cache before hitting L2 RSS
+  max_cache_age_hours: 24        # invalidate cached headlines/prices after this
+  alert_on_fallback_usage: true  # warn when a service has been on fallback >24 h
+
 # ── Telegram notifications (optional) ────────────────────────────────────────
 telegram:
   enabled: false
