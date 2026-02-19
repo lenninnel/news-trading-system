@@ -43,6 +43,7 @@ jobs:
           python -m pytest tests/test_coordinator.py \
                            tests/test_risk_agent.py \
                            tests/test_technical_agent.py \
+                           tests/test_recovery.py \
                            -v --tb=short --no-header \
                            --cov=. --cov-report=xml --cov-report=term-missing \
                            --cov-omit="tests/*,deployment/*"
@@ -57,6 +58,14 @@ jobs:
                            -v --tb=short --no-header
         env:
           DB_PATH: /tmp/integration_test.db
+          ANTHROPIC_API_KEY: dummy_key_for_tests
+          NEWSAPI_KEY: dummy_key_for_tests
+
+      - name: Run resilience test
+        run: |
+          python scheduler/daily_runner.py --resilience-test
+        env:
+          DB_PATH: /tmp/resilience_test.db
           ANTHROPIC_API_KEY: dummy_key_for_tests
           NEWSAPI_KEY: dummy_key_for_tests
 
@@ -156,7 +165,7 @@ jobs:
             "scheduler_logs", "health_checks", "emergency_stops",
             "portfolio_snapshots", "portfolio_violations", "price_alerts",
             "optimization_results", "backtest_results", "screener_results",
-            "backtest_strategy_comparison",
+            "backtest_strategy_comparison", "recovery_log",
           }
 
           conn   = sqlite3.connect("/tmp/schema_check.db")

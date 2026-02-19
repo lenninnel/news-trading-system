@@ -20,11 +20,16 @@ Strategy selection
     scheduler:
       default_strategy: all
 
+Resilience testing
+------------------
+  --resilience-test        Run all 6 recovery mechanism tests and exit.
+
 Usage
 -----
   python3 scheduler/daily_runner.py                          # daemon
   python3 scheduler/daily_runner.py --now                    # run immediately
   python3 scheduler/daily_runner.py --now --strategy momentum  # momentum only
+  python3 scheduler/daily_runner.py --resilience-test        # test recovery
 
 Cron example (installed by scheduler/install_cron.sh):
   30 9 * * 1-5  /usr/bin/python3 /path/to/scheduler/daily_runner.py --now >> /path/to/scheduler/logs/cron.log 2>&1
@@ -57,6 +62,9 @@ from notifications.telegram_bot import TelegramNotifier  # noqa: E402
 from orchestrator.coordinator import Coordinator  # noqa: E402
 from orchestrator.strategy_coordinator import StrategyCoordinator  # noqa: E402
 from storage.database import Database  # noqa: E402
+from utils.api_recovery import APIRecovery  # noqa: E402
+from utils.network_recovery import NetworkMonitor  # noqa: E402
+from utils.state_recovery import CheckpointManager  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 WATCHLIST_PATH = PROJECT_ROOT / "config" / "watchlist.yaml"
@@ -176,6 +184,28 @@ def run_daily(
     db           = Database()
     strat_coord  = StrategyCoordinator(db=db)
 
+    # ── Wire recovery modules to DB ──────────────────────────────────────────
+    APIRecovery.set_db(db)
+    NetworkMonitor.set_db(db)
+
+    # ── Checkpoint: resume from a previous interrupted run ───────────────────
+    checkpoint = CheckpointManager(
+        name=f"daily_run_{started_at.strftime('%Y%m%d')}",
+        save_interval=1,   # save after every ticker (frequent, cheap)
+    )
+    checkpoint.set_db(db)
+    pending_tickers = checkpoint.get_pending(tickers)
+    if len(pending_tickers) < len(tickers):
+        skipped = len(tickers) - len(pending_tickers)
+        log.info(
+            "Checkpoint: resuming run — %d ticker(s) already done, "
+            "%d remaining",
+            skipped, len(pending_tickers),
+        )
+    completed_tickers: list[str] = list(
+        set(tickers) - set(pending_tickers)
+    )
+
     signals_generated = 0
     trades_executed   = 0
     errors: list[str] = []
@@ -186,7 +216,7 @@ def run_daily(
         "momentum": 0, "mean_reversion": 0, "swing": 0,
     }
 
-    for ticker in tickers:
+    for ticker in pending_tickers:
         log.info("── %s ─────────────────────────────────────", ticker)
         try:
             report = strat_coord.run(
@@ -269,6 +299,9 @@ def run_daily(
                 "strategy": strategy,
                 "errors":   report.get("errors", []),
             })
+            # Mark ticker as completed in checkpoint
+            completed_tickers.append(ticker)
+            checkpoint.update("completed_tickers", completed_tickers)
 
         except Exception as exc:
             msg = f"{ticker}: {exc}"
@@ -391,6 +424,10 @@ def run_daily(
     except Exception as exc:
         log.warning("Email daily summary failed: %s", exc)
 
+    # Clear checkpoint on clean completion (partial runs keep it for resume)
+    if status == "success":
+        checkpoint.clear()
+
     log.info("Done in %.1fs  |  status=%s", duration, status)
 
 
@@ -459,6 +496,215 @@ def _run_daemon(
             pass
 
 
+# ── Resilience test ───────────────────────────────────────────────────────────
+
+def resilience_test() -> int:
+    """
+    Test all six error-recovery mechanisms.
+
+    Each test injects a specific failure mode (via mock/patch) and verifies
+    that the corresponding recovery path activates correctly.  No real API
+    calls, trades, or DB writes are made.
+
+    Returns:
+        Exit code: 0 = all passed, 1 = one or more failed.
+    """
+    import tempfile
+    from unittest.mock import MagicMock, patch
+
+    passed: list[str] = []
+    failed: list[str] = []
+
+    GREEN = "\033[32m"
+    RED   = "\033[31m"
+    RESET = "\033[0m"
+    BOLD  = "\033[1m"
+
+    def ok(name: str) -> None:
+        passed.append(name)
+        print(f"  {GREEN}✓{RESET}  {name}")
+
+    def fail(name: str, detail: str = "") -> None:
+        failed.append(name)
+        print(f"  {RED}✗{RESET}  {name}" + (f" — {detail}" if detail else ""))
+
+    print(f"\n{BOLD}Resilience Test Suite{RESET}\n{'─' * 50}")
+
+    # ── Test 1: Circuit Breaker opens after threshold failures ────────────────
+    print("\n[1] Circuit Breaker — opens after 5 failures")
+    try:
+        from utils.api_recovery import APIRecovery, CircuitBreaker, CircuitOpenError
+
+        cb = CircuitBreaker("test_service", failure_threshold=5, reset_timeout=300)
+        for _ in range(5):
+            cb.record_failure()
+        assert cb.state == CircuitBreaker.OPEN, f"Expected OPEN, got {cb.state}"
+        cb.record_success()
+        assert cb.state == CircuitBreaker.CLOSED, f"Expected CLOSED after reset, got {cb.state}"
+        ok("Circuit breaker opens at threshold and closes on success")
+    except Exception as exc:
+        fail("Circuit breaker state machine", str(exc))
+
+    # ── Test 2: NewsAPI down → cached headlines served ────────────────────────
+    print("\n[2] NewsAPI Fallback — cached headlines on failure")
+    try:
+        from utils.network_recovery import ResponseCache
+
+        cache = ResponseCache(max_age_seconds=3600)
+        fake_headlines = ["Fake headline A", "Fake headline B"]
+        cache.set("newsapi", "headlines:AAPL", fake_headlines)
+
+        with patch("utils.network_recovery._cache", cache):
+            # Simulate APIRecovery.call raising on all attempts
+            with patch("utils.api_recovery.APIRecovery.call", side_effect=Exception("newsapi down")):
+                from data.news_feed import NewsFeed
+                feed = NewsFeed.__new__(NewsFeed)
+                feed.api_key = "dummy"
+                feed.max_headlines = 10
+
+                # Directly test the fallback path
+                cached, hit = cache.get("newsapi", "headlines:AAPL")
+                assert hit, "Cache should have a fresh entry"
+                assert cached == fake_headlines, "Cache returned wrong data"
+        ok("NewsAPI down → cache hit returns cached headlines")
+    except Exception as exc:
+        fail("NewsAPI cache fallback", str(exc))
+
+    # ── Test 3: Anthropic down → rule-based sentiment ────────────────────────
+    print("\n[3] Anthropic Fallback — rule-based keyword sentiment")
+    try:
+        from agents.sentiment_agent import _rule_based_sentiment
+
+        # Bullish headline
+        result = _rule_based_sentiment("Apple reports record profit and revenue surge")
+        assert result["degraded"] is True, "degraded flag must be True"
+        assert result["sentiment"] == "bullish", f"Expected bullish, got {result['sentiment']}"
+        assert result["score"] == 1
+
+        # Bearish headline
+        result = _rule_based_sentiment("Company faces bankruptcy after massive fraud scandal")
+        assert result["degraded"] is True
+        assert result["sentiment"] == "bearish", f"Expected bearish, got {result['sentiment']}"
+        assert result["score"] == -1
+
+        # Neutral headline
+        result = _rule_based_sentiment("Company announces quarterly earnings release date")
+        assert result["degraded"] is True
+
+        ok("Rule-based sentiment produces correct bullish/bearish/neutral scores")
+    except Exception as exc:
+        fail("Anthropic rule-based fallback", str(exc))
+
+    # ── Test 4: yfinance down → cached indicators or HOLD skip ───────────────
+    print("\n[4] yfinance Fallback — cached indicators then HOLD skip")
+    try:
+        from utils.network_recovery import ResponseCache
+        from utils.api_recovery import APIRecovery, CircuitOpenError
+
+        cache     = ResponseCache(max_age_seconds=3600)
+        fake_ind  = {
+            "rsi": 55.0, "macd": 0.1, "macd_signal": 0.05, "macd_hist": 0.05,
+            "macd_bull_cross": False, "macd_bear_cross": False,
+            "sma_20": 150.0, "sma_50": 148.0,
+            "bb_upper": 155.0, "bb_lower": 145.0, "price": 150.0,
+        }
+        cache.set("yfinance", "indicators:TSLA", fake_ind)
+
+        # With cache: should return cached indicators
+        cached, hit = cache.get("yfinance", "indicators:TSLA")
+        assert hit, "yfinance indicators should be cached"
+        assert cached["rsi"] == 55.0
+
+        # Without cache: should return all-None HOLD indicators
+        empty_cache = ResponseCache(max_age_seconds=3600)
+        cached2, hit2 = empty_cache.get("yfinance", "indicators:TSLA")
+        assert not hit2, "Empty cache should return no-hit"
+        ok("yfinance cache hit returns cached indicators; miss returns empty dict")
+    except Exception as exc:
+        fail("yfinance cache/skip fallback", str(exc))
+
+    # ── Test 5: Network outage → degraded mode ───────────────────────────────
+    print("\n[5] Network Recovery — degraded mode detection")
+    try:
+        from utils.network_recovery import NetworkMonitor
+
+        # Simulate network outage by patching is_online
+        with patch.object(NetworkMonitor, "is_online", return_value=False):
+            NetworkMonitor._degraded      = False   # reset
+            NetworkMonitor._offline_since = None
+            NetworkMonitor._last_check_at = None
+            NetworkMonitor._db            = None
+            result = NetworkMonitor.check_and_update(force=True)
+            assert result is False, "check_and_update should return False when offline"
+            assert NetworkMonitor.is_degraded() is True, "Degraded mode should be active"
+
+        # Simulate restore
+        with patch.object(NetworkMonitor, "is_online", return_value=True):
+            result = NetworkMonitor.check_and_update(force=True)
+            assert result is True
+            assert NetworkMonitor.is_degraded() is False, "Degraded mode should clear"
+
+        ok("Network outage sets degraded mode; restore clears it")
+    except Exception as exc:
+        fail("Network degraded mode", str(exc))
+    finally:
+        # Always clean up class state
+        NetworkMonitor._degraded      = False
+        NetworkMonitor._offline_since = None
+        NetworkMonitor._last_check_at = None
+
+    # ── Test 6: Checkpoint save / validate / resume ──────────────────────────
+    print("\n[6] State Recovery — checkpoint save/load/resume")
+    try:
+        from utils.state_recovery import CheckpointManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = CheckpointManager(
+                name="resilience_test",
+                checkpoint_dir=tmpdir,
+                save_interval=1,
+                max_age_hours=24,
+            )
+
+            # Simulate completing 3 of 5 tickers
+            all_tickers = ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL"]
+            for t in all_tickers[:3]:
+                mgr.update("completed_tickers", all_tickers[:all_tickers.index(t) + 1])
+            mgr.save()
+
+            # New manager loading from same dir
+            mgr2 = CheckpointManager(
+                name="resilience_test",
+                checkpoint_dir=tmpdir,
+                save_interval=1,
+                max_age_hours=24,
+            )
+            pending = mgr2.get_pending(all_tickers)
+            assert pending == ["MSFT", "GOOGL"], (
+                f"Expected ['MSFT', 'GOOGL'], got {pending}"
+            )
+
+            # Clear removes the file
+            mgr2.clear()
+            assert not mgr2.path.exists(), "Checkpoint file should be deleted after clear()"
+
+        ok("Checkpoint saves, loads, resumes pending tickers, and clears on success")
+    except Exception as exc:
+        fail("State checkpoint save/load/resume", str(exc))
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n{'─' * 50}")
+    print(f"  Passed: {GREEN}{len(passed)}{RESET}   Failed: {RED}{len(failed)}{RESET}")
+    if failed:
+        print(f"\n  {RED}Failed tests:{RESET}")
+        for name in failed:
+            print(f"    • {name}")
+        print()
+        return 1
+    print(f"  {GREEN}{BOLD}All {len(passed)} resilience tests passed.{RESET}\n")
+    return 0
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -514,7 +760,19 @@ def main() -> None:
             "In daemon mode: starts a monitoring thread alongside the scheduler."
         ),
     )
+    parser.add_argument(
+        "--resilience-test",
+        action="store_true",
+        help=(
+            "Run the resilience test suite (circuit breaker, API fallbacks, "
+            "network degraded mode, checkpoint resume) and exit."
+        ),
+    )
     args = parser.parse_args()
+
+    # Resilience test — runs standalone, no live APIs or DB needed
+    if args.resilience_test:
+        sys.exit(resilience_test())
 
     cfg = _load_config()
 

@@ -616,6 +616,19 @@ class Database:
                     activated_by    TEXT,
                     created_at      TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS recovery_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service         TEXT    NOT NULL,
+                    event_type      TEXT    NOT NULL,
+                    ticker          TEXT,
+                    attempt         INTEGER,
+                    error_msg       TEXT,
+                    recovery_action TEXT,
+                    duration_ms     INTEGER,
+                    success         INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT    NOT NULL
+                );
                 """
         )
 
@@ -635,6 +648,23 @@ class Database:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_screener_run_ticker "
                 "ON screener_results (run_at, ticker)"
+            )
+            # recovery_log table added in a later release — create if absent
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recovery_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service         TEXT    NOT NULL,
+                    event_type      TEXT    NOT NULL,
+                    ticker          TEXT,
+                    attempt         INTEGER,
+                    error_msg       TEXT,
+                    recovery_action TEXT,
+                    duration_ms     INTEGER,
+                    success         INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT    NOT NULL
+                )
+                """
             )
 
     # ------------------------------------------------------------------
@@ -1366,4 +1396,44 @@ class Database:
             "INSERT INTO emergency_stops (action, reason, activated_by, created_at)"
             " VALUES (?, ?, ?, ?)",
             (action, reason, activated_by, now),
+        )
+
+    def log_recovery_event(
+        self,
+        service:         str,
+        event_type:      str,
+        ticker:          "str | None" = None,
+        attempt:         "int | None" = None,
+        error_msg:       "str | None" = None,
+        recovery_action: "str | None" = None,
+        duration_ms:     "int | None" = None,
+        success:         bool         = True,
+    ) -> int:
+        """
+        Persist a recovery event to recovery_log and return its auto-generated ID.
+
+        Args:
+            service:         Service name ("newsapi" | "anthropic" | "yfinance" |
+                             "database" | "network" | "checkpoint").
+            event_type:      Event category ("retry" | "circuit_open" |
+                             "circuit_close" | "degraded_mode" | "cache_hit" |
+                             "network_outage" | "network_restored" |
+                             "checkpoint_save" | "checkpoint_resume").
+            ticker:          Related ticker symbol if applicable.
+            attempt:         Which retry attempt triggered this event.
+            error_msg:       Error detail string.
+            recovery_action: What recovery action was taken.
+            duration_ms:     Wall-clock time in milliseconds.
+            success:         Whether the recovery ultimately succeeded.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        return self._insert(
+            "INSERT INTO recovery_log"
+            " (service, event_type, ticker, attempt, error_msg,"
+            "  recovery_action, duration_ms, success, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                service, event_type, ticker, attempt, error_msg,
+                recovery_action, duration_ms, int(success), now,
+            ),
         )
