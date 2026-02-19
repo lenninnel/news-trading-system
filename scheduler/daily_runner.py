@@ -455,6 +455,15 @@ def main() -> None:
             "Overrides scheduler.default_strategy in watchlist.yaml."
         ),
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help=(
+            "Start the price monitor after the daily run. "
+            "In --now mode: runs one check-now pass after the cycle. "
+            "In daemon mode: starts a monitoring thread alongside the scheduler."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = _load_config()
@@ -479,7 +488,21 @@ def main() -> None:
 
     if args.now:
         run_daily(cfg, notifier=notifier, strategy=strategy)
+        if args.monitor:
+            from monitoring.price_monitor import PriceMonitor
+            log.info("Running post-trade price check...")
+            monitor = PriceMonitor(cfg=cfg, notifier=notifier)
+            alerts  = monitor.check_now()
+            log.info("Price check: %d alert(s) fired.", len(alerts))
     else:
+        # Daemon mode: optionally spin up monitoring in a background thread
+        if args.monitor:
+            import threading
+            from monitoring.price_monitor import PriceMonitor
+            monitor     = PriceMonitor(cfg=cfg, notifier=notifier)
+            mon_thread  = threading.Thread(target=monitor.run_daemon, daemon=True, name="price-monitor")
+            mon_thread.start()
+            log.info("Price monitor thread started (daemon=True).")
         _run_daemon(cfg, notifier=notifier, strategy=strategy)
 
 

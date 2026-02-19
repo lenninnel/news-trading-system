@@ -143,6 +143,18 @@ portfolio_violations
                             "max_deployed" | "correlation"
     reason         TEXT     Human-readable explanation
     created_at     TEXT     ISO-8601 UTC timestamp
+
+price_alerts
+    id           INTEGER  Primary key
+    ticker       TEXT     Stock ticker symbol
+    alert_type   TEXT     "stop_loss" | "take_profit" | "price_move" | "volume_spike"
+    price        REAL     Current price when alert fired
+    stop_loss    REAL     Stop-loss level (NULL for non-SL alerts)
+    take_profit  REAL     Take-profit level (NULL for non-TP alerts)
+    change_pct   REAL     Intraday price change % (NULL for volume alerts)
+    volume_ratio REAL     Volume as multiple of average (NULL for price alerts)
+    message      TEXT     Full human-readable alert message
+    created_at   TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -382,6 +394,19 @@ class Database:
                     violation_type TEXT    NOT NULL,
                     reason         TEXT    NOT NULL,
                     created_at     TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS price_alerts (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker       TEXT    NOT NULL,
+                    alert_type   TEXT    NOT NULL,
+                    price        REAL    NOT NULL,
+                    stop_loss    REAL,
+                    take_profit  REAL,
+                    change_pct   REAL,
+                    volume_ratio REAL,
+                    message      TEXT    NOT NULL,
+                    created_at   TEXT    NOT NULL
                 );
                 """
             )
@@ -780,6 +805,47 @@ class Database:
                     combined_signal, ensemble_confidence, consensus,
                     risk_calc_id, account_balance, errors_json, now,
                 ),
+            )
+            return cur.lastrowid
+
+    def log_price_alert(
+        self,
+        ticker: str,
+        alert_type: str,
+        price: float,
+        message: str,
+        stop_loss: "float | None" = None,
+        take_profit: "float | None" = None,
+        change_pct: "float | None" = None,
+        volume_ratio: "float | None" = None,
+    ) -> int:
+        """
+        Persist a price alert event and return its auto-generated ID.
+
+        Args:
+            ticker:       Stock ticker symbol.
+            alert_type:   "stop_loss" | "take_profit" | "price_move" | "volume_spike".
+            price:        Current price when the alert fired.
+            message:      Full human-readable alert message.
+            stop_loss:    Stop-loss level (None for non-SL alerts).
+            take_profit:  Take-profit level (None for non-TP alerts).
+            change_pct:   Intraday price change % (None for volume alerts).
+            volume_ratio: Volume multiple of average (None for price alerts).
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO price_alerts
+                    (ticker, alert_type, price, stop_loss, take_profit,
+                     change_pct, volume_ratio, message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, alert_type, price, stop_loss, take_profit,
+                 change_pct, volume_ratio, message, now),
             )
             return cur.lastrowid
 

@@ -285,6 +285,16 @@ class TelegramNotifier:
 
         self._send("\n".join(lines))
 
+    def send_price_alert(self, message: str) -> None:
+        """
+        Send a price / stop-loss / take-profit alert from PriceMonitor.
+
+        Args:
+            message: Pre-formatted alert string from PriceMonitor
+                     (already contains emoji and ticker details).
+        """
+        self._send(message[:500])
+
     def send_error(self, message: str) -> None:
         """
         Send a plain error alert.

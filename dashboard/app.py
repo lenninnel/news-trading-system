@@ -73,7 +73,7 @@ def badge(sig: str) -> str:
 st.sidebar.title("📈 Trading System")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Signals", "Portfolio", "History", "Agents", "Backtesting", "Screener"],
+    ["Overview", "Signals", "Portfolio", "History", "Agents", "Backtesting", "Screener", "Monitoring"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"DB: `{DB_PATH}`")
@@ -102,12 +102,24 @@ if page == "Overview":
     signals_today = len(today_sigs) if not today_sigs.empty else 0
 
     # ── KPI row ───────────────────────────────────────────────────────────────
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Portfolio Value",  fmt_usd(total_value),
               help="Entry-based (shares × avg price)")
     k2.metric("Open Positions",   open_pos)
     k3.metric("Total Trades",     total_trades)
     k4.metric("Signals Today",    signals_today)
+
+    # Monitoring status KPI
+    _last_alert_row = query(
+        "SELECT created_at, alert_type FROM price_alerts ORDER BY id DESC LIMIT 1"
+    )
+    if not _last_alert_row.empty:
+        _last_ts = pd.to_datetime(_last_alert_row["created_at"].iloc[0])
+        _last_lbl = _last_ts.strftime("%H:%M")
+        _last_type = _last_alert_row["alert_type"].iloc[0].replace("_", " ").title()
+        k5.metric("Last Alert", _last_lbl, help=f"Type: {_last_type}")
+    else:
+        k5.metric("Last Alert", "—", help="No price alerts yet")
 
     st.markdown("---")
 
@@ -1721,3 +1733,196 @@ elif page == "Screener":
                 file_name=f"screener_{sel_run[:10]}.csv",
                 mime="text/csv",
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: MONITORING
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Monitoring":
+    st.title("Price Monitor")
+
+    # ── Market hours status ───────────────────────────────────────────────────
+    try:
+        from monitoring.price_monitor import PriceMonitor as _PM, _TZ_ET, _TZ_CET
+        _mon_tmp = _PM()
+        _mkt_status = _mon_tmp._market_status()
+        _mkt_open   = _mon_tmp._is_market_hours()
+    except Exception:
+        _mkt_status = "unavailable"
+        _mkt_open   = False
+
+    status_col, cmd_col = st.columns([2, 1])
+    with status_col:
+        if _mkt_open:
+            st.success(f"Market open: {_mkt_status}")
+        else:
+            st.info(f"Market closed: {_mkt_status}")
+
+    with cmd_col:
+        st.caption("Start monitoring:")
+        st.code("python3 monitoring/price_monitor.py --check-now", language="bash")
+
+    st.markdown("---")
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    alerts_today = query(
+        "SELECT * FROM price_alerts WHERE date(created_at) = date('now')"
+    )
+    alerts_all   = query("SELECT * FROM price_alerts ORDER BY id DESC")
+    last_alert   = query(
+        "SELECT created_at, ticker, alert_type FROM price_alerts ORDER BY id DESC LIMIT 1"
+    )
+
+    total_alerts = len(alerts_all)  if not alerts_all.empty  else 0
+    today_count  = len(alerts_today) if not alerts_today.empty else 0
+
+    sl_count = int((alerts_all["alert_type"] == "stop_loss").sum())   if not alerts_all.empty else 0
+    tp_count = int((alerts_all["alert_type"] == "take_profit").sum()) if not alerts_all.empty else 0
+    pm_count = int((alerts_all["alert_type"] == "price_move").sum())  if not alerts_all.empty else 0
+    vs_count = int((alerts_all["alert_type"] == "volume_spike").sum())if not alerts_all.empty else 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Alerts",    total_alerts)
+    k2.metric("Alerts Today",    today_count)
+    k3.metric("Stop-Loss Hits",  sl_count, help="All time")
+    k4.metric("Take-Profit Hits",tp_count, help="All time")
+    k5.metric("Price Moves",     pm_count + vs_count, help="Price move + volume spike alerts")
+
+    st.markdown("---")
+
+    # ── Alert type distribution chart ─────────────────────────────────────────
+    col_dist, col_tl = st.columns([1, 1.6])
+
+    with col_dist:
+        st.subheader("Alert Distribution")
+        if not alerts_all.empty:
+            dist = alerts_all["alert_type"].value_counts().reset_index()
+            dist.columns = ["Type", "Count"]
+            dist["Type"] = dist["Type"].str.replace("_", " ").str.title()
+            _ALERT_COLORS = {
+                "Stop Loss":    "#e74c3c",
+                "Take Profit":  "#2ecc71",
+                "Price Move":   "#f39c12",
+                "Volume Spike": "#3498db",
+            }
+            fig_dist = px.pie(
+                dist, values="Count", names="Type",
+                color="Type", color_discrete_map=_ALERT_COLORS,
+                hole=0.4,
+            )
+            fig_dist.update_layout(margin=dict(t=10, b=10), height=240)
+            st.plotly_chart(fig_dist, use_container_width=True)
+        else:
+            st.info("No alerts yet.")
+
+    with col_tl:
+        st.subheader("Alerts Over Time")
+        if not alerts_all.empty and len(alerts_all) > 1:
+            tl = alerts_all.copy()
+            tl["created_at"] = pd.to_datetime(tl["created_at"])
+            tl["date"]        = tl["created_at"].dt.date
+            tl_counts = (
+                tl.groupby(["date", "alert_type"]).size()
+                .reset_index(name="count")
+            )
+            tl_counts["alert_type"] = tl_counts["alert_type"].str.replace("_", " ").str.title()
+            fig_tl = px.bar(
+                tl_counts, x="date", y="count", color="alert_type",
+                labels={"date": "Date", "count": "Alerts", "alert_type": "Type"},
+                color_discrete_map={
+                    "Stop Loss":    "#e74c3c",
+                    "Take Profit":  "#2ecc71",
+                    "Price Move":   "#f39c12",
+                    "Volume Spike": "#3498db",
+                },
+            )
+            fig_tl.update_layout(margin=dict(t=10, b=10), height=240, showlegend=True)
+            st.plotly_chart(fig_tl, use_container_width=True)
+        else:
+            st.info("Need multiple alert events to show timeline.")
+
+    st.markdown("---")
+
+    # ── Open positions with stop/TP levels ────────────────────────────────────
+    st.subheader("Monitored Positions")
+    try:
+        from monitoring.price_monitor import PriceMonitor as _PM2
+        _mon2 = _PM2()
+        _positions_mon = _mon2._get_open_positions()
+        if _positions_mon:
+            _rows = []
+            for p in _positions_mon:
+                _rows.append({
+                    "Ticker":      p["ticker"],
+                    "Shares":      p["shares"],
+                    "Avg Price":   fmt_usd(p["avg_price"]),
+                    "Stop Loss":   fmt_usd(p["stop_loss"])   if p["stop_loss"]   else "—",
+                    "Take Profit": fmt_usd(p["take_profit"]) if p["take_profit"] else "—",
+                    "SL Set":      "✅" if p["stop_loss"]   else "⚠️",
+                    "TP Set":      "✅" if p["take_profit"] else "⚠️",
+                })
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+            _missing = sum(1 for p in _positions_mon if not p["stop_loss"])
+            if _missing:
+                st.warning(
+                    f"⚠️ {_missing} position(s) have no stop-loss recorded. "
+                    "Trades logged via `--execute` include stop/TP levels automatically."
+                )
+        else:
+            st.info("No open positions to monitor.")
+    except Exception as _e:
+        st.warning(f"Could not load monitored positions: {_e}")
+
+    st.markdown("---")
+
+    # ── Recent alerts table ───────────────────────────────────────────────────
+    st.subheader("Recent Alerts")
+
+    _alert_filter = st.selectbox(
+        "Filter by type",
+        ["All", "Stop Loss", "Take Profit", "Price Move", "Volume Spike"],
+        key="mon_filter",
+    )
+
+    if not alerts_all.empty:
+        disp = alerts_all.copy()
+        if _alert_filter != "All":
+            _type_key = _alert_filter.lower().replace(" ", "_")
+            disp = disp[disp["alert_type"] == _type_key]
+
+        if disp.empty:
+            st.info(f"No {_alert_filter} alerts recorded.")
+        else:
+            disp = disp.head(50).copy()
+            disp["created_at"]  = pd.to_datetime(disp["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+            disp["alert_type"]  = disp["alert_type"].str.replace("_", " ").str.title()
+            disp["price"]       = disp["price"].apply(fmt_usd)
+            disp["stop_loss"]   = disp["stop_loss"].apply(
+                lambda x: fmt_usd(x) if pd.notna(x) else "—"
+            )
+            disp["take_profit"] = disp["take_profit"].apply(
+                lambda x: fmt_usd(x) if pd.notna(x) else "—"
+            )
+            disp["change_pct"]  = disp["change_pct"].apply(
+                lambda x: f"{x:+.1f}%" if pd.notna(x) else "—"
+            )
+            disp["volume_ratio"] = disp["volume_ratio"].apply(
+                lambda x: f"{x:.1f}×" if pd.notna(x) else "—"
+            )
+            disp = disp[["created_at", "ticker", "alert_type", "price",
+                          "stop_loss", "take_profit", "change_pct", "volume_ratio", "message"]]
+            disp.columns = ["Time", "Ticker", "Type", "Price", "Stop", "Target",
+                            "Change", "Vol Ratio", "Message"]
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "⬇ Download Alerts (CSV)",
+                data=disp.to_csv(index=False),
+                file_name="price_alerts.csv",
+                mime="text/csv",
+            )
+    else:
+        st.info(
+            "No price alerts yet. Run:\n"
+            "`python3 monitoring/price_monitor.py --check-now`"
+        )

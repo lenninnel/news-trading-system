@@ -51,6 +51,17 @@ screener:
   # mid_cap_min_volume_ratio: 1.5
   # min_price_change_pct: 3.0
 
+# ── Monitoring (price alerts & stop-loss tracking) ────────────────────────────
+monitoring:
+  enabled: true
+  check_interval: 60        # seconds between checks
+  market_hours_only: true   # only run during NYSE / XETRA hours
+  auto_close_on_stop: false # auto-sell position when stop-loss is hit
+  volume_spike_threshold: 3.0   # x times 20-day avg volume
+  price_move_threshold: 5.0     # % intraday move to alert
+  max_alerts_per_day: 5         # per (ticker, alert_type) pair
+  alert_cooldown: 300           # seconds between repeated same alerts
+
 # ── Telegram notifications (optional) ────────────────────────────────────────
 telegram:
   enabled: false
