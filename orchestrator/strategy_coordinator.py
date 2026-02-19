@@ -93,6 +93,7 @@ class StrategyCoordinator:
         ticker: str,
         account_balance: float = 10_000.0,
         verbose: bool = True,
+        strategy: str = "all",
     ) -> dict:
         """
         Run all three strategy agents in parallel and return a combined result.
@@ -101,6 +102,8 @@ class StrategyCoordinator:
             ticker:          Stock ticker symbol.
             account_balance: Account value for RiskAgent position sizing.
             verbose:         Print progress to stdout.
+            strategy:        Which agents to run: "momentum" | "mean-reversion" |
+                             "swing" | "all" (default).
 
         Returns:
             dict with keys:
@@ -118,15 +121,14 @@ class StrategyCoordinator:
         ticker = ticker.upper()
         run_at = datetime.now(timezone.utc).isoformat()
 
+        active_agents = self._select_agents(strategy)
+
         if verbose:
-            print(
-                f"\n  Running {self._momentum.name}, "
-                f"{self._mean_reversion.name}, "
-                f"{self._swing.name} in parallel..."
-            )
+            names = ", ".join(a.name for a in active_agents)
+            print(f"\n  Running {names} in parallel...")
 
         # 1. Parallel execution
-        signals, errors = self._run_all_agents(ticker)
+        signals, errors = self._run_all_agents(ticker, active_agents)
 
         if verbose:
             for sig in signals:
@@ -200,6 +202,7 @@ class StrategyCoordinator:
 
         return {
             "ticker":                   ticker,
+            "strategy":                 strategy,
             "strategy_signals":         [self._signal_to_dict(s) for s in signals],
             "ranked_signals":           [self._signal_to_dict(s) for s in ranked],
             "combined_strategy_signal": combined_signal,
@@ -215,15 +218,44 @@ class StrategyCoordinator:
     # Parallel execution
     # ------------------------------------------------------------------
 
+    def _select_agents(self, strategy: str) -> list:
+        """
+        Return the subset of agents to run for the given strategy name.
+
+        Args:
+            strategy: "all" | "momentum" | "mean-reversion" | "swing"
+
+        Returns:
+            List of StrategyAgent instances to execute.
+        """
+        if strategy == "all":
+            return [self._momentum, self._mean_reversion, self._swing]
+        strategy_map = {
+            "momentum":       self._momentum,
+            "mean-reversion": self._mean_reversion,
+            "mean_reversion": self._mean_reversion,
+            "swing":          self._swing,
+        }
+        agent = strategy_map.get(strategy)
+        if agent is None:
+            log.warning("Unknown strategy %r — running all agents.", strategy)
+            return [self._momentum, self._mean_reversion, self._swing]
+        return [agent]
+
     def _run_all_agents(
-        self, ticker: str
+        self, ticker: str, agents: list | None = None
     ) -> tuple[list[StrategySignal], list[str]]:
         """
-        Execute all three agents concurrently.
+        Execute the given agents concurrently.
 
         Uses as_completed() so a single agent failure does not cancel others.
+
+        Args:
+            ticker: Stock ticker symbol.
+            agents: Agents to run. Defaults to all three when None.
         """
-        agents = [self._momentum, self._mean_reversion, self._swing]
+        if agents is None:
+            agents = [self._momentum, self._mean_reversion, self._swing]
         results: list[StrategySignal] = []
         errors:  list[str]            = []
 

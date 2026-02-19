@@ -9,10 +9,22 @@ Two modes
   Instant (--now)      Run one full cycle immediately and exit.
                        Used by cron jobs and for manual testing.
 
+Strategy selection
+------------------
+  --strategy all           Run MomentumAgent + MeanReversionAgent + SwingAgent (default)
+  --strategy momentum      Run MomentumAgent only
+  --strategy mean-reversion  Run MeanReversionAgent only
+  --strategy swing         Run SwingAgent only
+
+  Default strategy can also be set in config/watchlist.yaml:
+    scheduler:
+      default_strategy: all
+
 Usage
 -----
-  python3 scheduler/daily_runner.py          # daemon — waits for schedule time
-  python3 scheduler/daily_runner.py --now    # run immediately
+  python3 scheduler/daily_runner.py                          # daemon
+  python3 scheduler/daily_runner.py --now                    # run immediately
+  python3 scheduler/daily_runner.py --now --strategy momentum  # momentum only
 
 Cron example (installed by scheduler/install_cron.sh):
   30 9 * * 1-5  /usr/bin/python3 /path/to/scheduler/daily_runner.py --now >> /path/to/scheduler/logs/cron.log 2>&1
@@ -41,6 +53,7 @@ from config.settings import DB_PATH  # noqa: E402
 from execution.paper_trader import PaperTrader  # noqa: E402
 from notifications.telegram_bot import TelegramNotifier  # noqa: E402
 from orchestrator.coordinator import Coordinator  # noqa: E402
+from orchestrator.strategy_coordinator import StrategyCoordinator  # noqa: E402
 from storage.database import Database  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -92,6 +105,7 @@ def _load_config() -> dict:
     cfg["schedule"].setdefault("weekdays_only", True)
     cfg.setdefault("email", {}).setdefault("enabled", False)
     cfg.setdefault("telegram", {}).setdefault("enabled", False)
+    cfg.setdefault("scheduler", {}).setdefault("default_strategy", "all")
     return cfg
 
 
@@ -125,8 +139,20 @@ def _send_failure_email(cfg: dict, subject: str, body: str) -> None:
 
 # ── Core run logic ────────────────────────────────────────────────────────────
 
-def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None) -> None:
-    """Run one full analysis cycle for every ticker in the watchlist."""
+def run_daily(
+    cfg: dict | None = None,
+    notifier: TelegramNotifier | None = None,
+    strategy: str = "all",
+) -> None:
+    """
+    Run one full analysis cycle for every ticker in the watchlist.
+
+    Args:
+        cfg:      Configuration dict (loaded from watchlist.yaml when None).
+        notifier: Optional TelegramNotifier for signal/trade alerts.
+        strategy: Strategy agents to use: "all" | "momentum" |
+                  "mean-reversion" | "swing".
+    """
     if cfg is None:
         cfg = _load_config()
 
@@ -136,37 +162,90 @@ def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None)
 
     started_at = datetime.now(timezone.utc)
     log.info("=" * 60)
-    log.info("Daily runner started  |  %d tickers  |  balance $%.2f  |  execute=%s",
-             len(tickers), balance, execute)
+    log.info(
+        "Daily runner started  |  %d tickers  |  balance $%.2f  |  "
+        "execute=%s  |  strategy=%s",
+        len(tickers), balance, execute, strategy,
+    )
     log.info("Tickers: %s", ", ".join(tickers))
     log.info("=" * 60)
 
     paper_trader = PaperTrader() if execute else None
     db           = Database()
+    strat_coord  = StrategyCoordinator(db=db)
 
     signals_generated = 0
     trades_executed   = 0
     errors: list[str] = []
     results: list[dict] = []
 
+    # Per-agent signal counts (non-HOLD signals only)
+    strategy_counts: dict[str, int] = {
+        "momentum": 0, "mean_reversion": 0, "swing": 0,
+    }
+
     for ticker in tickers:
         log.info("── %s ─────────────────────────────────────", ticker)
         try:
-            coordinator = Coordinator(paper_trader=paper_trader, notifier=notifier)
-            report = coordinator.run_combined(
-                ticker,
-                verbose=False,
+            report = strat_coord.run(
+                ticker=ticker,
                 account_balance=balance,
+                verbose=False,
+                strategy=strategy,
             )
 
-            sig   = report["combined_signal"]
-            conf  = report["confidence"]
-            risk  = report["risk"]
-            trade = report.get("trade_id")
+            sig  = report["combined_strategy_signal"]
+            conf = report["ensemble_confidence"] / 100.0   # normalise to 0–1
+            risk = report["risk"]
+
+            # Count active (non-HOLD) per-agent signals for the breakdown
+            for sig_info in report.get("strategy_signals", []):
+                if sig_info["signal"] in ("BUY", "SELL"):
+                    strat_key = sig_info["strategy"]  # "momentum" | "mean_reversion" | "swing"
+                    strategy_counts[strat_key] = strategy_counts.get(strat_key, 0) + 1
 
             signals_generated += 1
+
+            # Paper execution (strategy mode handles risk sizing but not trading)
+            trade = None
+            if paper_trader and not risk["skipped"]:
+                price = risk.get("current_price") or 0.0
+                trade = paper_trader.track_trade(
+                    ticker=ticker,
+                    action=risk["direction"],
+                    shares=risk["shares"],
+                    price=price,
+                    stop_loss=risk["stop_loss"],
+                    take_profit=risk["take_profit"],
+                )
+
             if trade is not None:
                 trades_executed += 1
+
+            # Telegram signal alert
+            if notifier is not None:
+                top_reasons = [
+                    s["reasoning"][0]
+                    for s in report.get("ranked_signals", [])
+                    if s.get("reasoning")
+                ][:2]
+                reasoning = "  |  ".join(top_reasons)
+                notifier.send_signal(
+                    ticker=ticker,
+                    signal=sig,
+                    confidence=conf * 100,
+                    reasoning=reasoning,
+                )
+                if trade is not None and not risk["skipped"]:
+                    price = risk.get("current_price") or 0.0
+                    notifier.send_trade_executed(
+                        ticker=ticker,
+                        action=risk["direction"],
+                        shares=risk["shares"],
+                        price=price,
+                        stop_loss=risk["stop_loss"],
+                        take_profit=risk["take_profit"],
+                    )
 
             log.info(
                 "%s  →  %s  (conf: %.0f%%)  |  %s",
@@ -176,15 +255,17 @@ def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None)
                 (f"TRADE #{trade}  ${risk['position_size_usd']:,.2f}  "
                  f"{risk['shares']} sh  SL ${risk['stop_loss']:.2f}  TP ${risk['take_profit']:.2f}")
                 if trade else
-                (f"no trade — {risk.get('skip_reason', 'skipped')}"),
+                f"no trade — {risk.get('skip_reason', 'skipped')}",
             )
 
             results.append({
-                "ticker":  ticker,
-                "signal":  sig,
-                "conf":    conf,
-                "traded":  trade is not None,
+                "ticker":   ticker,
+                "signal":   sig,
+                "conf":     conf,
+                "traded":   trade is not None,
                 "trade_id": trade,
+                "strategy": strategy,
+                "errors":   report.get("errors", []),
             })
 
         except Exception as exc:
@@ -210,9 +291,16 @@ def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None)
         status = "failed"
 
     # ── Summary report ────────────────────────────────────────────────────────
+    _STRATEGY_LABELS = {
+        "momentum":       "Momentum",
+        "mean_reversion": "Mean Reversion",
+        "swing":          "Swing",
+    }
+
     lines = [
         f"Run completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Status          : {status.upper()}",
+        f"Strategy        : {strategy}",
         f"Tickers checked : {len(tickers)}",
         f"Signals         : {signals_generated}",
         f"Trades executed : {trades_executed}",
@@ -223,6 +311,20 @@ def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None)
         lines.append(f"Errors          : {len(errors)}")
         for e in errors:
             lines.append(f"  • {e}")
+
+    # Strategy breakdown — only show strategies that were actually active
+    active_counts = {
+        k: v for k, v in strategy_counts.items() if v > 0
+    }
+    if active_counts:
+        parts = []
+        for key, label in _STRATEGY_LABELS.items():
+            if key in active_counts:
+                n = active_counts[key]
+                parts.append(f"{label}: {n} signal{'s' if n != 1 else ''}")
+        if parts:
+            lines.append(f"Strategy breakdown: {', '.join(parts)}")
+
     if results:
         lines.append("\nSignal breakdown:")
         for r in results:
@@ -276,7 +378,11 @@ def run_daily(cfg: dict | None = None, notifier: TelegramNotifier | None = None)
 
 # ── Scheduler loop (daemon mode) ──────────────────────────────────────────────
 
-def _run_daemon(cfg: dict, notifier: TelegramNotifier | None = None) -> None:
+def _run_daemon(
+    cfg: dict,
+    notifier: TelegramNotifier | None = None,
+    strategy: str = "all",
+) -> None:
     """Block forever, firing run_daily() at the configured time each day."""
     import functools
 
@@ -288,7 +394,7 @@ def _run_daemon(cfg: dict, notifier: TelegramNotifier | None = None) -> None:
 
     run_time      = cfg["schedule"]["time"]      # e.g. "09:30"
     weekdays_only = cfg["schedule"]["weekdays_only"]
-    job           = functools.partial(run_daily, cfg, notifier=notifier)
+    job           = functools.partial(run_daily, cfg, notifier=notifier, strategy=strategy)
 
     if weekdays_only:
         for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
@@ -339,6 +445,16 @@ def main() -> None:
         help="Send Telegram notifications (requires telegram section in watchlist.yaml "
              "and TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars).",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=["momentum", "mean-reversion", "swing", "all"],
+        default=None,
+        metavar="STRATEGY",
+        help=(
+            "Strategy agents to run: momentum | mean-reversion | swing | all. "
+            "Overrides scheduler.default_strategy in watchlist.yaml."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = _load_config()
@@ -353,14 +469,18 @@ def main() -> None:
     if args.notify:
         cfg["telegram"]["enabled"] = True
 
+    # Resolve strategy: CLI flag > config file > hardcoded default
+    strategy = args.strategy or cfg["scheduler"].get("default_strategy", "all")
+    log.info("Strategy mode: %s", strategy)
+
     notifier = TelegramNotifier.from_config(cfg)
     if notifier:
         log.info("Telegram notifications enabled.")
 
     if args.now:
-        run_daily(cfg, notifier=notifier)
+        run_daily(cfg, notifier=notifier, strategy=strategy)
     else:
-        _run_daemon(cfg, notifier=notifier)
+        _run_daemon(cfg, notifier=notifier, strategy=strategy)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,12 @@ schedule:
                             # Set this to the local equivalent of 9:30 AM US/Eastern
   weekdays_only: true       # true → skip Sat/Sun
 
+# ── Scheduler strategy ────────────────────────────────────────────────────────
+scheduler:
+  default_strategy: all     # all | momentum | mean-reversion | swing
+                            # Controls which strategy agents run each cycle.
+                            # Override at runtime with --strategy CLI flag.
+
 # ── Email notifications (optional) ───────────────────────────────────────────
 email:
   enabled: false

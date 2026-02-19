@@ -125,6 +125,7 @@ class Coordinator:
         ticker: str,
         account_balance: float = 10_000.0,
         verbose: bool = True,
+        strategy: str = "all",
     ) -> dict:
         """
         Run the multi-strategy pipeline (momentum + mean-reversion + swing).
@@ -136,12 +137,14 @@ class Coordinator:
             ticker:          Stock ticker symbol (e.g. "AAPL").
             account_balance: Account size in USD for position sizing.
             verbose:         Print progress to stdout.
+            strategy:        Which agents to run: "momentum" | "mean-reversion" |
+                             "swing" | "all" (default).
 
         Returns:
             dict — same structure as StrategyCoordinator.run():
-                ticker, strategy_signals, ranked_signals,
+                ticker, strategy, strategy_signals, ranked_signals,
                 combined_strategy_signal, ensemble_confidence,
-                consensus, risk, strategy_run_id, errors
+                consensus, risk, account_balance, strategy_run_id, errors
         """
         if self._strategy_coordinator is None:
             from orchestrator.strategy_coordinator import StrategyCoordinator
@@ -151,6 +154,7 @@ class Coordinator:
             ticker=ticker,
             account_balance=account_balance,
             verbose=verbose,
+            strategy=strategy,
         )
 
     # ------------------------------------------------------------------
