@@ -1,1 +1,15 @@
-{}
+TSLA:
+  momentum:
+    max_dd: -0.75
+    optimized_at: '2026-02-19T14:38:34Z'
+    params:
+      rsi_threshold: 60
+      stop_pct: 0.02
+      take_profit_pct: 0.08
+      vol_multiplier: 1.5
+    range: "2024-01-01 \u2192 2025-01-01"
+    return_pct: 2.63
+    sharpe: 3.27
+    stability: 1.666
+    trade_count: 10.5
+    win_rate: 51.6
