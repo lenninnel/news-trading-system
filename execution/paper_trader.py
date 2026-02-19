@@ -25,8 +25,12 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from config.settings import DB_PATH
+
+# Kill-switch flag file location (same directory as project root)
+_FLAG_FILE = Path(__file__).resolve().parent.parent / "emergency_stop.flag"
 
 
 class PaperTrader:
@@ -116,6 +120,21 @@ class PaperTrader:
         Returns:
             The integer primary key of the new trade_history row.
         """
+        # ── Kill-switch check ────────────────────────────────────────────────
+        if _FLAG_FILE.exists():
+            import json as _json
+            try:
+                state = _json.loads(_FLAG_FILE.read_text(encoding="utf-8"))
+                act = state.get("action", "unknown")
+                at  = state.get("activated_at", "unknown")
+            except Exception:
+                act, at = "unknown", "unknown"
+            raise RuntimeError(
+                f"Kill switch active ({act} since {at}): trade blocked for {ticker}. "
+                f"Run: python3 emergency_stop.py --resume"
+            )
+        # ── End kill-switch check ─────────────────────────────────────────────
+
         ticker = ticker.upper()
         action = action.upper()
         now = datetime.now(timezone.utc).isoformat()

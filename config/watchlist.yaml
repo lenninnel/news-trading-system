@@ -62,6 +62,15 @@ monitoring:
   max_alerts_per_day: 5         # per (ticker, alert_type) pair
   alert_cooldown: 300           # seconds between repeated same alerts
 
+# ── System Health Monitor ────────────────────────────────────────────────────
+health_monitor:
+  enabled: true
+  interval: 300             # seconds between checks (default: 5 min)
+  http_port: 9090           # embedded JSON /health endpoint (0 = disabled)
+  disk_min_gb: 1.0          # minimum free disk space in GB
+  memory_max_pct: 80.0      # maximum memory usage %
+  scheduler_max_age_h: 24   # alert if scheduler hasn't run in this many hours
+
 # ── Telegram notifications (optional) ────────────────────────────────────────
 telegram:
   enabled: false

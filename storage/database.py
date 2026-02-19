@@ -595,6 +595,27 @@ class Database:
                     window_results_json TEXT,
                     created_at          TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS health_checks (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checked_at      TEXT    NOT NULL,
+                    database_ok     INTEGER NOT NULL DEFAULT 0,
+                    api_keys_ok     INTEGER NOT NULL DEFAULT 0,
+                    scheduler_ok    INTEGER NOT NULL DEFAULT 0,
+                    disk_ok         INTEGER NOT NULL DEFAULT 0,
+                    memory_ok       INTEGER NOT NULL DEFAULT 0,
+                    overall_ok      INTEGER NOT NULL DEFAULT 0,
+                    details_json    TEXT,
+                    created_at      TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS emergency_stops (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action          TEXT    NOT NULL,
+                    reason          TEXT,
+                    activated_by    TEXT,
+                    created_at      TEXT    NOT NULL
+                );
                 """
         )
 
@@ -1305,4 +1326,44 @@ class Database:
                 max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
                 total_trades, sentiment_mode, trades_json, now,
             ),
+        )
+
+    def log_health_check(
+        self,
+        checked_at: str,
+        database_ok: bool,
+        api_keys_ok: bool,
+        scheduler_ok: bool,
+        disk_ok: bool,
+        memory_ok: bool,
+        overall_ok: bool,
+        details_json: "str | None" = None,
+    ) -> int:
+        """Persist a system health-check result and return its auto-generated ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        return self._insert(
+            "INSERT INTO health_checks"
+            " (checked_at, database_ok, api_keys_ok, scheduler_ok,"
+            "  disk_ok, memory_ok, overall_ok, details_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                checked_at,
+                int(database_ok), int(api_keys_ok), int(scheduler_ok),
+                int(disk_ok), int(memory_ok), int(overall_ok),
+                details_json, now,
+            ),
+        )
+
+    def log_emergency_stop(
+        self,
+        action: str,
+        reason: "str | None" = None,
+        activated_by: "str | None" = None,
+    ) -> int:
+        """Persist a kill-switch activation event and return its auto-generated ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        return self._insert(
+            "INSERT INTO emergency_stops (action, reason, activated_by, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (action, reason, activated_by, now),
         )

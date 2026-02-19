@@ -36,8 +36,10 @@ import argparse
 import json
 import logging
 import os
+import signal
 import smtplib
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
@@ -373,6 +375,22 @@ def run_daily(
             status=status,
         )
 
+    # ── Email daily summary ───────────────────────────────────────────────────
+    try:
+        from notifications.email_notifier import EmailNotifier
+        email_notifier = EmailNotifier.from_config(cfg)
+        if email_notifier:
+            email_notifier.send_daily_summary(
+                signals_count=signals_generated,
+                trades_count=trades_executed,
+                portfolio_value=portfolio_value,
+                results=results,
+                errors=errors,
+                status=status,
+            )
+    except Exception as exc:
+        log.warning("Email daily summary failed: %s", exc)
+
     log.info("Done in %.1fs  |  status=%s", duration, status)
 
 
@@ -392,7 +410,23 @@ def _run_daemon(
         log.error("'schedule' package not installed.  Run: pip install schedule")
         sys.exit(1)
 
-    run_time      = cfg["schedule"]["time"]      # e.g. "09:30"
+    # Register PID for kill-switch --stop-all support
+    try:
+        from emergency_stop import KillSwitch
+        KillSwitch.register_pid("scheduler")
+    except Exception:
+        pass
+
+    _shutdown = threading.Event()
+
+    def _handle_signal(sig, _frame):
+        log.info("Signal %s received — scheduler daemon shutting down gracefully.", sig)
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
+
+    run_time      = cfg["schedule"]["time"]
     weekdays_only = cfg["schedule"]["weekdays_only"]
     job           = functools.partial(run_daily, cfg, notifier=notifier, strategy=strategy)
 
@@ -404,9 +438,25 @@ def _run_daemon(
         schedule.every().day.at(run_time).do(job)
         log.info("Daemon started — will run daily at %s (local time).", run_time)
 
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+    try:
+        while not _shutdown.is_set():
+            # Honour kill switch
+            try:
+                from emergency_stop import KillSwitch
+                if KillSwitch.is_stopped():
+                    log.warning("Kill switch active — scheduler daemon exiting.")
+                    break
+            except Exception:
+                pass
+            schedule.run_pending()
+            _shutdown.wait(timeout=30)
+    finally:
+        log.info("Scheduler daemon stopped.")
+        try:
+            from emergency_stop import KillSwitch
+            KillSwitch.unregister_pid("scheduler")
+        except Exception:
+            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
