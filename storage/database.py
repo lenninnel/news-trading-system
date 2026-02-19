@@ -86,6 +86,20 @@ strategy_signals
     risk_calc_id        INTEGER  FK → risk_calculations.id
     created_at          TEXT     ISO-8601 UTC timestamp
 
+backtest_strategy_comparison
+    id            INTEGER  Primary key
+    ticker        TEXT     Stock ticker symbol
+    start_date    TEXT     Backtest start date "YYYY-MM-DD"
+    end_date      TEXT     Backtest end date "YYYY-MM-DD"
+    strategy      TEXT     "momentum" | "mean_reversion" | "swing" | "buy_and_hold"
+    total_return  REAL     Total return percent
+    sharpe        REAL     Annualised Sharpe ratio
+    max_dd        REAL     Maximum drawdown percent (negative)
+    win_rate      REAL     Win rate percent 0–100
+    trade_count   INTEGER  Number of completed trades
+    avg_hold_days REAL     Average holding period in calendar days
+    created_at    TEXT     ISO-8601 UTC timestamp
+
 strategy_performance
     id                        INTEGER  Primary key
     ticker                    TEXT     Stock ticker symbol
@@ -265,6 +279,21 @@ class Database:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_screener_run_ticker
                     ON screener_results (run_at, ticker);
+
+                CREATE TABLE IF NOT EXISTS backtest_strategy_comparison (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker        TEXT    NOT NULL,
+                    start_date    TEXT    NOT NULL,
+                    end_date      TEXT    NOT NULL,
+                    strategy      TEXT    NOT NULL,
+                    total_return  REAL,
+                    sharpe        REAL,
+                    max_dd        REAL,
+                    win_rate      REAL,
+                    trade_count   INTEGER,
+                    avg_hold_days REAL,
+                    created_at    TEXT    NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS strategy_signals (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -533,6 +562,55 @@ class Database:
                     position_size_usd, shares, stop_loss, take_profit,
                     risk_amount, kelly_fraction, stop_pct,
                     int(skipped), skip_reason, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_strategy_comparison(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        strategy: str,
+        total_return: float,
+        sharpe: float,
+        max_dd: float,
+        win_rate: float,
+        trade_count: int,
+        avg_hold_days: float = 0.0,
+    ) -> int:
+        """
+        Persist one strategy's result from a compare_strategies() run.
+
+        Args:
+            ticker:        Stock ticker symbol.
+            start_date:    Backtest start date "YYYY-MM-DD".
+            end_date:      Backtest end date "YYYY-MM-DD".
+            strategy:      "momentum" | "mean_reversion" | "swing" | "buy_and_hold".
+            total_return:  Total return percent.
+            sharpe:        Annualised Sharpe ratio.
+            max_dd:        Maximum drawdown percent (negative value).
+            win_rate:      Win rate percent (0–100).
+            trade_count:   Number of completed trades.
+            avg_hold_days: Average holding period in calendar days.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO backtest_strategy_comparison
+                    (ticker, start_date, end_date, strategy,
+                     total_return, sharpe, max_dd, win_rate,
+                     trade_count, avg_hold_days, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, start_date, end_date, strategy,
+                    total_return, sharpe, max_dd, win_rate,
+                    trade_count, avg_hold_days, now,
                 ),
             )
             return cur.lastrowid

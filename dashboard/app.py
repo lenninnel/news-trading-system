@@ -508,7 +508,9 @@ elif page == "Agents":
 elif page == "Backtesting":
     st.title("Backtesting")
 
-    tab_run, tab_saved = st.tabs(["▶  Run Backtest", "📋  Saved Results"])
+    tab_run, tab_saved, tab_compare = st.tabs(
+        ["▶  Run Backtest", "📋  Saved Results", "🔀  Strategy Comparison"]
+    )
 
     # ── Tab: Run ──────────────────────────────────────────────────────────────
     with tab_run:
@@ -770,6 +772,257 @@ elif page == "Backtesting":
                 file_name="backtest_results_all.csv",
                 mime="text/csv",
             )
+
+
+    # ── Tab: Strategy Comparison ──────────────────────────────────────────────
+    with tab_compare:
+        st.subheader("Strategy Comparison")
+        st.caption(
+            "Backtest Momentum, Mean Reversion, and Swing strategies on the "
+            "same ticker / date range and compare performance side-by-side."
+        )
+
+        _STRATEGY_COLORS = {
+            "Momentum":    "#4fc3f7",
+            "Mean Rev.":   "#a5d6a7",
+            "Swing":       "#ffcc80",
+            "Buy & Hold":  "#90a4ae",
+        }
+
+        COMPARE_TICKERS = [
+            "AAPL", "NVDA", "TSLA", "MSFT", "GOOGL",
+            "AMZN", "META", "NFLX", "AMD", "INTC",
+            "SPY", "QQQ",
+        ]
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        with cc1:
+            cmp_ticker = st.selectbox("Ticker", COMPARE_TICKERS, key="cmp_ticker")
+        with cc2:
+            cmp_start = st.date_input(
+                "Start date", value=date(2024, 1, 1), key="cmp_start"
+            )
+        with cc3:
+            cmp_end = st.date_input(
+                "End date", value=date(2025, 1, 1), key="cmp_end"
+            )
+        with cc4:
+            cmp_balance = st.number_input(
+                "Initial balance ($)", min_value=1_000, max_value=1_000_000,
+                value=10_000, step=1_000, key="cmp_balance",
+            )
+
+        cmp_clicked = st.button("▶  Run Comparison", type="primary", key="cmp_run")
+
+        if cmp_clicked:
+            if cmp_start >= cmp_end:
+                st.error("Start date must be before end date.")
+            else:
+                with st.spinner(
+                    f"Running all 3 strategies on {cmp_ticker} "
+                    f"({cmp_start} → {cmp_end})…"
+                ):
+                    try:
+                        from backtest.engine import BacktestEngine
+                        cmp_engine = BacktestEngine(
+                            ticker          = cmp_ticker,
+                            start_date      = str(cmp_start),
+                            end_date        = str(cmp_end),
+                            initial_balance = float(cmp_balance),
+                            verbose         = False,
+                        )
+                        cmp_result = cmp_engine.compare_strategies()
+                        cmp_fig    = cmp_engine.plot_comparison(
+                            cmp_result, show=False, save_path=None
+                        )
+                        st.session_state["cmp_result"] = cmp_result
+                        st.session_state["cmp_fig"]    = cmp_fig
+                        st.cache_data.clear()
+                        winner_label = {
+                            "momentum":       "Momentum",
+                            "mean_reversion": "Mean Reversion",
+                            "swing":          "Swing",
+                        }.get(cmp_result["winner"], cmp_result["winner"])
+                        st.success(
+                            f"Done — winner: **{winner_label}** "
+                            f"(best Sharpe ratio)"
+                        )
+                    except Exception as exc:
+                        st.error(f"Comparison failed: {exc}")
+                        st.session_state.pop("cmp_result", None)
+
+        if "cmp_result" in st.session_state:
+            cmp_r   = st.session_state["cmp_result"]
+            cmp_f   = st.session_state["cmp_fig"]
+            df_cmp  = cmp_r["comparison_df"]
+            winner  = cmp_r["winner"]
+            results = cmp_r["strategies"]
+
+            _W_LABELS = {
+                "momentum":       "Momentum",
+                "mean_reversion": "Mean Reversion",
+                "swing":          "Swing",
+            }
+            winner_label = _W_LABELS.get(winner, winner)
+
+            st.markdown("---")
+            st.subheader(
+                f"{cmp_r['ticker']}  ·  "
+                f"{cmp_r['start_date']} → {cmp_r['end_date']}"
+            )
+
+            # ── Winner highlight ──────────────────────────────────────────────
+            if winner in results:
+                wr = results[winner]
+                st.success(
+                    f"🏆 **Winner: {winner_label}**  —  "
+                    f"Sharpe {wr.sharpe_ratio:.2f}  |  "
+                    f"Return {wr.total_return_pct:+.2f}%  |  "
+                    f"Win Rate {wr.win_rate_pct:.0f}%  |  "
+                    f"{wr.total_trades} trades"
+                )
+
+            # ── KPI strip (one column per strategy + B&H) ─────────────────────
+            strat_keys = [s for s in ["momentum", "mean_reversion", "swing"]
+                          if s in results]
+            cols = st.columns(len(strat_keys) + 1)
+            for col, strat in zip(cols, strat_keys):
+                r     = results[strat]
+                label = _W_LABELS.get(strat, strat)
+                delta = "★ Winner" if strat == winner else None
+                col.metric(
+                    label,
+                    f"{r.total_return_pct:+.2f}%",
+                    delta=delta,
+                    delta_color="off" if delta else "normal",
+                    help=(
+                        f"Sharpe: {r.sharpe_ratio:.2f}  "
+                        f"MaxDD: {r.max_drawdown_pct:.1f}%  "
+                        f"WR: {r.win_rate_pct:.0f}%  "
+                        f"Trades: {r.total_trades}"
+                    ),
+                )
+            bh = cmp_r["buy_and_hold"]
+            cols[-1].metric(
+                "Buy & Hold",
+                f"{bh['return_pct']:+.2f}%",
+                help=f"Sharpe: {bh['sharpe']:.2f}  MaxDD: {bh['max_dd']:.1f}%",
+            )
+
+            # ── Equity curves chart ───────────────────────────────────────────
+            st.plotly_chart(cmp_f, use_container_width=True)
+
+            st.markdown("---")
+
+            # ── Metrics table ─────────────────────────────────────────────────
+            st.subheader("Performance Table")
+
+            disp = df_cmp.copy()
+            disp["Return (%)"]   = disp["Return (%)"].apply(lambda x: f"{x:+.2f}%")
+            disp["Sharpe"]       = disp["Sharpe"].apply(lambda x: f"{x:.2f}")
+            disp["Max DD (%)"]   = disp["Max DD (%)"].apply(lambda x: f"{x:.1f}%")
+            disp["Win Rate (%)"] = disp["Win Rate (%)"].apply(lambda x: f"{x:.0f}%")
+            disp["Avg Hold (d)"] = disp["Avg Hold (d)"].apply(lambda x: f"{x:.1f}d")
+            disp.columns = [
+                "Strategy", "Return", "Sharpe", "Max DD",
+                "Win Rate", "Trades", "Avg Hold",
+            ]
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+            # ── Trade distribution ────────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("Trade Distribution")
+            td_cols = st.columns(len(strat_keys))
+            for col, strat in zip(td_cols, strat_keys):
+                r     = results[strat]
+                label = _W_LABELS.get(strat, strat)
+                with col:
+                    st.markdown(f"**{label}**")
+                    if r.trades:
+                        import plotly.express as px_local
+                        pnl_vals = [t.pnl for t in r.trades if t.exit_price]
+                        fig_hist = px_local.histogram(
+                            x=pnl_vals,
+                            nbins=20,
+                            labels={"x": "P&L ($)"},
+                            color_discrete_sequence=[
+                                _STRATEGY_COLORS.get(
+                                    {"momentum": "Momentum",
+                                     "mean_reversion": "Mean Rev.",
+                                     "swing": "Swing"}.get(strat, strat),
+                                    "#4fc3f7"
+                                )
+                            ],
+                        )
+                        fig_hist.add_vline(x=0, line_dash="dash",
+                                           line_color="gray", opacity=0.6)
+                        fig_hist.update_layout(
+                            height=200,
+                            margin=dict(t=5, b=5, l=5, r=5),
+                            showlegend=False,
+                            template="plotly_dark",
+                        )
+                        st.plotly_chart(fig_hist, use_container_width=True)
+                    else:
+                        st.info("No trades.")
+
+            # ── Download ──────────────────────────────────────────────────────
+            st.markdown("---")
+            st.download_button(
+                label="⬇  Download Comparison CSV",
+                data=df_cmp.to_csv(index=False),
+                file_name=(
+                    f"strategy_comparison_{cmp_r['ticker']}_"
+                    f"{cmp_r['start_date']}_{cmp_r['end_date']}.csv"
+                ),
+                mime="text/csv",
+            )
+
+        # ── Saved comparison results ──────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Saved Comparison Results")
+        saved_cmp = query(
+            "SELECT * FROM backtest_strategy_comparison ORDER BY created_at DESC"
+        )
+        if saved_cmp.empty:
+            st.info(
+                "No saved comparisons yet. "
+                "Run one using the ▶ Run Comparison button above."
+            )
+        else:
+            sf1, sf2 = st.columns(2)
+            sv_tickers = ["All"] + sorted(saved_cmp["ticker"].unique().tolist())
+            sv_strats  = ["All"] + sorted(saved_cmp["strategy"].unique().tolist())
+            with sf1:
+                sel_sv_t = st.selectbox("Ticker", sv_tickers, key="sv_cmp_ticker")
+            with sf2:
+                sel_sv_s = st.selectbox("Strategy", sv_strats, key="sv_cmp_strat")
+
+            filt_cmp = saved_cmp.copy()
+            if sel_sv_t != "All":
+                filt_cmp = filt_cmp[filt_cmp["ticker"] == sel_sv_t]
+            if sel_sv_s != "All":
+                filt_cmp = filt_cmp[filt_cmp["strategy"] == sel_sv_s]
+
+            st.caption(f"{len(filt_cmp)} result(s)")
+
+            d_sv = filt_cmp[[
+                "created_at", "ticker", "start_date", "end_date", "strategy",
+                "total_return", "sharpe", "max_dd", "win_rate",
+                "trade_count", "avg_hold_days",
+            ]].copy()
+            d_sv["total_return"]  = d_sv["total_return"].apply(lambda x: f"{x:+.2f}%")
+            d_sv["sharpe"]        = d_sv["sharpe"].apply(lambda x: f"{x:.2f}")
+            d_sv["max_dd"]        = d_sv["max_dd"].apply(lambda x: f"{x:.1f}%")
+            d_sv["win_rate"]      = d_sv["win_rate"].apply(lambda x: f"{x:.0f}%")
+            d_sv["avg_hold_days"] = d_sv["avg_hold_days"].apply(lambda x: f"{x:.1f}d")
+            d_sv["created_at"]    = pd.to_datetime(d_sv["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+            d_sv.columns = [
+                "Run At", "Ticker", "Start", "End", "Strategy",
+                "Return", "Sharpe", "Max DD", "Win Rate",
+                "Trades", "Avg Hold",
+            ]
+            st.dataframe(d_sv, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

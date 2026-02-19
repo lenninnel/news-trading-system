@@ -129,6 +129,7 @@ class BacktestResult:
     buy_and_hold_curve:      pd.Series = field(repr=False)
     drawdown_series:         pd.Series = field(repr=False)
     trades:                  list[Trade] = field(repr=False, default_factory=list)
+    avg_hold_days:           float         = 0.0
     db_id:                   Optional[int] = None
 
 
@@ -354,8 +355,9 @@ class BacktestEngine:
 
     # ── Private: data ──────────────────────────────────────────────────────────
 
-    def _download_data(self) -> pd.DataFrame:
-        warmup_start = self.start_ts - pd.Timedelta(days=self._WARMUP_DAYS)
+    def _download_data(self, warmup_days: Optional[int] = None) -> pd.DataFrame:
+        days         = warmup_days if warmup_days is not None else self._WARMUP_DAYS
+        warmup_start = self.start_ts - pd.Timedelta(days=days)
         self._log(
             f"  Downloading {self.ticker} "
             f"({warmup_start.date()} → {self.end_ts.date()})..."
@@ -591,6 +593,14 @@ class BacktestEngine:
         avg_win  = float(np.mean([t.pnl for t in winners])) if winners else 0.0
         avg_loss = float(np.mean([t.pnl for t in losers]))  if losers  else 0.0
 
+        # Average holding period (calendar days)
+        hold_days = [
+            (t.exit_date - t.entry_date).days
+            for t in closed
+            if t.exit_date is not None
+        ]
+        avg_hold = float(np.mean(hold_days)) if hold_days else 0.0
+
         # Buy-and-hold benchmark (normalised to initial_balance)
         bh_prices = bt_df["Close"].squeeze()
         bh_curve  = bh_prices / float(bh_prices.iloc[0]) * self.initial_balance
@@ -616,7 +626,585 @@ class BacktestEngine:
             buy_and_hold_curve      = bh_curve,
             drawdown_series         = drawdown,
             trades                  = trades,
+            avg_hold_days           = round(avg_hold, 1),
         )
+
+    # ── Strategy comparison ────────────────────────────────────────────────────
+
+    # Extra warmup days needed to calculate SMA-200 (≈ 200 trading days ≈ 280 cal days)
+    _STRATEGY_WARMUP_DAYS = 310
+
+    def compare_strategies(
+        self,
+        strategies: Optional[list] = None,
+    ) -> dict:
+        """
+        Run all three strategy agents on the same ticker/date range and compare.
+
+        Each strategy uses its own indicator-based signal logic (same logic as
+        the live agents) applied day-by-day to historical OHLCV data.
+
+        Args:
+            strategies: Subset to compare. Defaults to all three:
+                        ["momentum", "mean_reversion", "swing"].
+
+        Returns:
+            dict with keys:
+                ticker          (str)
+                start_date      (str)
+                end_date        (str)
+                strategies      (dict[str, BacktestResult])
+                buy_and_hold    (dict with curve/return_pct/sharpe)
+                comparison_df   (pd.DataFrame)  — metrics side-by-side
+                winner          (str)            — strategy with best Sharpe
+        """
+        if strategies is None:
+            strategies = ["momentum", "mean_reversion", "swing"]
+
+        self._log(f"\n{'=' * 66}")
+        self._log(f"  Strategy Comparison : {self.ticker}  "
+                  f"{self.start_ts.date()} → {self.end_ts.date()}")
+        self._log(f"  Strategies : {', '.join(strategies)}")
+        self._log(f"{'=' * 66}")
+
+        # Download with extra warmup for SMA-200
+        df = self._download_data(warmup_days=self._STRATEGY_WARMUP_DAYS)
+
+        # Pre-compute all indicators once (shared across strategies)
+        ind_df = self._compute_all_indicators(df)
+
+        # Slice to requested backtest range
+        bt_df = df.loc[self.start_ts : self.end_ts]
+        if bt_df.empty:
+            raise ValueError(
+                f"No trading data for {self.ticker} in range "
+                f"{self.start_ts.date()} – {self.end_ts.date()}"
+            )
+        self._log(f"  Trading days : {len(bt_df)}")
+
+        # Buy-and-hold benchmark
+        bh_prices  = bt_df["Close"].squeeze()
+        bh_curve   = bh_prices / float(bh_prices.iloc[0]) * self.initial_balance
+        bh_ret     = (float(bh_prices.iloc[-1]) / float(bh_prices.iloc[0]) - 1.0) * 100
+        bh_daily   = bh_curve.pct_change().dropna()
+        bh_sharpe  = (
+            float(bh_daily.mean() / bh_daily.std() * np.sqrt(252))
+            if len(bh_daily) > 1 and bh_daily.std() > 0 else 0.0
+        )
+        bh_roll_max = bh_curve.cummax()
+        bh_dd_min   = float(((bh_curve - bh_roll_max) / bh_roll_max * 100).min())
+
+        signal_fns = {
+            "momentum":       self._signal_momentum,
+            "mean_reversion": self._signal_mean_reversion,
+            "swing":          self._signal_swing,
+        }
+
+        results: dict = {}
+        for strat in strategies:
+            fn = signal_fns.get(strat)
+            if fn is None:
+                self._log(f"  [!] Unknown strategy {strat!r} — skipped.")
+                continue
+            self._log(f"\n  ── {strat.replace('_', ' ').title()} ──")
+            eq, trades, final_cash = self._run_strategy_loop(bt_df, ind_df, fn)
+            result = self._compute_metrics(eq, trades, final_cash, bt_df)
+            # Persist to DB
+            self._db.log_strategy_comparison(
+                ticker        = self.ticker,
+                start_date    = self.start_ts.strftime("%Y-%m-%d"),
+                end_date      = self.end_ts.strftime("%Y-%m-%d"),
+                strategy      = strat,
+                total_return  = result.total_return_pct,
+                sharpe        = result.sharpe_ratio,
+                max_dd        = result.max_drawdown_pct,
+                win_rate      = result.win_rate_pct,
+                trade_count   = result.total_trades,
+                avg_hold_days = result.avg_hold_days,
+            )
+            results[strat] = result
+            if self.verbose:
+                self._log(
+                    f"    Return: {result.total_return_pct:+.2f}%  "
+                    f"Sharpe: {result.sharpe_ratio:.2f}  "
+                    f"MaxDD: {result.max_drawdown_pct:.1f}%  "
+                    f"WR: {result.win_rate_pct:.0f}%  "
+                    f"Trades: {result.total_trades}  "
+                    f"Avg hold: {result.avg_hold_days:.1f}d"
+                )
+
+        # Persist buy-and-hold row
+        self._db.log_strategy_comparison(
+            ticker        = self.ticker,
+            start_date    = self.start_ts.strftime("%Y-%m-%d"),
+            end_date      = self.end_ts.strftime("%Y-%m-%d"),
+            strategy      = "buy_and_hold",
+            total_return  = round(bh_ret, 2),
+            sharpe        = round(bh_sharpe, 3),
+            max_dd        = round(bh_dd_min, 2),
+            win_rate      = 100.0,
+            trade_count   = 1,
+            avg_hold_days = float(len(bt_df)),
+        )
+
+        # Determine winner by Sharpe ratio
+        winner = max(results, key=lambda s: results[s].sharpe_ratio) if results else "—"
+
+        # Build comparison DataFrame
+        _LABELS = {
+            "momentum":       "Momentum",
+            "mean_reversion": "Mean Rev.",
+            "swing":          "Swing",
+        }
+        rows = []
+        for strat in strategies:
+            if strat not in results:
+                continue
+            r = results[strat]
+            rows.append({
+                "Strategy":      _LABELS.get(strat, strat),
+                "Return (%)":    r.total_return_pct,
+                "Sharpe":        r.sharpe_ratio,
+                "Max DD (%)":    r.max_drawdown_pct,
+                "Win Rate (%)":  r.win_rate_pct,
+                "Trades":        r.total_trades,
+                "Avg Hold (d)":  r.avg_hold_days,
+            })
+        rows.append({
+            "Strategy":      "Buy & Hold",
+            "Return (%)":    round(bh_ret, 2),
+            "Sharpe":        round(bh_sharpe, 3),
+            "Max DD (%)":    round(bh_dd_min, 2),
+            "Win Rate (%)":  100.0,
+            "Trades":        1,
+            "Avg Hold (d)":  float(len(bt_df)),
+        })
+        comparison_df = pd.DataFrame(rows)
+
+        return {
+            "ticker":       self.ticker,
+            "start_date":   self.start_ts.strftime("%Y-%m-%d"),
+            "end_date":     self.end_ts.strftime("%Y-%m-%d"),
+            "strategies":   results,
+            "buy_and_hold": {
+                "curve":      bh_curve,
+                "return_pct": round(bh_ret, 2),
+                "sharpe":     round(bh_sharpe, 3),
+                "max_dd":     round(bh_dd_min, 2),
+            },
+            "comparison_df": comparison_df,
+            "winner":        winner,
+        }
+
+    def plot_comparison(
+        self,
+        comparison: dict,
+        show:       bool           = True,
+        save_path:  Optional[str]  = None,
+    ) -> go.Figure:
+        """
+        Render combined equity curves (one line per strategy + buy-and-hold).
+
+        Args:
+            comparison: Return value of compare_strategies().
+            show:       Call fig.show() to open in browser.
+            save_path:  If set, save interactive HTML to this path.
+
+        Returns:
+            The plotly Figure.
+        """
+        _COLORS = {
+            "momentum":       "#4fc3f7",
+            "mean_reversion": "#a5d6a7",
+            "swing":          "#ffcc80",
+            "buy_and_hold":   "#90a4ae",
+        }
+        _LABELS = {
+            "momentum":       "Momentum",
+            "mean_reversion": "Mean Reversion",
+            "swing":          "Swing",
+            "buy_and_hold":   "Buy & Hold",
+        }
+
+        winner    = comparison["winner"]
+        ticker    = comparison["ticker"]
+        start     = comparison["start_date"]
+        end       = comparison["end_date"]
+        results   = comparison["strategies"]
+        bh_curve  = comparison["buy_and_hold"]["curve"]
+        bh_ret    = comparison["buy_and_hold"]["return_pct"]
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.65, 0.35],
+            vertical_spacing=0.10,
+            subplot_titles=[
+                f"{ticker} — Strategy Comparison: Equity Curves",
+                "Drawdown (%)",
+            ],
+        )
+
+        # Equity curves
+        for strat, result in results.items():
+            eq = result.equity_curve
+            fig.add_trace(go.Scatter(
+                x=eq.index, y=eq.values,
+                name=_LABELS.get(strat, strat)
+                     + (" ★" if strat == winner else ""),
+                line=dict(color=_COLORS.get(strat, "#ffffff"), width=2),
+                hovertemplate=(
+                    f"<b>{_LABELS.get(strat, strat)}</b><br>"
+                    "Date: %{x|%Y-%m-%d}<br>"
+                    "Value: $%{y:,.2f}<extra></extra>"
+                ),
+            ), row=1, col=1)
+
+        # Buy & hold
+        fig.add_trace(go.Scatter(
+            x=bh_curve.index, y=bh_curve.values,
+            name=f"Buy & Hold ({bh_ret:+.1f}%)",
+            line=dict(color=_COLORS["buy_and_hold"], width=1.5, dash="dash"),
+        ), row=1, col=1)
+
+        # Drawdown curves
+        for strat, result in results.items():
+            fig.add_trace(go.Scatter(
+                x=result.drawdown_series.index,
+                y=result.drawdown_series.values,
+                name=_LABELS.get(strat, strat),
+                line=dict(color=_COLORS.get(strat, "#ffffff"), width=1),
+                showlegend=False,
+            ), row=2, col=1)
+
+        winner_result = results.get(winner)
+        title_suffix  = (
+            f"Winner: {_LABELS.get(winner, winner)} "
+            f"(Sharpe {winner_result.sharpe_ratio:.2f})"
+            if winner_result else ""
+        )
+
+        fig.update_layout(
+            height=820,
+            template="plotly_dark",
+            margin=dict(l=65, r=40, t=80, b=40),
+            legend=dict(x=0.01, y=0.98, bgcolor="rgba(0,0,0,0.4)"),
+            title=dict(
+                text=(
+                    f"{ticker} Strategy Comparison  |  {start} → {end}  |  "
+                    f"{title_suffix}"
+                ),
+                font=dict(size=13),
+            ),
+        )
+        fig.update_yaxes(title_text="Portfolio ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
+
+        if save_path:
+            fig.write_html(save_path)
+            self._log(f"  Chart saved → {save_path}")
+        if show:
+            fig.show()
+        return fig
+
+    # ── Private: all-strategy indicators ──────────────────────────────────────
+
+    def _compute_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Pre-compute every indicator needed by all three strategy signal functions.
+        Done once and shared across strategies for efficiency.
+        """
+        close  = df["Close"].squeeze()
+        high   = df["High"].squeeze()
+        low    = df["Low"].squeeze()
+        volume = df["Volume"].squeeze()
+
+        # ── Momentum indicators ───────────────────────────────────────────────
+        ema20   = ta.trend.EMAIndicator(close=close, window=20).ema_indicator()
+        ema50   = ta.trend.EMAIndicator(close=close, window=50).ema_indicator()
+        adx_obj = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
+        adx     = adx_obj.adx()
+        adx_pos = adx_obj.adx_pos()
+        adx_neg = adx_obj.adx_neg()
+        vol_avg   = volume.rolling(20).mean()
+        vol_ratio = volume / vol_avg.replace(0, np.nan)
+        # shift(1) avoids same-bar look-ahead (mirrors momentum_agent iloc[-2])
+        high_20 = high.rolling(20).max().shift(1)
+        low_20  = low.rolling(20).min().shift(1)
+        roc     = ta.momentum.ROCIndicator(close=close, window=10).roc()
+
+        # ── Mean-reversion indicators ──────────────────────────────────────────
+        rsi      = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+        stoch    = ta.momentum.StochasticOscillator(
+            high=high, low=low, close=close, window=14, smooth_window=3
+        )
+        stoch_k  = stoch.stoch()
+        bb_obj   = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+        bb_pct_b = bb_obj.bollinger_pband()
+        wr       = ta.momentum.WilliamsRIndicator(
+            high=high, low=low, close=close, lbp=14
+        ).williams_r()
+        is_green = (close > close.shift(1)).astype(float)
+
+        # ── Swing indicators ──────────────────────────────────────────────────
+        sma20  = ta.trend.SMAIndicator(close=close, window=20).sma_indicator()
+        sma50  = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
+        sma200 = ta.trend.SMAIndicator(close=close, window=200).sma_indicator()
+        macd_obj  = ta.trend.MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
+        macd_line = macd_obj.macd()
+        macd_sig  = macd_obj.macd_signal()
+        macd_hist = macd_obj.macd_diff()
+        hist_up   = ((macd_hist > macd_hist.shift(1)) & (macd_hist > 0)).astype(float)
+        hist_down = ((macd_hist < macd_hist.shift(1)) & (macd_hist < 0)).astype(float)
+        # shift(1) avoids look-ahead (mirrors swing_agent iloc[-2])
+        pivot_high = high.rolling(5).max().shift(1)
+        pivot_low  = low.rolling(5).min().shift(1)
+        atr_val    = ta.volatility.AverageTrueRange(
+            high=high, low=low, close=close, window=14
+        ).average_true_range()
+        atr_pct = atr_val / close.replace(0, np.nan)
+        crossed_above = ((close.shift(1) < sma20.shift(1)) & (close > sma20)).astype(float)
+        crossed_below = ((close.shift(1) > sma20.shift(1)) & (close < sma20)).astype(float)
+
+        return pd.DataFrame({
+            "close":         close,
+            # momentum
+            "ema20":         ema20,
+            "ema50":         ema50,
+            "adx":           adx,
+            "adx_pos":       adx_pos,
+            "adx_neg":       adx_neg,
+            "vol_ratio":     vol_ratio,
+            "high_20":       high_20,
+            "low_20":        low_20,
+            "roc":           roc,
+            # mean reversion
+            "rsi":           rsi,
+            "stoch_k":       stoch_k,
+            "bb_pct_b":      bb_pct_b,
+            "williams_r":    wr,
+            "is_green":      is_green,
+            # swing
+            "sma20":         sma20,
+            "sma50":         sma50,
+            "sma200":        sma200,
+            "macd_line":     macd_line,
+            "macd_sig":      macd_sig,
+            "hist_up":       hist_up,
+            "hist_down":     hist_down,
+            "pivot_high":    pivot_high,
+            "pivot_low":     pivot_low,
+            "atr_pct":       atr_pct,
+            "crossed_above": crossed_above,
+            "crossed_below": crossed_below,
+        }, index=df.index)
+
+    # ── Private: per-strategy signal functions ─────────────────────────────────
+
+    @staticmethod
+    def _signal_momentum(row: pd.Series) -> tuple:
+        """Return (signal, confidence) using MomentumAgent logic."""
+        price     = float(row["close"])  if pd.notna(row.get("close"))     else None
+        ema20     = float(row["ema20"])  if pd.notna(row.get("ema20"))     else None
+        ema50     = float(row["ema50"])  if pd.notna(row.get("ema50"))     else None
+        adx       = float(row["adx"])    if pd.notna(row.get("adx"))       else 0.0
+        adx_pos   = float(row["adx_pos"]) if pd.notna(row.get("adx_pos")) else 0.0
+        adx_neg   = float(row["adx_neg"]) if pd.notna(row.get("adx_neg")) else 0.0
+        vol_ratio = float(row["vol_ratio"]) if pd.notna(row.get("vol_ratio")) else 1.0
+        high_20   = float(row["high_20"]) if pd.notna(row.get("high_20")) else None
+        low_20    = float(row["low_20"])  if pd.notna(row.get("low_20"))   else None
+        roc       = float(row["roc"])     if pd.notna(row.get("roc"))      else 0.0
+
+        conf = 50.0
+        if adx > 25:        conf += 15.0
+        if adx > 35:        conf += 10.0
+        if vol_ratio > 1.5: conf += 10.0
+        if abs(roc) > 5.0:  conf += 15.0
+        conf = min(max(conf, 30.0), 90.0)
+
+        if (price and high_20 and price > high_20
+                and adx > 25 and vol_ratio > 1.2 and adx_pos > adx_neg):
+            return "BUY", conf
+        if (price and ema20 and ema50
+                and ema20 > ema50 and price > ema20 and roc > 3.0):
+            return "BUY", conf
+        if (price and low_20 and price < low_20
+                and adx > 25 and vol_ratio > 1.2 and adx_neg > adx_pos):
+            return "SELL", conf
+        if (price and ema20 and ema50
+                and ema20 < ema50 and price < ema20 and roc < -3.0):
+            return "SELL", conf
+        return "HOLD", 25.0
+
+    @staticmethod
+    def _signal_mean_reversion(row: pd.Series) -> tuple:
+        """Return (signal, confidence) using MeanReversionAgent logic."""
+        rsi      = float(row["rsi"])       if pd.notna(row.get("rsi"))       else 50.0
+        stoch_k  = float(row["stoch_k"])   if pd.notna(row.get("stoch_k"))   else 50.0
+        bb_pct_b = float(row["bb_pct_b"])  if pd.notna(row.get("bb_pct_b"))  else 0.5
+        wr       = float(row["williams_r"]) if pd.notna(row.get("williams_r")) else -50.0
+        is_green = bool(row.get("is_green", 0))
+
+        if rsi < 30 and stoch_k < 20 and bb_pct_b < 0 and is_green:
+            return "BUY", 80.0
+        if rsi < 35 and (stoch_k < 25 or wr < -80):
+            return "BUY", 60.0
+        if rsi > 70 and stoch_k > 80 and bb_pct_b > 1:
+            return "SELL", 80.0
+        if rsi > 65 and (stoch_k > 75 or wr > -20):
+            return "SELL", 60.0
+        return "HOLD", 25.0
+
+    @staticmethod
+    def _signal_swing(row: pd.Series) -> tuple:
+        """Return (signal, confidence) using SwingAgent logic."""
+        price      = float(row["close"])   if pd.notna(row.get("close"))   else None
+        sma20      = float(row["sma20"])   if pd.notna(row.get("sma20"))   else None
+        sma50      = float(row["sma50"])   if pd.notna(row.get("sma50"))   else None
+        sma200     = float(row["sma200"])  if pd.notna(row.get("sma200"))  else None
+        macd_line  = float(row["macd_line"]) if pd.notna(row.get("macd_line")) else 0.0
+        macd_sig   = float(row["macd_sig"])  if pd.notna(row.get("macd_sig"))  else 0.0
+        hist_up    = bool(row.get("hist_up",    0))
+        hist_down  = bool(row.get("hist_down",  0))
+        pivot_high = float(row["pivot_high"]) if pd.notna(row.get("pivot_high")) else None
+        pivot_low  = float(row["pivot_low"])  if pd.notna(row.get("pivot_low"))  else None
+        atr_pct    = float(row["atr_pct"])    if pd.notna(row.get("atr_pct"))    else 0.0
+        cross_up   = bool(row.get("crossed_above", 0))
+        cross_down = bool(row.get("crossed_below", 0))
+
+        buy_signal  = False
+        sell_signal = False
+
+        if (price and sma20 and sma50 and price > sma20 > sma50
+                and hist_up and pivot_high and price > pivot_high):
+            buy_signal = True
+        if price and sma200 and price > sma200 and hist_up and cross_up:
+            buy_signal = True
+        if (price and sma20 and sma50 and price < sma20 < sma50
+                and hist_down and pivot_low and price < pivot_low):
+            sell_signal = True
+        if price and sma200 and price < sma200 and hist_down and cross_down:
+            sell_signal = True
+
+        if not buy_signal and not sell_signal:
+            return "HOLD", 25.0
+
+        conf = 55.0
+        if buy_signal:
+            if price and sma20 and sma50 and sma200:
+                if price > sma20 > sma50 and price > sma200:
+                    conf += 20.0
+            if macd_line > macd_sig:
+                conf += 10.0
+        else:
+            if price and sma20 and sma50 and sma200:
+                if price < sma20 < sma50 and price < sma200:
+                    conf += 20.0
+            if macd_line < macd_sig:
+                conf += 10.0
+        if atr_pct > 0.03:
+            conf -= 10.0
+        conf = min(max(conf, 30.0), 85.0)
+
+        if buy_signal:
+            return "BUY", conf
+        return "SELL", conf
+
+    def _run_strategy_loop(
+        self,
+        bt_df:     pd.DataFrame,
+        ind_df:    pd.DataFrame,
+        signal_fn,
+    ) -> tuple:
+        """
+        Generic day-by-day simulation using a strategy-specific signal function.
+
+        Args:
+            bt_df:     Price DataFrame sliced to the backtest date range.
+            ind_df:    Full indicator DataFrame (pre-computed from download window).
+            signal_fn: Callable(row) → (signal: str, confidence: float).
+
+        Returns:
+            (equity_curve dict, trades list, final_cash float)
+        """
+        cash:         float          = self.initial_balance
+        shares:       int            = 0
+        position:     Optional[dict] = None
+        equity_curve: dict           = {}
+        trades:       list           = []
+
+        for date in bt_df.index:
+            close = float(bt_df.loc[date, "Close"])
+
+            # Stop-loss / take-profit check
+            if position is not None:
+                hit_sl = close <= position["stop_loss"]
+                hit_tp = close >= position["take_profit"]
+                if hit_sl or hit_tp:
+                    exit_px = position["stop_loss"] if hit_sl else position["take_profit"]
+                    pnl     = (exit_px - position["entry_price"]) * position["shares"]
+                    cash   += position["shares"] * exit_px
+                    t       = position["trade"]
+                    t.exit_date   = date
+                    t.exit_price  = round(exit_px, 4)
+                    t.exit_reason = "stop_loss" if hit_sl else "take_profit"
+                    t.pnl         = round(pnl, 2)
+                    trades.append(t)
+                    shares   = 0
+                    position = None
+
+            # Compute today's signal
+            if date in ind_df.index:
+                row    = ind_df.loc[date]
+                signal, conf = signal_fn(row)
+
+                if position is None and signal == "BUY":
+                    sz = self._size_position("BUY", conf, close, cash)
+                    if sz["shares"] > 0:
+                        cash    -= sz["shares"] * close
+                        shares   = sz["shares"]
+                        position = {
+                            "entry_price": close,
+                            "shares":      sz["shares"],
+                            "stop_loss":   sz["stop_loss"],
+                            "take_profit": sz["take_profit"],
+                            "trade": Trade(
+                                entry_date  = date,
+                                entry_price = close,
+                                shares      = sz["shares"],
+                                stop_loss   = sz["stop_loss"],
+                                take_profit = sz["take_profit"],
+                                signal      = "BUY",
+                                confidence  = round(conf, 1),
+                            ),
+                        }
+                elif position is not None and signal == "SELL":
+                    pnl  = (close - position["entry_price"]) * position["shares"]
+                    cash += position["shares"] * close
+                    t    = position["trade"]
+                    t.exit_date   = date
+                    t.exit_price  = close
+                    t.exit_reason = "signal"
+                    t.pnl         = round(pnl, 2)
+                    trades.append(t)
+                    shares   = 0
+                    position = None
+
+            equity_curve[date] = cash + shares * close
+
+        # Close any open position at end of period
+        if position is not None:
+            last_close = float(bt_df["Close"].iloc[-1])
+            last_date  = bt_df.index[-1]
+            pnl  = (last_close - position["entry_price"]) * position["shares"]
+            cash += position["shares"] * last_close
+            t    = position["trade"]
+            t.exit_date   = last_date
+            t.exit_price  = last_close
+            t.exit_reason = "end_of_period"
+            t.pnl         = round(pnl, 2)
+            trades.append(t)
+
+        return equity_curve, trades, cash
 
     # ── Private: chart helpers ─────────────────────────────────────────────────
 
