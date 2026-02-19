@@ -17,7 +17,13 @@ Combined pipeline (run_combined):
     8. RiskAgent      → position size, stop-loss, take-profit
     9. Database       → persist to combined_signals + risk_calculations tables
 
-Signal fusion matrix
+Strategy pipeline (run_strategy):
+
+    Delegates to StrategyCoordinator which runs three agents in parallel:
+    MomentumAgent, MeanReversionAgent, SwingAgent → ensemble signal → RiskAgent
+    DB tables: strategy_signals + strategy_performance
+
+Signal fusion matrix (combined pipeline)
 --------------------
 Sentiment  Technical  Combined
 ─────────  ─────────  ─────────────
@@ -47,6 +53,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from execution.paper_trader import PaperTrader
     from notifications.telegram_bot import TelegramNotifier
+    from orchestrator.strategy_coordinator import StrategyCoordinator
 
 # Maps (sentiment_signal, technical_signal) → combined label
 _FUSION_TABLE: dict[tuple[str, str], str] = {
@@ -96,6 +103,7 @@ class Coordinator:
         db: Database | None = None,
         paper_trader: "PaperTrader | None" = None,
         notifier: "TelegramNotifier | None" = None,
+        strategy_coordinator: "StrategyCoordinator | None" = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -106,6 +114,44 @@ class Coordinator:
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
         self.paper_trader = paper_trader
         self.notifier = notifier
+        self._strategy_coordinator = strategy_coordinator
+
+    # ------------------------------------------------------------------
+    # Strategy pipeline
+    # ------------------------------------------------------------------
+
+    def run_strategy(
+        self,
+        ticker: str,
+        account_balance: float = 10_000.0,
+        verbose: bool = True,
+    ) -> dict:
+        """
+        Run the multi-strategy pipeline (momentum + mean-reversion + swing).
+
+        Delegates entirely to StrategyCoordinator; creates one on demand when
+        no coordinator was injected at construction time.
+
+        Args:
+            ticker:          Stock ticker symbol (e.g. "AAPL").
+            account_balance: Account size in USD for position sizing.
+            verbose:         Print progress to stdout.
+
+        Returns:
+            dict — same structure as StrategyCoordinator.run():
+                ticker, strategy_signals, ranked_signals,
+                combined_strategy_signal, ensemble_confidence,
+                consensus, risk, strategy_run_id, errors
+        """
+        if self._strategy_coordinator is None:
+            from orchestrator.strategy_coordinator import StrategyCoordinator
+            self._strategy_coordinator = StrategyCoordinator(db=self.db)
+
+        return self._strategy_coordinator.run(
+            ticker=ticker,
+            account_balance=account_balance,
+            verbose=verbose,
+        )
 
     # ------------------------------------------------------------------
     # Private helpers

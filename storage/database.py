@@ -69,6 +69,40 @@ risk_calculations
     skipped           INTEGER  1 = no position taken, 0 = position taken
     skip_reason       TEXT     Explanation when skipped (NULL otherwise)
     created_at        TEXT     ISO-8601 UTC timestamp
+
+strategy_signals
+    id                  INTEGER  Primary key
+    ticker              TEXT     Stock ticker symbol
+    strategy            TEXT     "momentum" | "mean_reversion" | "swing"
+    signal              TEXT     "BUY" | "SELL" | "HOLD"
+    confidence          REAL     Agent confidence 0–100
+    timeframe           TEXT     Intended holding period
+    reasoning           TEXT     Semicolon-joined triggered conditions
+    indicators_json     TEXT     JSON blob of numeric indicator values
+    ensemble_confidence REAL     Coordinator ensemble confidence 0–100
+    combined_signal     TEXT     Coordinator combined direction
+    consensus           TEXT     "unanimous" | "majority" | "conflicting" | "none"
+    account_balance     REAL     Account value used for sizing
+    risk_calc_id        INTEGER  FK → risk_calculations.id
+    created_at          TEXT     ISO-8601 UTC timestamp
+
+strategy_performance
+    id                        INTEGER  Primary key
+    ticker                    TEXT     Stock ticker symbol
+    run_at                    TEXT     ISO-8601 coordinator run timestamp
+    momentum_signal           TEXT     MomentumAgent signal (NULL if failed)
+    momentum_confidence       REAL     MomentumAgent confidence
+    mean_reversion_signal     TEXT     MeanReversionAgent signal
+    mean_reversion_confidence REAL     MeanReversionAgent confidence
+    swing_signal              TEXT     SwingAgent signal
+    swing_confidence          REAL     SwingAgent confidence
+    combined_signal           TEXT     Ensemble direction
+    ensemble_confidence       REAL     Ensemble confidence 0–100
+    consensus                 TEXT     "unanimous" | "majority" | "conflicting" | "none"
+    risk_calc_id              INTEGER  FK → risk_calculations.id
+    account_balance           REAL     Account value used for sizing
+    errors_json               TEXT     JSON list of per-agent error strings
+    created_at                TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -231,6 +265,42 @@ class Database:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_screener_run_ticker
                     ON screener_results (run_at, ticker);
+
+                CREATE TABLE IF NOT EXISTS strategy_signals (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker              TEXT    NOT NULL,
+                    strategy            TEXT    NOT NULL,
+                    signal              TEXT    NOT NULL,
+                    confidence          REAL    NOT NULL,
+                    timeframe           TEXT,
+                    reasoning           TEXT,
+                    indicators_json     TEXT,
+                    ensemble_confidence REAL,
+                    combined_signal     TEXT,
+                    consensus           TEXT,
+                    account_balance     REAL,
+                    risk_calc_id        INTEGER REFERENCES risk_calculations(id),
+                    created_at          TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS strategy_performance (
+                    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker                    TEXT    NOT NULL,
+                    run_at                    TEXT    NOT NULL,
+                    momentum_signal           TEXT,
+                    momentum_confidence       REAL,
+                    mean_reversion_signal     TEXT,
+                    mean_reversion_confidence REAL,
+                    swing_signal              TEXT,
+                    swing_confidence          REAL,
+                    combined_signal           TEXT    NOT NULL,
+                    ensemble_confidence       REAL    NOT NULL,
+                    consensus                 TEXT    NOT NULL,
+                    risk_calc_id              INTEGER REFERENCES risk_calculations(id),
+                    account_balance           REAL,
+                    errors_json               TEXT,
+                    created_at                TEXT    NOT NULL
+                );
                 """
             )
 
@@ -463,6 +533,121 @@ class Database:
                     position_size_usd, shares, stop_loss, take_profit,
                     risk_amount, kelly_fraction, stop_pct,
                     int(skipped), skip_reason, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_strategy_signal(
+        self,
+        ticker: str,
+        strategy: str,
+        signal: str,
+        confidence: float,
+        timeframe: "str | None" = None,
+        reasoning: "str | None" = None,
+        indicators_json: "str | None" = None,
+        ensemble_confidence: "float | None" = None,
+        combined_signal: "str | None" = None,
+        consensus: "str | None" = None,
+        account_balance: "float | None" = None,
+        risk_calc_id: "int | None" = None,
+    ) -> int:
+        """
+        Persist one strategy agent's signal and return its auto-generated ID.
+
+        Args:
+            ticker:              Stock ticker symbol.
+            strategy:            Agent name: "momentum" | "mean_reversion" | "swing".
+            signal:              "BUY" | "SELL" | "HOLD".
+            confidence:          Agent confidence 0–100.
+            timeframe:           Intended holding period.
+            reasoning:           Semicolon-joined list of triggered conditions.
+            indicators_json:     JSON-serialised indicator dict.
+            ensemble_confidence: Coordinator ensemble confidence 0–100.
+            combined_signal:     Coordinator combined direction.
+            consensus:           "unanimous" | "majority" | "conflicting" | "none".
+            account_balance:     Account value used for sizing.
+            risk_calc_id:        FK to risk_calculations.id (None when skipped).
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO strategy_signals
+                    (ticker, strategy, signal, confidence, timeframe, reasoning,
+                     indicators_json, ensemble_confidence, combined_signal, consensus,
+                     account_balance, risk_calc_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, strategy, signal, confidence, timeframe, reasoning,
+                    indicators_json, ensemble_confidence, combined_signal, consensus,
+                    account_balance, risk_calc_id, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_strategy_performance(
+        self,
+        ticker: str,
+        run_at: str,
+        combined_signal: str,
+        ensemble_confidence: float,
+        consensus: str,
+        momentum_signal: "str | None" = None,
+        momentum_confidence: "float | None" = None,
+        mean_reversion_signal: "str | None" = None,
+        mean_reversion_confidence: "float | None" = None,
+        swing_signal: "str | None" = None,
+        swing_confidence: "float | None" = None,
+        risk_calc_id: "int | None" = None,
+        account_balance: "float | None" = None,
+        errors_json: "str | None" = None,
+    ) -> int:
+        """
+        Persist one StrategyCoordinator run summary and return its auto-generated ID.
+
+        Args:
+            ticker:                    Stock ticker symbol.
+            run_at:                    ISO-8601 timestamp when the coordinator ran.
+            combined_signal:           Ensemble direction "BUY" | "SELL" | "HOLD".
+            ensemble_confidence:       Weighted ensemble confidence 0–100.
+            consensus:                 "unanimous" | "majority" | "conflicting" | "none".
+            momentum_signal:           MomentumAgent signal (None if agent failed).
+            momentum_confidence:       MomentumAgent confidence (None if agent failed).
+            mean_reversion_signal:     MeanReversionAgent signal.
+            mean_reversion_confidence: MeanReversionAgent confidence.
+            swing_signal:              SwingAgent signal.
+            swing_confidence:          SwingAgent confidence.
+            risk_calc_id:              FK to risk_calculations.id (None when skipped).
+            account_balance:           Account value used for sizing.
+            errors_json:               JSON-serialised list of per-agent errors.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO strategy_performance
+                    (ticker, run_at, momentum_signal, momentum_confidence,
+                     mean_reversion_signal, mean_reversion_confidence,
+                     swing_signal, swing_confidence,
+                     combined_signal, ensemble_confidence, consensus,
+                     risk_calc_id, account_balance, errors_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, run_at,
+                    momentum_signal, momentum_confidence,
+                    mean_reversion_signal, mean_reversion_confidence,
+                    swing_signal, swing_confidence,
+                    combined_signal, ensemble_confidence, consensus,
+                    risk_calc_id, account_balance, errors_json, now,
                 ),
             )
             return cur.lastrowid
