@@ -155,6 +155,29 @@ price_alerts
     volume_ratio REAL     Volume as multiple of average (NULL for price alerts)
     message      TEXT     Full human-readable alert message
     created_at   TEXT     ISO-8601 UTC timestamp
+
+optimization_results
+    id                  INTEGER  Primary key
+    ticker              TEXT     Stock ticker symbol
+    strategy            TEXT     "momentum" | "mean_reversion" | "swing"
+    start_date          TEXT     Optimization range start "YYYY-MM-DD"
+    end_date            TEXT     Optimization range end   "YYYY-MM-DD"
+    best_params_json    TEXT     JSON dict of optimized parameters
+    default_params_json TEXT     JSON dict of default parameters
+    best_sharpe         REAL     Average test-window Sharpe with best params
+    default_sharpe      REAL     Average test-window Sharpe with default params
+    best_return         REAL     Average test-window return % with best params
+    default_return      REAL     Average test-window return % with default params
+    best_max_dd         REAL     Average test-window max drawdown % with best params
+    default_max_dd      REAL     Average test-window max drawdown % with default params
+    best_win_rate       REAL     Average win rate % with best params
+    default_win_rate    REAL     Average win rate % with default params
+    best_trade_count    REAL     Average trade count per test window (best params)
+    stability_score     REAL     Std-dev of Sharpe across test windows (lower = more stable)
+    windows_tested      INTEGER  Number of walk-forward windows used
+    combos_tested       INTEGER  Total parameter combinations evaluated
+    window_results_json TEXT     JSON list of per-window metrics for best params
+    created_at          TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -407,6 +430,30 @@ class Database:
                     volume_ratio REAL,
                     message      TEXT    NOT NULL,
                     created_at   TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS optimization_results (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker              TEXT    NOT NULL,
+                    strategy            TEXT    NOT NULL,
+                    start_date          TEXT    NOT NULL,
+                    end_date            TEXT    NOT NULL,
+                    best_params_json    TEXT    NOT NULL,
+                    default_params_json TEXT    NOT NULL,
+                    best_sharpe         REAL,
+                    default_sharpe      REAL,
+                    best_return         REAL,
+                    default_return      REAL,
+                    best_max_dd         REAL,
+                    default_max_dd      REAL,
+                    best_win_rate       REAL,
+                    default_win_rate    REAL,
+                    best_trade_count    REAL,
+                    stability_score     REAL,
+                    windows_tested      INTEGER NOT NULL DEFAULT 0,
+                    combos_tested       INTEGER NOT NULL DEFAULT 0,
+                    window_results_json TEXT,
+                    created_at          TEXT    NOT NULL
                 );
                 """
             )
@@ -1043,6 +1090,86 @@ class Database:
                 rows,
             )
         return len(rows)
+
+    def log_optimization_result(
+        self,
+        ticker: str,
+        strategy: str,
+        start_date: str,
+        end_date: str,
+        best_params: dict,
+        default_params: dict,
+        best_sharpe: float,
+        default_sharpe: float,
+        best_return: float,
+        default_return: float,
+        best_max_dd: float,
+        default_max_dd: float,
+        best_win_rate: float,
+        default_win_rate: float,
+        best_trade_count: float,
+        stability_score: float,
+        windows_tested: int,
+        combos_tested: int,
+        window_results_json: str,
+    ) -> int:
+        """
+        Persist a parameter optimization result and return its auto-generated ID.
+
+        Args:
+            ticker:              Stock ticker symbol.
+            strategy:            "momentum" | "mean_reversion" | "swing".
+            start_date:          Optimization range start "YYYY-MM-DD".
+            end_date:            Optimization range end   "YYYY-MM-DD".
+            best_params:         Dict of optimized parameters.
+            default_params:      Dict of default parameters for comparison.
+            best_sharpe:         Avg test-window Sharpe with best params.
+            default_sharpe:      Avg test-window Sharpe with default params.
+            best_return:         Avg test-window return % with best params.
+            default_return:      Avg test-window return % with default params.
+            best_max_dd:         Avg test-window max drawdown % with best params.
+            default_max_dd:      Avg test-window max drawdown % with default params.
+            best_win_rate:       Avg win rate % with best params.
+            default_win_rate:    Avg win rate % with default params.
+            best_trade_count:    Avg trade count per test window (best params).
+            stability_score:     Std-dev of Sharpe across test windows (lower = stable).
+            windows_tested:      Number of walk-forward windows used.
+            combos_tested:       Total parameter combinations evaluated.
+            window_results_json: JSON list of per-window metrics for best params.
+
+        Returns:
+            The integer primary key of the newly inserted row.
+        """
+        import json as _json
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO optimization_results
+                    (ticker, strategy, start_date, end_date,
+                     best_params_json, default_params_json,
+                     best_sharpe, default_sharpe,
+                     best_return, default_return,
+                     best_max_dd, default_max_dd,
+                     best_win_rate, default_win_rate,
+                     best_trade_count, stability_score,
+                     windows_tested, combos_tested,
+                     window_results_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, strategy, start_date, end_date,
+                    _json.dumps(best_params), _json.dumps(default_params),
+                    best_sharpe, default_sharpe,
+                    best_return, default_return,
+                    best_max_dd, default_max_dd,
+                    best_win_rate, default_win_rate,
+                    best_trade_count, stability_score,
+                    windows_tested, combos_tested,
+                    window_results_json, now,
+                ),
+            )
+            return cur.lastrowid
 
     def log_backtest_result(
         self,
