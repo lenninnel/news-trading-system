@@ -1,12 +1,26 @@
+# ── Core AI & data ────────────────────────────────────────────────────────────
 anthropic
 requests
 python-dotenv
 yfinance
 ta
+pyyaml
+numpy
+pandas
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 streamlit
 streamlit-autorefresh
 plotly
-pyyaml
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 schedule
-numpy
-pandas
+
+# ── Database ──────────────────────────────────────────────────────────────────
+# psycopg2-binary is only needed in production (PostgreSQL).
+# For local SQLite development it is optional.
+psycopg2-binary
+
+# ── Health check server ───────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]

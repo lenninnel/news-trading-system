@@ -182,39 +182,179 @@ optimization_results
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 
 from config.settings import DB_PATH
 
+# ---------------------------------------------------------------------------
+# PostgreSQL support
+# ---------------------------------------------------------------------------
+# When the DATABASE_URL environment variable is set (Railway / Render inject it
+# automatically when a PostgreSQL plugin is attached), the Database class
+# transparently uses psycopg2 instead of SQLite.  All public method signatures
+# are identical in both modes so no calling code needs to change.
+#
+# Local development (no DATABASE_URL)  → SQLite, file at DB_PATH
+# Production (DATABASE_URL set)        → PostgreSQL via psycopg2-binary
+# ---------------------------------------------------------------------------
+
 
 class Database:
-    """Thin wrapper around a SQLite database for logging trading analysis."""
+    """
+    Persistence layer for the News Trading System.
+
+    Supports SQLite (local dev) and PostgreSQL (production).
+    Backend is chosen automatically from the DATABASE_URL environment variable.
+    """
 
     def __init__(self, db_path: str = DB_PATH) -> None:
         """
         Initialise the database and create tables if they don't exist.
 
         Args:
-            db_path: Path to the SQLite file. Defaults to settings.DB_PATH.
+            db_path: Path to the SQLite file (ignored when DATABASE_URL is set).
         """
-        self.db_path = db_path
+        pg_url = os.environ.get("DATABASE_URL", "")
+        self._use_pg: bool = bool(pg_url)
+        if self._use_pg:
+            self._pg_dsn: str = pg_url
+        self.db_path = db_path          # kept as public attr for backward compat
+        self._db_path = db_path
         self._init_schema()
-        self._migrate_schema()
+        if not self._use_pg:
+            self._migrate_schema()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        # timeout=5.0 — wait up to 5 s when the DB is locked by another writer
-        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
+    def _connect(self):
+        """Return an open database connection for the active backend."""
+        if self._use_pg:
+            try:
+                import psycopg2
+                import psycopg2.extras
+            except ImportError as exc:
+                raise ImportError(
+                    "psycopg2-binary is required for PostgreSQL. "
+                    "Install it with: pip install psycopg2-binary"
+                ) from exc
+            return psycopg2.connect(
+                self._pg_dsn,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+        conn = sqlite3.connect(self._db_path, timeout=5.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_schema(self) -> None:
+    def _pg_sql(self, sql: str) -> str:
+        """Adapt SQLite SQL to PostgreSQL: replace ? placeholders and DDL keywords."""
+        return (
+            sql
+            .replace("?", "%s")
+            .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            .replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        )
+
+    def _insert(self, sql: str, params: tuple) -> int:
+        """
+        Execute an INSERT statement and return the generated row id.
+
+        For PostgreSQL, appends RETURNING id and fetches the value.
+        For SQLite, uses cursor.lastrowid.
+        """
+        if self._use_pg:
+            pg_sql = self._pg_sql(sql).rstrip().rstrip(";") + " RETURNING id"
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(pg_sql, params)
+                row_id = cur.fetchone()["id"]
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return row_id
         with self._connect() as conn:
-            conn.executescript(
+            cur = conn.execute(sql, params)
+            return cur.lastrowid
+
+    def _exec_write(self, sql: str, params: tuple = ()) -> None:
+        """Execute an INSERT/UPDATE/DELETE with no return value."""
+        if self._use_pg:
+            conn = self._connect()
+            try:
+                conn.cursor().execute(self._pg_sql(sql), params)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return
+        with self._connect() as conn:
+            conn.execute(sql, params)
+
+    def _select(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a SELECT and return all rows as a list of dicts."""
+        if self._use_pg:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(self._pg_sql(sql), params)
+                return [dict(row) for row in cur.fetchall()]
+            finally:
+                conn.close()
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def _exec_many(self, sql: str, rows: list[tuple]) -> None:
+        """Execute an INSERT for many rows (executemany)."""
+        if self._use_pg:
+            pg_sql = self._pg_sql(sql)
+            if "OR IGNORE" in sql:
+                pg_sql = pg_sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+            conn = self._connect()
+            try:
+                conn.cursor().executemany(pg_sql, rows)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return
+        with self._connect() as conn:
+            conn.executemany(sql, rows)
+
+    def _exec_script(self, sql: str) -> None:
+        """Execute a multi-statement DDL/DML script."""
+        if self._use_pg:
+            pg_sql = self._pg_sql(sql)
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                for stmt in pg_sql.split(";"):
+                    stmt = stmt.strip()
+                    if stmt:
+                        cur.execute(stmt)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return
+        with self._connect() as conn:
+            conn.executescript(sql)
+
+    def _init_schema(self) -> None:
+        self._exec_script(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -456,10 +596,13 @@ class Database:
                     created_at          TEXT    NOT NULL
                 );
                 """
-            )
+        )
 
     def _migrate_schema(self) -> None:
         """Idempotently add columns/indices introduced after the initial schema."""
+        # PostgreSQL always starts with the complete current schema; no migration needed.
+        if self._use_pg:
+            return
         with self._connect() as conn:
             # Add price and volume columns to screener_results if they don't exist yet
             for col_def in ("price REAL", "volume REAL"):
@@ -499,16 +642,12 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO runs
-                    (ticker, headlines_fetched, headlines_analysed, avg_score, signal, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (ticker, headlines_fetched, headlines_analysed, avg_score, signal, now),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO runs "
+            "(ticker, headlines_fetched, headlines_analysed, avg_score, signal, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (ticker, headlines_fetched, headlines_analysed, avg_score, signal, now),
+        )
 
     def log_headline_score(
         self,
@@ -528,14 +667,11 @@ class Database:
             score:     Numeric score (+1 / 0 / -1).
             reason:    Claude's one-sentence explanation.
         """
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO headline_scores (run_id, headline, sentiment, score, reason)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (run_id, headline, sentiment, score, reason),
-            )
+        self._exec_write(
+            "INSERT INTO headline_scores (run_id, headline, sentiment, score, reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (run_id, headline, sentiment, score, reason),
+        )
 
     def log_technical_signal(
         self,
@@ -573,20 +709,14 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO technical_signals
-                    (ticker, signal, rsi, macd, macd_signal, macd_hist,
-                     sma_20, sma_50, bb_upper, bb_lower, price, reasoning, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, signal, rsi, macd, macd_signal, macd_hist,
-                    sma_20, sma_50, bb_upper, bb_lower, price, reasoning, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO technical_signals "
+            "(ticker, signal, rsi, macd, macd_signal, macd_hist, "
+            " sma_20, sma_50, bb_upper, bb_lower, price, reasoning, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ticker, signal, rsi, macd, macd_signal, macd_hist,
+             sma_20, sma_50, bb_upper, bb_lower, price, reasoning, now),
+        )
 
     def log_combined_signal(
         self,
@@ -617,20 +747,16 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO combined_signals
-                    (ticker, combined_signal, sentiment_signal, technical_signal,
-                     sentiment_score, confidence, run_id, technical_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, combined_signal, sentiment_signal, technical_signal,
-                    sentiment_score, confidence, run_id, technical_id, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO combined_signals"
+            " (ticker, combined_signal, sentiment_signal, technical_signal,"
+            "  sentiment_score, confidence, run_id, technical_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, combined_signal, sentiment_signal, technical_signal,
+                sentiment_score, confidence, run_id, technical_id, now,
+            ),
+        )
 
     def log_risk_calculation(
         self,
@@ -672,24 +798,20 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO risk_calculations
-                    (ticker, signal, confidence, current_price, account_balance,
-                     position_size_usd, shares, stop_loss, take_profit,
-                     risk_amount, kelly_fraction, stop_pct,
-                     skipped, skip_reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, signal, confidence, current_price, account_balance,
-                    position_size_usd, shares, stop_loss, take_profit,
-                    risk_amount, kelly_fraction, stop_pct,
-                    int(skipped), skip_reason, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO risk_calculations"
+            " (ticker, signal, confidence, current_price, account_balance,"
+            "  position_size_usd, shares, stop_loss, take_profit,"
+            "  risk_amount, kelly_fraction, stop_pct,"
+            "  skipped, skip_reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, signal, confidence, current_price, account_balance,
+                position_size_usd, shares, stop_loss, take_profit,
+                risk_amount, kelly_fraction, stop_pct,
+                int(skipped), skip_reason, now,
+            ),
+        )
 
     def log_strategy_comparison(
         self,
@@ -723,22 +845,18 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO backtest_strategy_comparison
-                    (ticker, start_date, end_date, strategy,
-                     total_return, sharpe, max_dd, win_rate,
-                     trade_count, avg_hold_days, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, start_date, end_date, strategy,
-                    total_return, sharpe, max_dd, win_rate,
-                    trade_count, avg_hold_days, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO backtest_strategy_comparison"
+            " (ticker, start_date, end_date, strategy,"
+            "  total_return, sharpe, max_dd, win_rate,"
+            "  trade_count, avg_hold_days, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, start_date, end_date, strategy,
+                total_return, sharpe, max_dd, win_rate,
+                trade_count, avg_hold_days, now,
+            ),
+        )
 
     def log_strategy_signal(
         self,
@@ -776,22 +894,18 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO strategy_signals
-                    (ticker, strategy, signal, confidence, timeframe, reasoning,
-                     indicators_json, ensemble_confidence, combined_signal, consensus,
-                     account_balance, risk_calc_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, strategy, signal, confidence, timeframe, reasoning,
-                    indicators_json, ensemble_confidence, combined_signal, consensus,
-                    account_balance, risk_calc_id, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO strategy_signals"
+            " (ticker, strategy, signal, confidence, timeframe, reasoning,"
+            "  indicators_json, ensemble_confidence, combined_signal, consensus,"
+            "  account_balance, risk_calc_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, strategy, signal, confidence, timeframe, reasoning,
+                indicators_json, ensemble_confidence, combined_signal, consensus,
+                account_balance, risk_calc_id, now,
+            ),
+        )
 
     def log_strategy_performance(
         self,
@@ -833,27 +947,23 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO strategy_performance
-                    (ticker, run_at, momentum_signal, momentum_confidence,
-                     mean_reversion_signal, mean_reversion_confidence,
-                     swing_signal, swing_confidence,
-                     combined_signal, ensemble_confidence, consensus,
-                     risk_calc_id, account_balance, errors_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, run_at,
-                    momentum_signal, momentum_confidence,
-                    mean_reversion_signal, mean_reversion_confidence,
-                    swing_signal, swing_confidence,
-                    combined_signal, ensemble_confidence, consensus,
-                    risk_calc_id, account_balance, errors_json, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO strategy_performance"
+            " (ticker, run_at, momentum_signal, momentum_confidence,"
+            "  mean_reversion_signal, mean_reversion_confidence,"
+            "  swing_signal, swing_confidence,"
+            "  combined_signal, ensemble_confidence, consensus,"
+            "  risk_calc_id, account_balance, errors_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, run_at,
+                momentum_signal, momentum_confidence,
+                mean_reversion_signal, mean_reversion_confidence,
+                swing_signal, swing_confidence,
+                combined_signal, ensemble_confidence, consensus,
+                risk_calc_id, account_balance, errors_json, now,
+            ),
+        )
 
     def log_price_alert(
         self,
@@ -883,18 +993,14 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO price_alerts
-                    (ticker, alert_type, price, stop_loss, take_profit,
-                     change_pct, volume_ratio, message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (ticker, alert_type, price, stop_loss, take_profit,
-                 change_pct, volume_ratio, message, now),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO price_alerts"
+            " (ticker, alert_type, price, stop_loss, take_profit,"
+            "  change_pct, volume_ratio, message, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ticker, alert_type, price, stop_loss, take_profit,
+             change_pct, volume_ratio, message, now),
+        )
 
     def log_portfolio_snapshot(
         self,
@@ -913,24 +1019,20 @@ class Database:
     ) -> int:
         """Persist a portfolio state snapshot and return its auto-generated ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO portfolio_snapshots
-                    (snapshot_at, open_positions, total_value, deployed_pct,
-                     cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,
-                     max_concentration, sector_json, strategy_json,
-                     violations_today, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_at, open_positions, total_value, deployed_pct,
-                    cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,
-                    max_concentration, sector_json, strategy_json,
-                    violations_today, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO portfolio_snapshots"
+            " (snapshot_at, open_positions, total_value, deployed_pct,"
+            "  cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,"
+            "  max_concentration, sector_json, strategy_json,"
+            "  violations_today, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot_at, open_positions, total_value, deployed_pct,
+                cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,
+                max_concentration, sector_json, strategy_json,
+                violations_today, now,
+            ),
+        )
 
     def log_portfolio_violation(
         self,
@@ -942,16 +1044,12 @@ class Database:
     ) -> int:
         """Persist a blocked trade attempt and return its auto-generated ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO portfolio_violations
-                    (ticker, strategy, amount_usd, violation_type, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (ticker, strategy, amount_usd, violation_type, reason, now),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO portfolio_violations"
+            " (ticker, strategy, amount_usd, violation_type, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (ticker, strategy, amount_usd, violation_type, reason, now),
+        )
 
     def get_recent_runs(self, limit: int = 10) -> list[dict]:
         """
@@ -963,11 +1061,7 @@ class Database:
         Returns:
             List of dicts, each representing one row from the runs table.
         """
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [dict(row) for row in rows]
+        return self._select("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
 
     def get_scores_for_run(self, run_id: int) -> list[dict]:
         """
@@ -979,11 +1073,7 @@ class Database:
         Returns:
             List of dicts, each representing one headline_scores row.
         """
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM headline_scores WHERE run_id = ?", (run_id,)
-            ).fetchall()
-            return [dict(row) for row in rows]
+        return self._select("SELECT * FROM headline_scores WHERE run_id = ?", (run_id,))
 
     def log_scheduler_run(
         self,
@@ -1016,29 +1106,25 @@ class Database:
         """
         import json
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO scheduler_logs
-                    (run_at, tickers, signals_generated, trades_executed,
-                     portfolio_value, duration_seconds, errors, status,
-                     summary, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_at,
-                    json.dumps(tickers),
-                    signals_generated,
-                    trades_executed,
-                    portfolio_value,
-                    duration_seconds,
-                    json.dumps(errors),
-                    status,
-                    summary,
-                    now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO scheduler_logs"
+            " (run_at, tickers, signals_generated, trades_executed,"
+            "  portfolio_value, duration_seconds, errors, status,"
+            "  summary, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_at,
+                json.dumps(tickers),
+                signals_generated,
+                trades_executed,
+                portfolio_value,
+                duration_seconds,
+                json.dumps(errors),
+                status,
+                summary,
+                now,
+            ),
+        )
 
     def log_screener_results(self, run_at: str, results: list[dict]) -> int:
         """
@@ -1078,17 +1164,14 @@ class Database:
             )
             for r in results
         ]
-        with self._connect() as conn:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO screener_results
-                    (run_at, ticker, name, market, exchange, country,
-                     hotness, price, price_change, volume_ratio, volume,
-                     rsi, market_cap, avg_volume, metrics, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
+        self._exec_many(
+            "INSERT OR IGNORE INTO screener_results"
+            " (run_at, ticker, name, market, exchange, country,"
+            "  hotness, price, price_change, volume_ratio, volume,"
+            "  rsi, market_cap, avg_volume, metrics, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
         return len(rows)
 
     def log_optimization_result(
@@ -1142,34 +1225,30 @@ class Database:
         """
         import json as _json
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO optimization_results
-                    (ticker, strategy, start_date, end_date,
-                     best_params_json, default_params_json,
-                     best_sharpe, default_sharpe,
-                     best_return, default_return,
-                     best_max_dd, default_max_dd,
-                     best_win_rate, default_win_rate,
-                     best_trade_count, stability_score,
-                     windows_tested, combos_tested,
-                     window_results_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, strategy, start_date, end_date,
-                    _json.dumps(best_params), _json.dumps(default_params),
-                    best_sharpe, default_sharpe,
-                    best_return, default_return,
-                    best_max_dd, default_max_dd,
-                    best_win_rate, default_win_rate,
-                    best_trade_count, stability_score,
-                    windows_tested, combos_tested,
-                    window_results_json, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO optimization_results"
+            " (ticker, strategy, start_date, end_date,"
+            "  best_params_json, default_params_json,"
+            "  best_sharpe, default_sharpe,"
+            "  best_return, default_return,"
+            "  best_max_dd, default_max_dd,"
+            "  best_win_rate, default_win_rate,"
+            "  best_trade_count, stability_score,"
+            "  windows_tested, combos_tested,"
+            "  window_results_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, strategy, start_date, end_date,
+                _json.dumps(best_params), _json.dumps(default_params),
+                best_sharpe, default_sharpe,
+                best_return, default_return,
+                best_max_dd, default_max_dd,
+                best_win_rate, default_win_rate,
+                best_trade_count, stability_score,
+                windows_tested, combos_tested,
+                window_results_json, now,
+            ),
+        )
 
     def log_backtest_result(
         self,
@@ -1213,21 +1292,17 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO backtest_results
-                    (ticker, start_date, end_date, initial_balance, final_balance,
-                     total_return_pct, buy_and_hold_return_pct, sharpe_ratio,
-                     max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
-                     total_trades, sentiment_mode, trades_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ticker, start_date, end_date, initial_balance, final_balance,
-                    total_return_pct, buy_and_hold_return_pct, sharpe_ratio,
-                    max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
-                    total_trades, sentiment_mode, trades_json, now,
-                ),
-            )
-            return cur.lastrowid
+        return self._insert(
+            "INSERT INTO backtest_results"
+            " (ticker, start_date, end_date, initial_balance, final_balance,"
+            "  total_return_pct, buy_and_hold_return_pct, sharpe_ratio,"
+            "  max_drawdown_pct, win_rate_pct, avg_win, avg_loss,"
+            "  total_trades, sentiment_mode, trades_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticker, start_date, end_date, initial_balance, final_balance,
+                total_return_pct, buy_and_hold_return_pct, sharpe_ratio,
+                max_drawdown_pct, win_rate_pct, avg_win, avg_loss,
+                total_trades, sentiment_mode, trades_json, now,
+            ),
+        )

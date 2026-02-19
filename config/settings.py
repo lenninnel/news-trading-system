@@ -49,3 +49,19 @@ SELL_THRESHOLD: float = -0.3
 # ---------------------------------------------------------------------------
 
 DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
+
+# ---------------------------------------------------------------------------
+# Deployment / runtime
+# ---------------------------------------------------------------------------
+
+ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "")  # PostgreSQL DSN in production
+HEALTH_PORT: int = int(os.environ.get("HEALTH_PORT", "8080"))
+ACCOUNT_BALANCE: float = float(os.environ.get("ACCOUNT_BALANCE", "10000.0"))
+
+# ---------------------------------------------------------------------------
+# Telegram notifications (optional)
+# ---------------------------------------------------------------------------
+
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")

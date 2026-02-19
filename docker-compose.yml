@@ -1,0 +1,119 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════
+#  Local development stack
+#  Usage:
+#    docker-compose up            # start everything
+#    docker-compose up dashboard  # dashboard only (SQLite)
+#    docker-compose up -d         # background
+#    docker-compose logs -f       # follow logs
+# ══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── PostgreSQL (mirrors Railway prod database) ─────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader_dev
+      POSTGRES_DB: news_trading
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d news_trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Streamlit Dashboard ────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      streamlit run dashboard/app.py
+        --server.port=8501
+        --server.address=0.0.0.0
+        --server.headless=true
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount source for hot-reload during development
+      - .:/app
+      - /app/__pycache__
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+      - ENVIRONMENT=development
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Health Check API ───────────────────────────────────────────
+  health:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: uvicorn deployment.health_server:app --host 0.0.0.0 --port 8080 --reload
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Scheduler Worker ───────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python3 scheduler/daily_runner.py --daemon
+    volumes:
+      - .:/app
+      - logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+      - ENVIRONMENT=development
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - full  # only start with: docker-compose --profile full up
+
+  # ── Price Monitor ──────────────────────────────────────────────
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python3 monitoring/price_monitor.py --daemon
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - full
+
+volumes:
+  pg_data:
+  logs:

@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+
+# Virtual environments
+.venv
+venv
+env/
+
+# Local database (never ship SQLite to prod)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment files (secrets!)
+.env
+.env.local
+.env.*.local
+
+# Generated outputs
+backtest/*.html
+logs/
+*.log
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Node (if any frontend tooling)
+node_modules/
