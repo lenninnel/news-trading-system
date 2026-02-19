@@ -265,7 +265,33 @@ elif page == "Signals":
 # PAGE: PORTFOLIO
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Portfolio":
+    import plotly.graph_objects as go
+    from execution.portfolio_manager import PortfolioManager
+
     st.title("Portfolio")
+
+    # ── Sidebar balance input ──────────────────────────────────────────────────
+    pm_balance = st.sidebar.number_input(
+        "Account Balance ($)",
+        min_value=1_000.0,
+        max_value=10_000_000.0,
+        value=10_000.0,
+        step=1_000.0,
+        key="pm_balance",
+        help="Used to compute deployment % and capacity limits.",
+    )
+
+    @st.cache_data(ttl=60)
+    def _load_pm_data(balance: float):
+        pm      = PortfolioManager(account_balance=balance)
+        div     = pm.get_diversification_metrics()
+        cap     = pm.capacity_summary()
+        risk    = pm.check_risk_limits()
+        rebal   = pm.rebalance_if_needed()
+        corr_df = pm.get_correlation_matrix()
+        return pm, div, cap, risk, rebal, corr_df
+
+    pm, div, cap, risk, rebal, corr_df = _load_pm_data(pm_balance)
 
     portfolio = query("SELECT * FROM portfolio ORDER BY ticker")
     closed    = query(
@@ -274,15 +300,15 @@ elif page == "Portfolio":
     )
 
     open_df      = portfolio[portfolio["shares"] > 0] if not portfolio.empty else pd.DataFrame()
-    total_value  = open_df["current_value"].sum() if not open_df.empty else 0.0
+    total_value  = div["total_value"]
     realized_pnl = (
         closed["total_pnl"].iloc[0]
         if not closed.empty and closed["total_pnl"].iloc[0] is not None
         else 0.0
     )
 
-    # ── KPIs ──────────────────────────────────────────────────────────────────
-    k1, k2, k3 = st.columns(3)
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Open Position Value", fmt_usd(total_value),
               help="Entry-based: shares × avg price")
     k2.metric(
@@ -291,20 +317,233 @@ elif page == "Portfolio":
         delta=f"{realized_pnl:+.2f}" if realized_pnl else None,
         delta_color="normal",
     )
-    k3.metric("Open Positions", len(open_df))
+    k3.metric("Open Positions", f"{cap['positions_used']}/{cap['positions_max']}")
+    k4.metric(
+        "Capital Deployed",
+        f"{cap['deployed_pct']:.1%}",
+        help=f"Max: {PortfolioManager.MAX_DEPLOYED_PCT:.0%} of ${pm_balance:,.0f}",
+    )
+    k5.metric("Cash Reserve", fmt_usd(cap["cash_reserve"]))
 
     st.markdown("---")
 
-    # ── Open positions ────────────────────────────────────────────────────────
-    st.subheader("Open Positions")
-    if open_df.empty:
-        st.info("No open positions. Run `python main.py <TICKER> --execute` to log trades.")
+    # ── Warnings banner ───────────────────────────────────────────────────────
+    all_warnings = cap["warnings"] + risk["warnings"]
+    if all_warnings:
+        for w in all_warnings:
+            st.warning(f"⚠️ {w}")
+    if rebal:
+        for act in rebal:
+            colour = "error" if act["action"] in ("partial_close", "block_sector") else "warning"
+            getattr(st, colour)(f"{'🔴' if colour == 'error' else '⚠️'} {act['reason']}")
+
+    # ── Row 1: Position limits + sector pie ───────────────────────────────────
+    col_lim, col_pie, col_strat = st.columns([1.2, 1.4, 1])
+
+    with col_lim:
+        st.subheader("Position Limits")
+
+        def _bar(used, mx, label):
+            pct   = used / mx if mx > 0 else 0.0
+            color = "#e74c3c" if pct >= 1.0 else ("#f39c12" if pct >= 0.80 else "#2ecc71")
+            st.markdown(f"**{label}** — {used}/{mx}")
+            st.progress(min(pct, 1.0))
+
+        _bar(cap["positions_used"], cap["positions_max"], "Total positions")
+
+        dep_pct = cap["deployed_usd"] / cap["deploy_max_usd"] if cap["deploy_max_usd"] > 0 else 0.0
+        st.markdown(
+            f"**Capital deployed** — {dep_pct:.0%}  "
+            f"(${cap['deployed_usd']:,.0f} / ${cap['deploy_max_usd']:,.0f})"
+        )
+        st.progress(min(dep_pct, 1.0))
+
+        st.markdown("**By strategy**")
+        for strat, info in cap["by_strategy"].items():
+            pct = info["used"] / info["max"] if info["max"] > 0 else 0.0
+            st.markdown(f"  {strat.replace('_', ' ').title()}: {info['used']}/{info['max']}")
+            st.progress(min(pct, 1.0))
+
+    with col_pie:
+        st.subheader("Sector Diversification")
+        if div["by_sector"]:
+            sector_labels = list(div["by_sector"].keys())
+            sector_values = list(div["by_sector"].values())
+            fig_pie = px.pie(
+                values=sector_values,
+                names=sector_labels,
+                hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Set3,
+            )
+            fig_pie.update_traces(textinfo="label+percent", pull=[0.02] * len(sector_labels))
+            fig_pie.update_layout(
+                margin=dict(t=10, b=10, l=10, r=10),
+                showlegend=False,
+                height=260,
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+            # Sector concentration bars
+            for sector, pct in sorted(div["sector_pcts"].items(), key=lambda x: -x[1]):
+                icon = "🔴" if pct > PortfolioManager.MAX_SECTOR_PCT else (
+                    "⚠️" if pct > PortfolioManager.MAX_SECTOR_PCT * PortfolioManager.WARN_THRESHOLD
+                    else "🟢"
+                )
+                st.caption(
+                    f"{icon} {sector}: {div['by_sector'].get(sector, 0)} pos · {pct:.0%} of portfolio"
+                )
+        else:
+            st.info("No open positions.")
+
+    with col_strat:
+        st.subheader("Risk Metrics")
+
+        def _metric_row(label, value, warn_val=None, fmt="{:.2f}"):
+            if value is None:
+                st.metric(label, "—")
+            else:
+                icon = ""
+                if warn_val is not None and abs(value) > warn_val:
+                    icon = " ⚠️"
+                st.metric(label, fmt.format(value) + icon)
+
+        _metric_row("Portfolio Beta",       risk["beta"],
+                    warn_val=1.5, fmt="{:.2f}")
+        _metric_row("Volatility (ann.)",    risk["volatility"],
+                    warn_val=0.30, fmt="{:.1%}")
+        _metric_row("Max Concentration",    risk["max_concentration"],
+                    warn_val=PortfolioManager.MAX_POSITION_PCT, fmt="{:.1%}")
+        _metric_row("Avg Correlation",      risk["avg_correlation"],
+                    warn_val=PortfolioManager.WARN_CORRELATION, fmt="{:.2f}")
+        _metric_row("Cash Reserve",         cap["cash_reserve"] / pm_balance if pm_balance else None,
+                    fmt="{:.1%}")
+
+    st.markdown("---")
+
+    # ── Row 2: Correlation heatmap + open positions table ─────────────────────
+    col_hm, col_pos = st.columns([1, 1.4])
+
+    with col_hm:
+        st.subheader("Correlation Heatmap (30d)")
+        if not corr_df.empty and corr_df.shape[0] >= 2:
+            fig_hm = go.Figure(
+                go.Heatmap(
+                    z        = corr_df.values,
+                    x        = corr_df.columns.tolist(),
+                    y        = corr_df.index.tolist(),
+                    colorscale = "RdYlGn_r",
+                    zmin     = -1,
+                    zmax     = 1,
+                    text     = [[f"{v:.2f}" for v in row] for row in corr_df.values],
+                    texttemplate = "%{text}",
+                    showscale = True,
+                )
+            )
+            fig_hm.update_layout(
+                margin=dict(t=10, b=10, l=10, r=10),
+                height=280,
+                xaxis=dict(side="bottom"),
+            )
+            st.plotly_chart(fig_hm, use_container_width=True)
+            if risk["avg_correlation"] is not None:
+                ac = risk["avg_correlation"]
+                color = "red" if ac > PortfolioManager.MAX_CORRELATION else (
+                    "orange" if ac > PortfolioManager.WARN_CORRELATION else "green"
+                )
+                st.markdown(
+                    f"Average pairwise: "
+                    f"<span style='color:{color};font-weight:bold'>{ac:.3f}</span>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("Need ≥ 2 open positions to compute correlations.")
+
+    with col_pos:
+        st.subheader("Open Positions")
+        positions = div.get("positions", [])
+        if positions:
+            total_val = div["total_value"]
+            rows = []
+            for p in sorted(positions, key=lambda x: -x["current_value"]):
+                weight = p["current_value"] / total_val if total_val > 0 else 0.0
+                rows.append({
+                    "Ticker":    p["ticker"],
+                    "Shares":    p["shares"],
+                    "Avg Price": fmt_usd(p["avg_price"]),
+                    "Value":     fmt_usd(p["current_value"]),
+                    "Weight":    f"{weight:.1%}",
+                    "Strategy":  p["strategy"].replace("_", " ").title(),
+                    "Sector":    p["sector"],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        elif not open_df.empty:
+            # Fall back to raw portfolio table (no metadata registered yet)
+            d = open_df.copy()
+            d["avg_price"]     = d["avg_price"].apply(fmt_usd)
+            d["current_value"] = d["current_value"].apply(fmt_usd)
+            d.columns = ["Ticker", "Shares", "Avg Price", "Entry Value"]
+            st.dataframe(d, use_container_width=True, hide_index=True)
+            st.caption(
+                "Strategy/sector data not available. "
+                "Use PortfolioManager.register_position() when opening trades."
+            )
+        else:
+            st.info("No open positions. Run with `--execute` to log trades.")
+
+    st.markdown("---")
+
+    # ── Portfolio violations log ───────────────────────────────────────────────
+    st.subheader("Recent Portfolio Violations")
+    violations = query(
+        "SELECT created_at, ticker, strategy, amount_usd, violation_type, reason "
+        "FROM portfolio_violations ORDER BY id DESC LIMIT 25"
+    )
+    if violations.empty:
+        st.info("No violations recorded — all trades passed portfolio checks.")
     else:
-        d = open_df.copy()
-        d["avg_price"]     = d["avg_price"].apply(fmt_usd)
-        d["current_value"] = d["current_value"].apply(fmt_usd)
-        d.columns = ["Ticker", "Shares", "Avg Price", "Entry Value"]
-        st.dataframe(d, use_container_width=True, hide_index=True)
+        violations["created_at"] = pd.to_datetime(violations["created_at"]).dt.strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        violations.columns = ["Time", "Ticker", "Strategy", "Amount ($)", "Type", "Reason"]
+        st.dataframe(violations, use_container_width=True, hide_index=True)
+
+    # ── Historical snapshot chart ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Portfolio Snapshots Over Time")
+    snaps = query(
+        "SELECT snapshot_at, open_positions, total_value, deployed_pct, "
+        "avg_correlation, portfolio_beta "
+        "FROM portfolio_snapshots ORDER BY snapshot_at"
+    )
+    if snaps.empty:
+        st.info(
+            "No snapshots saved yet. Run `python3 -m execution.portfolio_manager "
+            "--balance 10000 --save-snapshot` to capture one."
+        )
+    else:
+        snaps["snapshot_at"] = pd.to_datetime(snaps["snapshot_at"])
+        fig_snaps = px.line(
+            snaps,
+            x="snapshot_at",
+            y="total_value",
+            title="Portfolio Value Over Snapshots",
+            labels={"snapshot_at": "Time", "total_value": "Entry Value ($)"},
+        )
+        fig_snaps.update_layout(margin=dict(t=30, b=10))
+        st.plotly_chart(fig_snaps, use_container_width=True)
+
+        cols_show = [c for c in ["snapshot_at", "open_positions", "total_value",
+                                  "deployed_pct", "avg_correlation", "portfolio_beta"]
+                     if c in snaps.columns]
+        d = snaps[cols_show].copy()
+        if "deployed_pct" in d.columns:
+            d["deployed_pct"] = (d["deployed_pct"] * 100).round(1).astype(str) + "%"
+        if "avg_correlation" in d.columns:
+            d["avg_correlation"] = d["avg_correlation"].round(3)
+        if "portfolio_beta" in d.columns:
+            d["portfolio_beta"] = d["portfolio_beta"].round(2)
+        d.columns = [c.replace("_", " ").title() for c in d.columns]
+        st.dataframe(d.tail(20), use_container_width=True, hide_index=True)
 
     # ── All tickers (incl. closed) ────────────────────────────────────────────
     if not portfolio.empty:

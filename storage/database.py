@@ -117,6 +117,32 @@ strategy_performance
     account_balance           REAL     Account value used for sizing
     errors_json               TEXT     JSON list of per-agent error strings
     created_at                TEXT     ISO-8601 UTC timestamp
+
+portfolio_snapshots
+    id                INTEGER  Primary key
+    snapshot_at       TEXT     ISO-8601 UTC timestamp of the snapshot
+    open_positions    INTEGER  Number of open positions at snapshot time
+    total_value       REAL     Total portfolio value (entry-based)
+    deployed_pct      REAL     Fraction of account balance deployed (0.0–1.0)
+    cash_reserve      REAL     Remaining buying power in USD
+    portfolio_beta    REAL     Portfolio weighted beta vs SPY (NULL if unavailable)
+    portfolio_vol     REAL     30-day annualised portfolio volatility (NULL if unavailable)
+    avg_correlation   REAL     Average pairwise 30-day price correlation (NULL if < 2 positions)
+    max_concentration REAL     Largest single-position weight (NULL if empty)
+    sector_json       TEXT     JSON {"Tech": 2, "Finance": 1, ...} sector position counts
+    strategy_json     TEXT     JSON {"momentum": 2, "swing": 1, ...} strategy position counts
+    violations_today  INTEGER  Number of blocked trades logged today
+    created_at        TEXT     ISO-8601 UTC timestamp
+
+portfolio_violations
+    id             INTEGER  Primary key
+    ticker         TEXT     Ticker that was blocked
+    strategy       TEXT     Strategy that requested the trade
+    amount_usd     REAL     Requested position size in USD
+    violation_type TEXT     "duplicate" | "max_positions" | "max_per_strategy" | "max_per_sector" |
+                            "max_deployed" | "correlation"
+    reason         TEXT     Human-readable explanation
+    created_at     TEXT     ISO-8601 UTC timestamp
 """
 
 from __future__ import annotations
@@ -329,6 +355,33 @@ class Database:
                     account_balance           REAL,
                     errors_json               TEXT,
                     created_at                TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_at       TEXT    NOT NULL,
+                    open_positions    INTEGER NOT NULL DEFAULT 0,
+                    total_value       REAL    NOT NULL DEFAULT 0,
+                    deployed_pct      REAL    NOT NULL DEFAULT 0,
+                    cash_reserve      REAL    NOT NULL DEFAULT 0,
+                    portfolio_beta    REAL,
+                    portfolio_vol     REAL,
+                    avg_correlation   REAL,
+                    max_concentration REAL,
+                    sector_json       TEXT,
+                    strategy_json     TEXT,
+                    violations_today  INTEGER NOT NULL DEFAULT 0,
+                    created_at        TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portfolio_violations (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker         TEXT    NOT NULL,
+                    strategy       TEXT,
+                    amount_usd     REAL,
+                    violation_type TEXT    NOT NULL,
+                    reason         TEXT    NOT NULL,
+                    created_at     TEXT    NOT NULL
                 );
                 """
             )
@@ -727,6 +780,63 @@ class Database:
                     combined_signal, ensemble_confidence, consensus,
                     risk_calc_id, account_balance, errors_json, now,
                 ),
+            )
+            return cur.lastrowid
+
+    def log_portfolio_snapshot(
+        self,
+        snapshot_at: str,
+        open_positions: int,
+        total_value: float,
+        deployed_pct: float,
+        cash_reserve: float,
+        portfolio_beta: "float | None" = None,
+        portfolio_vol: "float | None" = None,
+        avg_correlation: "float | None" = None,
+        max_concentration: "float | None" = None,
+        sector_json: "str | None" = None,
+        strategy_json: "str | None" = None,
+        violations_today: int = 0,
+    ) -> int:
+        """Persist a portfolio state snapshot and return its auto-generated ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO portfolio_snapshots
+                    (snapshot_at, open_positions, total_value, deployed_pct,
+                     cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,
+                     max_concentration, sector_json, strategy_json,
+                     violations_today, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_at, open_positions, total_value, deployed_pct,
+                    cash_reserve, portfolio_beta, portfolio_vol, avg_correlation,
+                    max_concentration, sector_json, strategy_json,
+                    violations_today, now,
+                ),
+            )
+            return cur.lastrowid
+
+    def log_portfolio_violation(
+        self,
+        ticker: str,
+        violation_type: str,
+        reason: str,
+        strategy: "str | None" = None,
+        amount_usd: "float | None" = None,
+    ) -> int:
+        """Persist a blocked trade attempt and return its auto-generated ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO portfolio_violations
+                    (ticker, strategy, amount_usd, violation_type, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, strategy, amount_usd, violation_type, reason, now),
             )
             return cur.lastrowid
 

@@ -35,7 +35,7 @@ import concurrent.futures
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agents.momentum_agent import MomentumAgent
 from agents.mean_reversion_agent import MeanReversionAgent
@@ -43,6 +43,9 @@ from agents.swing_agent import SwingAgent
 from agents.strategy_base import StrategySignal
 from agents.risk_agent import RiskAgent
 from storage.database import Database
+
+if TYPE_CHECKING:
+    from execution.portfolio_manager import PortfolioManager
 
 log = logging.getLogger(__name__)
 
@@ -76,13 +79,15 @@ class StrategyCoordinator:
         risk_agent: RiskAgent | None = None,
         db: Database | None = None,
         max_workers: int = 3,
+        portfolio_manager: "PortfolioManager | None" = None,
     ) -> None:
-        self._db             = db or Database()
-        self._momentum       = momentum_agent       or MomentumAgent(db=self._db)
-        self._mean_reversion = mean_reversion_agent or MeanReversionAgent(db=self._db)
-        self._swing          = swing_agent          or SwingAgent(db=self._db)
-        self._risk           = risk_agent           or RiskAgent(db=self._db)
-        self._max_workers    = max_workers
+        self._db                 = db or Database()
+        self._momentum           = momentum_agent       or MomentumAgent(db=self._db)
+        self._mean_reversion     = mean_reversion_agent or MeanReversionAgent(db=self._db)
+        self._swing              = swing_agent          or SwingAgent(db=self._db)
+        self._risk               = risk_agent           or RiskAgent(db=self._db)
+        self._max_workers        = max_workers
+        self._portfolio_manager  = portfolio_manager
 
     # ------------------------------------------------------------------
     # Public API
@@ -200,6 +205,26 @@ class StrategyCoordinator:
         risk["current_price"]   = price or 0.0
         risk["account_balance"] = account_balance
 
+        # 5. Portfolio limit check (optional — only when portfolio_manager attached)
+        portfolio_blocked = False
+        portfolio_block_reason = ""
+        if (
+            self._portfolio_manager is not None
+            and not risk["skipped"]
+        ):
+            allowed, block_reason = self._portfolio_manager.can_add_position(
+                ticker   = ticker,
+                strategy = strategy,
+                amount_usd = risk.get("position_size_usd", 0.0),
+            )
+            if not allowed:
+                risk["skipped"]      = True
+                risk["skip_reason"]  = f"Portfolio limit: {block_reason}"
+                portfolio_blocked    = True
+                portfolio_block_reason = block_reason
+                if verbose:
+                    print(f"  Portfolio block: {block_reason}")
+
         return {
             "ticker":                   ticker,
             "strategy":                 strategy,
@@ -212,6 +237,8 @@ class StrategyCoordinator:
             "account_balance":          account_balance,
             "strategy_run_id":          perf_id,
             "errors":                   errors,
+            "portfolio_blocked":        portfolio_blocked,
+            "portfolio_block_reason":   portfolio_block_reason,
         }
 
     # ------------------------------------------------------------------
