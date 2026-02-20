@@ -5,6 +5,7 @@ A multi-agent AI system that monitors financial news, analyses technical indicat
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-202%20passed-brightgreen)](tests/)
+[![Project Status](https://img.shields.io/badge/status-Production%20Ready%20%E2%9C%85-brightgreen)](docs/DEPLOYMENT_CHECKLIST.md)
 [![Deploy on Railway](https://railway.app/button.svg)](docs/DEPLOYMENT.md)
 
 ---
@@ -375,6 +376,7 @@ news-trading-system/
 | [docs/COST_MONITORING.md](docs/COST_MONITORING.md) | Operators | API costs, Railway.app pricing, free-tier tips |
 | [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) | DevOps | Pre/post-deployment verification checklist |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | DevOps | Railway.app and Docker deployment guide |
+| [docs/SESSION_SUMMARY_2026-02-18.md](docs/SESSION_SUMMARY_2026-02-18.md) | All | Full build session retrospective, stats, roadmap |
 
 ---
 

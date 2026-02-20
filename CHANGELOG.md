@@ -11,8 +11,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Planned
 - Live broker integration (Alpaca / IBKR paper API)
 - MacroAgent for economic indicator analysis (CPI, Fed rate decisions)
-- Portfolio-level risk monitoring (total exposure, correlation limits)
-- Automated MDAX / SDAX ticker list refresh from Deutsche Börse API
+- ML signal scoring (train on historical signal → outcome pairs)
+- REST API for external signal consumption
+- Mobile app dashboard
+
+---
+
+## [0.7.0] — 2026-02-20 — Production Ready (Pending Deployment)
+
+### Added
+
+#### Error Recovery System
+- **`utils/api_recovery.py`**: `CircuitBreaker` (3-state FSM: CLOSED → OPEN → HALF_OPEN; 5-failure threshold, 5-minute reset) and `APIRecovery` class with per-service retry configs (NewsAPI: 3 retries / 60s backoff; Anthropic: 2 retries / 30s; yfinance: 5 retries / 5s)
+  - HTTP-status-aware retry: 429 → full backoff, 401 → immediate `UnauthorizedError`, 502/503 → short wait
+- **`utils/network_recovery.py`**: `NetworkMonitor` (probes httpbin.org + google.com; 60s throttle; `is_degraded()` mode skips NewsAPI) and `ResponseCache` (thread-safe TTL dict, `get()` returns `(value, hit)` tuple, module-level singleton)
+- **`utils/state_recovery.py`**: `CheckpointManager` (atomic JSON writes via temp-file rename, auto-save every N ops, schema-version + age validation, `get_pending()` for crash resume)
+- **`recovery_log` table** in database: records service, event_type, ticker, attempt, error_msg, recovery_action, duration_ms, success for every degradation event
+- **`--resilience-test` flag** on `daily_runner.py`: 6 automated tests (circuit breaker FSM, NewsAPI cache fallback, Anthropic rule-based fallback, yfinance cache/skip, network degraded mode, checkpoint save/load/resume)
+
+#### 4-Level API Fallback Chains
+- **`data/news_aggregator.py`**: 4-level news chain — NewsAPI → Yahoo/Nasdaq RSS → Google News RSS → 24h `ResponseCache`. Always returns a list (never raises). CLI: `python3 -m data.news_aggregator --test-fallbacks`
+  - RSS parser: stdlib `xml.etree.ElementTree` (no feedparser dependency), with regex fallback for malformed XML; supports RSS 2.0 and Atom
+  - `NewsResult` dataclass: `headlines`, `source`, `level`, `ticker`, `degraded`, `count`
+- **`data/price_fallback.py`**: 4-level price chain — yfinance → Alpha Vantage (GLOBAL_QUOTE) → Yahoo Finance chart JSON API → cached last price
+  - `FreshDataRequired` exception when `require_fresh=True` and all live sources fail
+  - `PriceResult` dataclass: `ticker`, `price`, `source`, `level`, `is_fresh`, `is_estimated`, `currency`, `name`, `market_cap`, `change_pct`, `degraded`
+- **`data/sentiment_lexicon.json`**: 81 bullish + 87 bearish terms with per-term weights (1.0–2.0), 18 amplifiers, 19 negators, 14 compound-bullish + 16 compound-bearish phrases
+- **`data/fallback_coordinator.py`**: central fallback registry; tracks active level per service; alerts after >24h on any non-primary level; `daily_health_check()` probes primary sources; `reset()` for testing
+- **`ALPHA_VANTAGE_KEY`** added to `config/settings.py` and `config/watchlist.yaml` `fallbacks:` block
+
+#### Production Safety Features
+- **Health Monitor** (`scheduler/health_monitor.py`): disk space, memory %, scheduler age, circuit breaker states; embedded JSON `/health` endpoint on configurable port
+- **Kill Switch**: persistent halt flag in DB; `--kill-switch on/off/status` CLI; survives process restarts
+- **Email Alerts**: SMTP failure notifications with traceback; `email:` block in `watchlist.yaml`
+- **`health_monitor:` and `monitoring:` sections** in `config/watchlist.yaml`
+
+#### Testing Infrastructure
+- **202 unit tests** across 4 test files: `test_coordinator.py`, `test_risk_agent.py`, `test_technical_agent.py`, `test_recovery.py` (51 tests), `test_fallbacks.py` (45 tests)
+- **GitHub Actions CI/CD** (`.github/workflows/test.yml`): schema validation, unit tests, integration tests, resilience test on every push
+- **Docker integration test** (`tests/docker_test.sh`): isolated clean-DB test environment
+- **Load test** (`tests/load_test.py`): 10 concurrent requests, 30s soak
+
+#### Operations Documentation
+- **`docs/TROUBLESHOOTING.md`**: 7 issue categories (system not trading, API errors, DB locked, OOM, Telegram, scheduler, stale prices), copy-paste diagnostic commands, escalation guide
+- **`docs/RUNBOOK.md`**: daily (5–10 min), weekly (20–30 min), monthly (60–90 min) task checklists; 3 emergency procedures (system down, bad trades, data corruption)
+- **`docs/COST_MONITORING.md`**: Railway.app tier breakdown, per-headline Anthropic costs (Haiku ~$0.00036, Sonnet ~$0.00135), free-tier optimisation tips, monthly SQL cost report script
+- **`docs/DEPLOYMENT_CHECKLIST.md`**: 8 sections (code quality, env vars, DB, health checks, tests, monitoring, kill switch, backups), every check has expected output, formal sign-off table
+- **`docs/SESSION_SUMMARY_2026-02-18.md`**: full session retrospective with architecture snapshot, statistics, performance metrics, known limitations, and next-phase roadmap
+
+### Changed
+- `orchestrator/coordinator.py`: `NewsAggregator` is now the default news source (replaces bare `NewsFeed`); backward-compatible — `NewsFeed` still accepted via constructor injection
+- `data/market_data.py`: delegates to `PriceFallback` internally; `fetch()` now returns `source` and `degraded` keys in addition to the original five
+- `agents/sentiment_agent.py`: lexicon loaded from `data/sentiment_lexicon.json` at module import (falls back to hardcoded set if file missing); confidence scores added: 0.85 (Claude), 0.55 (rule-based); all results carry `degraded` flag
+
+### Fixed
+- Scheduler crash-recovery: `CheckpointManager` resumes from last completed ticker after an unexpected exit
+- yfinance circuit breaker shared state between test suites: `APIRecovery.reset_circuit()` called in `setUp()` of price-related tests
 
 ---
 
@@ -143,10 +197,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-[Unreleased]: https://github.com/your-username/news-trading-system/compare/v0.6.0...HEAD
-[0.6.0]: https://github.com/your-username/news-trading-system/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/your-username/news-trading-system/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/your-username/news-trading-system/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/your-username/news-trading-system/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/your-username/news-trading-system/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/your-username/news-trading-system/releases/tag/v0.1.0
+[Unreleased]: https://github.com/lenninnel/news-trading-system/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/lenninnel/news-trading-system/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/lenninnel/news-trading-system/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/lenninnel/news-trading-system/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/lenninnel/news-trading-system/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/lenninnel/news-trading-system/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/lenninnel/news-trading-system/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/lenninnel/news-trading-system/releases/tag/v0.1.0
