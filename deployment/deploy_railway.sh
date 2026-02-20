@@ -244,45 +244,58 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 7 — Set environment variables on the web service
 # ══════════════════════════════════════════════════════════════════════════════
-cyan "Step 7 — Environment variables"
-
-# Variables to set on the web service (DATABASE_URL injected by Railway plugin)
-# Use a helper function instead of declare -A to avoid bash parsing issues
-# with values containing hyphens (e.g. sk-ant-...) under set -u.
+# Helper: set one Railway variable; silently skips empty values.
+# Must be defined before Step 7 and Step 8 both use it.
 SET_COUNT=0
 SKIP_COUNT=0
 
 _railway_set_var() {
   local key="$1"
   local val="$2"
+  local svc_flag="${3:-}"   # optional: "--service NAME"
   if [ -z "$val" ]; then
     ((SKIP_COUNT++)) || true
     return
   fi
-  if railway variables set "${key}=${val}" &>/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  if railway variables set "${key}=${val}" ${svc_flag} &>/dev/null 2>&1; then
     ((SET_COUNT++)) || true
   else
-    yellow "Could not set ${key} via CLI — set it manually in the Railway dashboard"
+    yellow "  Could not set ${key} — add it in the Railway dashboard → Variables"
   fi
 }
 
-# Temporarily disable nounset so optional vars don't abort if unset
-set +u
-_railway_set_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
-_railway_set_var "NEWSAPI_KEY"        "${NEWSAPI_KEY:-}"
-_railway_set_var "ALPHA_VANTAGE_KEY"  "${ALPHA_VANTAGE_KEY:-}"
-_railway_set_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN:-}"
-_railway_set_var "TELEGRAM_CHAT_ID"   "${TELEGRAM_CHAT_ID:-}"
-_railway_set_var "ENVIRONMENT"        "${ENVIRONMENT:-production}"
-_railway_set_var "HEALTH_PORT"        "${HEALTH_PORT:-8080}"
-_railway_set_var "ACCOUNT_BALANCE"    "${ACCOUNT_BALANCE:-10000.0}"
-_railway_set_var "DASHBOARD_URL"      "${DASHBOARD_URL:-}"
-set -u
+_set_all_vars() {
+  local svc_flag="${1:-}"
+  set +u
+  _railway_set_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"  "$svc_flag"
+  _railway_set_var "NEWSAPI_KEY"        "${NEWSAPI_KEY:-}"        "$svc_flag"
+  _railway_set_var "ALPHA_VANTAGE_KEY"  "${ALPHA_VANTAGE_KEY:-}"  "$svc_flag"
+  _railway_set_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN:-}" "$svc_flag"
+  _railway_set_var "TELEGRAM_CHAT_ID"   "${TELEGRAM_CHAT_ID:-}"   "$svc_flag"
+  _railway_set_var "ENVIRONMENT"        "${ENVIRONMENT:-production}" "$svc_flag"
+  _railway_set_var "HEALTH_PORT"        "${HEALTH_PORT:-8080}"    "$svc_flag"
+  _railway_set_var "ACCOUNT_BALANCE"    "${ACCOUNT_BALANCE:-10000.0}" "$svc_flag"
+  _railway_set_var "DASHBOARD_URL"      "${DASHBOARD_URL:-}"      "$svc_flag"
+  set -u
+}
 
-green "Environment variables set: $SET_COUNT (${SKIP_COUNT} empty/skipped)"
+# ── Step 7 preview (actual setting happens after deploy creates the service) ──
+cyan "Step 7 — Environment variables (set after deploy)"
+yellow "Variables will be pushed to Railway after the service is created in Step 8."
+yellow "Preparing values from: ${ENV_FILE:-shell environment}"
 
 if $ENV_ONLY; then
-  green "ENV_ONLY mode — done. Re-run without --env-only to deploy."
+  # In env-only mode there may already be a service — try immediately
+  SVC_NAME=$(railway status 2>/dev/null | grep -oE 'Service: .+' | sed 's/Service: //' | tr -d '[:space:]' || echo "")
+  SVC_FLAG=""
+  [ -n "$SVC_NAME" ] && [ "$SVC_NAME" != "None" ] && SVC_FLAG="--service ${SVC_NAME}"
+  _set_all_vars "$SVC_FLAG"
+  green "Environment variables set: $SET_COUNT (${SKIP_COUNT} empty/skipped)"
+  if [ "$SET_COUNT" -eq 0 ]; then
+    _print_dashboard_vars
+  fi
+  green "ENV_ONLY mode — done."
   exit 0
 fi
 
@@ -302,6 +315,42 @@ else
   exit 1
 fi
 
+# ── Now set env vars (service exists after railway up) ────────────────────────
+cyan "Step 7b — Push environment variables to service"
+sleep 2   # give Railway a moment to register the service
+
+# Discover the deployed service name from `railway service status --all`
+SVC_NAME=$(railway service status --all 2>/dev/null \
+  | grep -oE '^[a-zA-Z0-9_-]+' | head -1 || echo "")
+SVC_FLAG=""
+if [ -n "$SVC_NAME" ] && [ "$SVC_NAME" != "Services" ]; then
+  # Link the CLI context to this service so future commands target it
+  railway service link "$SVC_NAME" &>/dev/null 2>&1 || true
+  SVC_FLAG="--service ${SVC_NAME}"
+  yellow "Targeting service: $SVC_NAME"
+fi
+
+_set_all_vars "$SVC_FLAG"
+green "Environment variables set: $SET_COUNT (${SKIP_COUNT} empty/skipped)"
+
+# If CLI couldn't set vars, print them for manual dashboard entry
+if [ "$SET_COUNT" -eq 0 ]; then
+  echo ""
+  bold "⚠ Paste these into Railway Dashboard → your service → Variables → RAW Editor:"
+  echo "──────────────────────────────────────────────────────────"
+  set +u
+  echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+  echo "NEWSAPI_KEY=${NEWSAPI_KEY:-}"
+  [ -n "${ALPHA_VANTAGE_KEY:-}"  ] && echo "ALPHA_VANTAGE_KEY=${ALPHA_VANTAGE_KEY:-}"
+  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}"
+  [ -n "${TELEGRAM_CHAT_ID:-}"   ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}"
+  set -u
+  echo "ENVIRONMENT=production"
+  echo "HEALTH_PORT=8080"
+  echo "ACCOUNT_BALANCE=${ACCOUNT_BALANCE:-10000.0}"
+  echo "──────────────────────────────────────────────────────────"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 9 — Generate or show domain
 # ══════════════════════════════════════════════════════════════════════════════
@@ -310,13 +359,13 @@ cyan "Step 9 — Public domain"
 # Wait a moment for the deployment to register
 sleep 3
 
-DOMAIN=$(railway domain 2>/dev/null | grep -oP 'https?://[^\s]+' | head -1 || echo "")
+DOMAIN=$(railway domain 2>/dev/null | grep -oE 'https?://[^[:space:]]+' | head -1 || echo "")
 if [ -n "$DOMAIN" ]; then
   green "Dashboard URL: $DOMAIN"
 else
-  # Try to generate a domain
-  if railway domain generate &>/dev/null 2>&1; then
-    DOMAIN=$(railway domain 2>/dev/null | grep -oP 'https?://[^\s]+' | head -1 || echo "")
+  # Try to generate a domain (railway domain with no args generates one)
+  if railway domain &>/dev/null 2>&1; then
+    DOMAIN=$(railway domain 2>/dev/null | grep -oE 'https?://[^[:space:]]+' | head -1 || echo "")
     if [ -n "$DOMAIN" ]; then
       green "Dashboard URL: $DOMAIN"
     fi
