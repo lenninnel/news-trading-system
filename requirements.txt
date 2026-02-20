@@ -19,7 +19,7 @@ schedule
 # ── Database ──────────────────────────────────────────────────────────────────
 # psycopg2-binary is only needed in production (PostgreSQL).
 # For local SQLite development it is optional.
-psycopg2-binary
+psycopg2-binary==2.9.9
 
 # ── Health check server ───────────────────────────────────────────────────────
 fastapi
