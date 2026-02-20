@@ -13,7 +13,8 @@
 #    ./deployment/run_tests.sh                 # unit + integration + load
 #    ./deployment/run_tests.sh --all           # all suites including Docker
 #    ./deployment/run_tests.sh --unit-only     # unit tests only (fastest)
-#    ./deployment/run_tests.sh --docker        # include Docker test
+#    ./deployment/run_tests.sh --docker        # include Docker test (test_docker.sh)
+#    ./deployment/run_tests.sh --docker-local  # include local E2E test (test_docker_local.sh)
 #    ./deployment/run_tests.sh --migrate       # include migration test
 #    ./deployment/run_tests.sh --fast          # unit + integration (skip load)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -24,15 +25,17 @@ RUN_UNIT=true
 RUN_INTEGRATION=true
 RUN_LOAD=true
 RUN_DOCKER=false
+RUN_DOCKER_LOCAL=false
 RUN_MIGRATE=false
 
 for arg in "$@"; do
   case "$arg" in
-    --all)        RUN_DOCKER=true; RUN_MIGRATE=true ;;
-    --unit-only)  RUN_INTEGRATION=false; RUN_LOAD=false ;;
-    --fast)       RUN_LOAD=false ;;
-    --docker)     RUN_DOCKER=true ;;
-    --migrate)    RUN_MIGRATE=true ;;
+    --all)          RUN_DOCKER=true; RUN_DOCKER_LOCAL=true; RUN_MIGRATE=true ;;
+    --unit-only)    RUN_INTEGRATION=false; RUN_LOAD=false ;;
+    --fast)         RUN_LOAD=false ;;
+    --docker)       RUN_DOCKER=true ;;
+    --docker-local) RUN_DOCKER_LOCAL=true ;;
+    --migrate)      RUN_MIGRATE=true ;;
     --help|-h)
       sed -n '3,20p' "$0" | sed 's/^#  //'
       exit 0 ;;
@@ -114,6 +117,16 @@ if $RUN_DOCKER; then
       bash deployment/test_docker.sh
   else
     yellow "Skipping Docker test — Docker not available"
+  fi
+fi
+
+# ── 4b. Docker local E2E test (optional) ───────────────────────────────────────
+if $RUN_DOCKER_LOCAL; then
+  if command -v docker &>/dev/null; then
+    run_suite "Docker Local E2E Test" \
+      bash deployment/test_docker_local.sh
+  else
+    yellow "Skipping Docker local E2E test — Docker not available"
   fi
 fi
 

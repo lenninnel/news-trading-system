@@ -2,11 +2,17 @@ version: "3.9"
 
 # ══════════════════════════════════════════════════════════════════
 #  Local development stack
-#  Usage:
-#    docker-compose up            # start everything
-#    docker-compose up dashboard  # dashboard only (SQLite)
-#    docker-compose up -d         # background
-#    docker-compose logs -f       # follow logs
+#
+#  Quick start:
+#    cp .env.docker .env              # copy template (fill in API keys)
+#    docker compose up                # start core services
+#    docker compose --profile full up # also start worker + monitor
+#    docker compose up dashboard      # dashboard only (SQLite mode)
+#    docker compose up -d             # background
+#    docker compose logs -f           # follow logs
+#
+#  Local E2E test:
+#    ./deployment/test_docker_local.sh
 # ══════════════════════════════════════════════════════════════════
 
 services:
@@ -43,17 +49,25 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      # Mount source for hot-reload during development
       - .:/app
       - /app/__pycache__
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
       - ENVIRONMENT=development
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8501/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
 
   # ── Health Check API ───────────────────────────────────────────
   health:
@@ -67,12 +81,21 @@ services:
     volumes:
       - .:/app
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   # ── Scheduler Worker ───────────────────────────────────────────
   worker:
@@ -85,15 +108,19 @@ services:
       - .:/app
       - logs:/app/logs
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
       - ENVIRONMENT=development
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
+      - ALPHA_VANTAGE_KEY=${ALPHA_VANTAGE_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
     profiles:
-      - full  # only start with: docker-compose --profile full up
+      - full  # only start with: docker compose --profile full up
 
   # ── Price Monitor ──────────────────────────────────────────────
   monitor:
@@ -105,16 +132,19 @@ services:
     volumes:
       - .:/app
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DATABASE_URL=postgresql://trader:trader_dev@postgres:5432/news_trading
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
     profiles:
       - full
 
-  # ── Redis (optional query cache) ───────────────────────────────────────────
+  # ── Redis (optional query cache) ──────────────────────────────
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -126,7 +156,7 @@ services:
       timeout: 5s
       retries: 5
     profiles:
-      - cache   # start with: docker-compose --profile cache up
+      - cache   # start with: docker compose --profile cache up
 
 volumes:
   pg_data:
