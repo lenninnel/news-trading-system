@@ -4,6 +4,8 @@ A multi-agent AI system that monitors financial news, analyses technical indicat
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-202%20passed-brightgreen)](tests/)
+[![Deploy on Railway](https://railway.app/button.svg)](docs/DEPLOYMENT.md)
 
 ---
 
@@ -368,6 +370,90 @@ news-trading-system/
 | [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) | New users | Detailed install for Mac / Linux / Windows, API setup |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Operators | Daily checklist, monitoring, risk management |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Contributors | Code structure, adding agents, testing, git workflow |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Operators | Daily/weekly/monthly tasks, emergency procedures |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Operators | Common issues, diagnostic commands, escalation guide |
+| [docs/COST_MONITORING.md](docs/COST_MONITORING.md) | Operators | API costs, Railway.app pricing, free-tier tips |
+| [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) | DevOps | Pre/post-deployment verification checklist |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | DevOps | Railway.app and Docker deployment guide |
+
+---
+
+## Getting Started in Production
+
+Moving from local development to a production deployment takes about 30 minutes. Here's the condensed path:
+
+### 1. Verify everything works locally
+
+```bash
+# Run the full test suite — must be 202/202 green
+python3 -m pytest tests/ -q
+
+# Smoke test: single ticker, no execution
+python3 main.py AAPL --no-execute
+```
+
+### 2. Work through the deployment checklist
+
+Open [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) and check off every item before pushing. Key gates:
+
+```bash
+# Environment variables
+python3 -c "import os; print('Keys set:', bool(os.environ.get('ANTHROPIC_API_KEY')), bool(os.environ.get('NEWSAPI_KEY')))"
+
+# Database healthy
+python3 -c "from storage.database import Database; Database(); print('DB OK')"
+
+# Kill switch works
+python3 main.py --kill-switch status
+```
+
+### 3. Deploy to Railway.app (recommended)
+
+```bash
+railway login
+railway link
+railway variables set ANTHROPIC_API_KEY=<key> NEWSAPI_KEY=<key>
+git push origin main   # triggers auto-deploy
+```
+
+Full deployment steps: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+
+### 4. Set up monitoring and alerting
+
+```bash
+# Telegram alerts (optional but recommended)
+railway variables set TELEGRAM_BOT_TOKEN=<token> TELEGRAM_CHAT_ID=<id>
+
+# Verify a test message arrives
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+  -d "chat_id=$TELEGRAM_CHAT_ID&text=Production+deployed+✓"
+```
+
+### 5. Ongoing operations
+
+| Reference | Use for |
+|---|---|
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Daily/weekly tasks, emergency procedures |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Diagnosing and fixing common issues |
+| [docs/COST_MONITORING.md](docs/COST_MONITORING.md) | Tracking API and infrastructure spend |
+
+### API fallback resilience
+
+The system includes a 4-level fallback chain for both news and price data — if the primary source fails, it automatically drops to the next level and logs the degradation:
+
+```
+News:  NewsAPI → Yahoo/Nasdaq RSS → Google News RSS → 24h cache
+Price: yfinance → Alpha Vantage   → Yahoo JSON API  → cached price
+```
+
+Check fallback status at any time:
+```bash
+python3 -c "
+from data.fallback_coordinator import FallbackCoordinator
+import json
+print(json.dumps(FallbackCoordinator.get_status(), indent=2))
+"
+```
 
 ---
 
