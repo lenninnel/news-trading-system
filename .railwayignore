@@ -1,0 +1,55 @@
+# ══════════════════════════════════════════════════════════════════
+#  .railwayignore — files excluded from Railway deployment context
+#
+#  Syntax: same as .gitignore
+#  Railway also respects .dockerignore (preferred for Dockerfile builds)
+# ══════════════════════════════════════════════════════════════════
+
+# ── Secrets (never ship to Railway build context) ─────────────────
+.env
+.env.local
+.env.*.local
+.env.docker
+.env.railway
+
+# ── Local databases (SQLite) ───────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── Generated / cache ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ── Local logs and outputs ─────────────────────────────────────────
+logs/
+scheduler/logs/
+*.log
+backtest/*.html
+
+# ── Development tools ─────────────────────────────────────────────
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── macOS ─────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── Docker local files (not needed in Railway build) ─────────────
+docker-compose.yml
+docker-compose.*.yml
+
+# ── Git ───────────────────────────────────────────────────────────
+.git/
