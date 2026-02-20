@@ -12,7 +12,7 @@
 #               --server.address=0.0.0.0 --server.headless=true \
 #               --server.enableCORS=false
 #
-#  worker  → python3 scheduler/daily_runner.py --daemon
+#  worker  → python3 scheduler/daily_runner.py
 #
 #  monitor → python3 monitoring/price_monitor.py --daemon
 #

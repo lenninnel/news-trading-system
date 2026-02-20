@@ -151,7 +151,7 @@ To add background services:
 
 | Service | Start command |
 |---------|--------------|
-| `worker` | `python3 scheduler/daily_runner.py --daemon` |
+| `worker` | `python3 scheduler/daily_runner.py` |
 | `monitor` | `python3 monitoring/price_monitor.py --daemon` |
 | `health` | `uvicorn deployment.health_server:app --host 0.0.0.0 --port ${HEALTH_PORT:-8080}` |
 

@@ -103,7 +103,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    command: python3 scheduler/daily_runner.py --daemon
+    command: python3 scheduler/daily_runner.py
     volumes:
       - .:/app
       - logs:/app/logs

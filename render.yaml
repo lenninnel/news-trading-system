@@ -30,7 +30,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    startCommand: python3 scheduler/daily_runner.py --daemon
+    startCommand: python3 scheduler/daily_runner.py
     envVars:
       - key: ENVIRONMENT
         value: production

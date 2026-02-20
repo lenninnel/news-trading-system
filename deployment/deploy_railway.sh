@@ -388,7 +388,7 @@ if ! $WEB_ONLY; then
   printf "  \033[1m%-12s\033[0m  %s\n" "Service" "Start command"
   printf "  %-12s  %s\n" "──────────" "──────────────────────────────────────────────────────"
   printf "  \033[36m%-12s\033[0m  %s\n" "worker" \
-    "python3 scheduler/daily_runner.py --daemon"
+    "python3 scheduler/daily_runner.py"
   printf "  \033[36m%-12s\033[0m  %s\n" "monitor" \
     "python3 monitoring/price_monitor.py --daemon"
   printf "  \033[36m%-12s\033[0m  %s\n" "health" \
@@ -406,7 +406,7 @@ if ! $WEB_ONLY; then
   # Try adding worker/monitor via CLI
   for SVC_NAME in worker monitor health; do
     case "$SVC_NAME" in
-      worker)  SVC_CMD="python3 scheduler/daily_runner.py --daemon" ;;
+      worker)  SVC_CMD="python3 scheduler/daily_runner.py" ;;
       monitor) SVC_CMD="python3 monitoring/price_monitor.py --daemon" ;;
       health)  SVC_CMD="uvicorn deployment.health_server:app --host 0.0.0.0 --port \${HEALTH_PORT:-8080}" ;;
     esac
