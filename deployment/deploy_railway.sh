@@ -247,36 +247,37 @@ fi
 cyan "Step 7 — Environment variables"
 
 # Variables to set on the web service (DATABASE_URL injected by Railway plugin)
-declare -A ENV_VARS=(
-  [ANTHROPIC_API_KEY]="${ANTHROPIC_API_KEY:-}"
-  [NEWSAPI_KEY]="${NEWSAPI_KEY:-}"
-  [ALPHA_VANTAGE_KEY]="${ALPHA_VANTAGE_KEY:-}"
-  [TELEGRAM_BOT_TOKEN]="${TELEGRAM_BOT_TOKEN:-}"
-  [TELEGRAM_CHAT_ID]="${TELEGRAM_CHAT_ID:-}"
-  [ENVIRONMENT]="production"
-  [HEALTH_PORT]="${HEALTH_PORT:-8080}"
-  [ACCOUNT_BALANCE]="${ACCOUNT_BALANCE:-10000.0}"
-)
-
-if [ -n "${DASHBOARD_URL:-}" ]; then
-  ENV_VARS[DASHBOARD_URL]="$DASHBOARD_URL"
-fi
-
+# Use a helper function instead of declare -A to avoid bash parsing issues
+# with values containing hyphens (e.g. sk-ant-...) under set -u.
 SET_COUNT=0
 SKIP_COUNT=0
-for key in "${!ENV_VARS[@]}"; do
-  val="${ENV_VARS[$key]}"
+
+_railway_set_var() {
+  local key="$1"
+  local val="$2"
   if [ -z "$val" ]; then
-    # Skip empty optional vars
     ((SKIP_COUNT++)) || true
-    continue
+    return
   fi
   if railway variables set "${key}=${val}" &>/dev/null 2>&1; then
     ((SET_COUNT++)) || true
   else
     yellow "Could not set ${key} via CLI — set it manually in the Railway dashboard"
   fi
-done
+}
+
+# Temporarily disable nounset so optional vars don't abort if unset
+set +u
+_railway_set_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
+_railway_set_var "NEWSAPI_KEY"        "${NEWSAPI_KEY:-}"
+_railway_set_var "ALPHA_VANTAGE_KEY"  "${ALPHA_VANTAGE_KEY:-}"
+_railway_set_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN:-}"
+_railway_set_var "TELEGRAM_CHAT_ID"   "${TELEGRAM_CHAT_ID:-}"
+_railway_set_var "ENVIRONMENT"        "${ENVIRONMENT:-production}"
+_railway_set_var "HEALTH_PORT"        "${HEALTH_PORT:-8080}"
+_railway_set_var "ACCOUNT_BALANCE"    "${ACCOUNT_BALANCE:-10000.0}"
+_railway_set_var "DASHBOARD_URL"      "${DASHBOARD_URL:-}"
+set -u
 
 green "Environment variables set: $SET_COUNT (${SKIP_COUNT} empty/skipped)"
 
@@ -366,11 +367,13 @@ if ! $WEB_ONLY; then
       # Set start command as an env var that the container reads (or redeploy with command)
       railway variables set "RAILWAY_RUN_COMMAND=${SVC_CMD}" --service "$SVC_NAME" &>/dev/null 2>&1 || true
 
-      # Copy API keys to new service
+      # Copy API keys to new service (set +u guards indirect expansion)
+      set +u
       for var in ANTHROPIC_API_KEY NEWSAPI_KEY ALPHA_VANTAGE_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ENVIRONMENT ACCOUNT_BALANCE; do
         val="${!var:-}"
         [ -n "$val" ] && railway variables set "${var}=${val}" --service "$SVC_NAME" &>/dev/null 2>&1 || true
       done
+      set -u
       green "Service '$SVC_NAME' created (set start command in dashboard)"
     fi
   done
