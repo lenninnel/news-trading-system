@@ -24,3 +24,9 @@ psycopg2-binary
 # ── Health check server ───────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest
+pytest-cov
+pytest-mock
+responses

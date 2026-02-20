@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # ── sys.path setup ────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -626,7 +628,8 @@ class TestFallbackCoordinator(unittest.TestCase):
         self.assertEqual(status["news"]["level"],  0)
         self.assertEqual(status["price"]["level"], 2)
 
-    # daily_health_check returns expected keys
+    # daily_health_check returns expected keys (makes real HTTP probes)
+    @pytest.mark.slow
     def test_daily_health_check_structure(self):
         report = self.FC.daily_health_check()
         for key in ("timestamp", "services_checked", "services_on_fallback",
