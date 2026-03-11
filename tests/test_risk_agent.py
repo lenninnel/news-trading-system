@@ -9,7 +9,7 @@ Run with:
 
 import sys
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -29,7 +29,8 @@ def make_agent() -> RiskAgent:
 
 
 def run(agent, **overrides) -> dict:
-    """Call agent.run() with sensible defaults, overriding specific fields."""
+    """Call agent.run() with sensible defaults, overriding specific fields.
+    Mocks get_days_to_earnings to return None (no earnings) by default."""
     defaults = dict(
         ticker="TEST",
         signal="STRONG BUY",
@@ -38,7 +39,8 @@ def run(agent, **overrides) -> dict:
         account_balance=10_000.0,
     )
     defaults.update(overrides)
-    return agent.run(**defaults)
+    with patch("agents.risk_agent.get_days_to_earnings", return_value=None):
+        return agent.run(**defaults)
 
 
 # ===========================================================================

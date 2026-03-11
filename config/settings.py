@@ -17,7 +17,9 @@ load_dotenv()
 
 NEWSAPI_KEY: str = os.environ.get("NEWSAPI_KEY", "")
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-ALPHA_VANTAGE_KEY: str = os.environ.get("ALPHA_VANTAGE_KEY", "")
+REDDIT_CLIENT_ID: str = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET: str = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_USER_AGENT: str = os.environ.get("REDDIT_USER_AGENT", "news-trading-bot/1.0")
 
 # ---------------------------------------------------------------------------
 # Claude model
@@ -46,23 +48,35 @@ BUY_THRESHOLD: float = 0.3
 SELL_THRESHOLD: float = -0.3
 
 # ---------------------------------------------------------------------------
+# Source weights for multi-source sentiment
+# ---------------------------------------------------------------------------
+
+SOURCE_WEIGHTS: dict[str, float] = {
+    "newsapi": 1.0,
+    "stocktwits": 0.8,
+    "reddit": 0.6,
+}
+
+# ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 
 DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
 
-# ---------------------------------------------------------------------------
-# Deployment / runtime
-# ---------------------------------------------------------------------------
-
-ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "")  # PostgreSQL DSN in production
-HEALTH_PORT: int = int(os.environ.get("HEALTH_PORT", "8080"))
-ACCOUNT_BALANCE: float = float(os.environ.get("ACCOUNT_BALANCE", "10000.0"))
 
 # ---------------------------------------------------------------------------
-# Telegram notifications (optional)
+# Startup validation
 # ---------------------------------------------------------------------------
 
-TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
+def validate_api_keys() -> None:
+    """Raise RuntimeError if required API keys are missing."""
+    missing = []
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    if not NEWSAPI_KEY:
+        missing.append("NEWSAPI_KEY")
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variable(s): {', '.join(missing)}. "
+            "Set them in your .env file or export them in your shell."
+        )

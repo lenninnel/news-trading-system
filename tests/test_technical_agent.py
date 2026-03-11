@@ -40,9 +40,16 @@ def _hold_indicators(**overrides) -> dict:
         "bb_upper":        210.0,
         "bb_lower":        190.0,
         "price":           200.0,
+        "rvol":            1.0,
+        "volume_trending_up": None,
+        "obv_trend":       None,
     }
     base.update(overrides)
     return base
+
+
+# Shorthand for calling volume confirmation
+vol_confirm = TechnicalAgent._check_volume_confirmation
 
 
 # ===========================================================================
@@ -161,3 +168,49 @@ class TestSignalPriority:
         ind = _hold_indicators(rsi=25.0, macd_bear_cross=True)
         sig, _ = signal(ind)
         assert sig == "BUY"
+
+
+# ===========================================================================
+# Volume confirmation
+# ===========================================================================
+
+class TestVolumeConfirmation:
+    def test_buy_confirmed_with_high_rvol_and_rising_obv(self):
+        ind = _hold_indicators(rvol=2.0, obv_trend="rising")
+        assert vol_confirm("BUY", ind) is True
+
+    def test_buy_not_confirmed_with_high_rvol_and_falling_obv(self):
+        ind = _hold_indicators(rvol=2.0, obv_trend="falling")
+        assert vol_confirm("BUY", ind) is False
+
+    def test_buy_not_confirmed_with_low_rvol(self):
+        ind = _hold_indicators(rvol=1.0, obv_trend="rising")
+        assert vol_confirm("BUY", ind) is False
+
+    def test_sell_confirmed_with_high_rvol_and_falling_obv(self):
+        ind = _hold_indicators(rvol=2.0, obv_trend="falling")
+        assert vol_confirm("SELL", ind) is True
+
+    def test_sell_not_confirmed_with_high_rvol_and_rising_obv(self):
+        ind = _hold_indicators(rvol=2.0, obv_trend="rising")
+        assert vol_confirm("SELL", ind) is False
+
+    def test_sell_not_confirmed_with_low_rvol(self):
+        ind = _hold_indicators(rvol=1.0, obv_trend="falling")
+        assert vol_confirm("SELL", ind) is False
+
+    def test_hold_never_confirmed(self):
+        ind = _hold_indicators(rvol=3.0, obv_trend="rising")
+        assert vol_confirm("HOLD", ind) is False
+
+    def test_none_rvol_not_confirmed(self):
+        ind = _hold_indicators(rvol=None, obv_trend="rising")
+        assert vol_confirm("BUY", ind) is False
+
+    def test_none_obv_trend_not_confirmed(self):
+        ind = _hold_indicators(rvol=2.0, obv_trend=None)
+        assert vol_confirm("BUY", ind) is False
+
+    def test_rvol_at_boundary_1_5_not_confirmed(self):
+        ind = _hold_indicators(rvol=1.5, obv_trend="rising")
+        assert vol_confirm("BUY", ind) is False  # strictly greater-than

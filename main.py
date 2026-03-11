@@ -3,24 +3,20 @@ News Trading System — command-line entry point.
 
 Usage
 -----
-    python main.py <TICKER> [--balance N] [--agent sentiment|technical]
-                            [--strategy momentum|mean-reversion|swing|all]
-                            [--execute]
+    python main.py <TICKER> [--balance N] [--agent sentiment|technical] [--execute]
 
 Examples
 --------
-    python main.py AAPL                                    # combined mode, $10k account
-    python main.py NVDA --balance 25000                    # combined mode, $25k account
-    python main.py TSLA --agent sentiment                  # sentiment only
-    python main.py AAPL --agent technical                  # technical only
-    python main.py AAPL --balance 10000 --execute          # combined + log to DB
-    python main.py AAPL --strategy all --balance 10000     # all 3 strategy agents
-    python main.py AAPL --strategy momentum                # momentum agent only
-    python main.py AAPL --strategy all --execute           # strategy + paper trade
+    python main.py AAPL                          # combined mode, $10k account
+    python main.py NVDA --balance 25000          # combined mode, $25k account
+    python main.py TSLA --agent sentiment        # sentiment only
+    python main.py AAPL --agent technical        # technical only
 """
 
 import argparse
 
+from config.settings import validate_api_keys
+from execution.broker_factory import get_trading_mode
 from orchestrator.coordinator import Coordinator
 
 
@@ -140,161 +136,6 @@ def print_technical_report(result: dict) -> None:
     print()
 
 
-def print_strategy_report(report: dict) -> None:
-    """Print the full multi-strategy coordinator report."""
-    ticker   = report["ticker"]
-    signals  = report["strategy_signals"]
-    ranked   = report["ranked_signals"]
-    combined = report["combined_strategy_signal"]
-    ensemble = report["ensemble_confidence"]
-    consensus = report["consensus"]
-    risk     = report["risk"]
-    errors   = report.get("errors", [])
-    run_id   = report.get("strategy_run_id")
-
-    bar = "=" * 66
-    print(f"\n{bar}")
-    print(f"  {ticker}  —  Multi-Strategy Analysis  (run #{run_id})")
-    print(bar)
-
-    # -- Individual agent signals --
-    print("\n  [STRATEGY AGENTS]")
-    icon_map = {"BUY": "+", "SELL": "-", "HOLD": "~"}
-    for sig in signals:
-        icon = icon_map.get(sig["signal"], "?")
-        print(
-            f"  [{sig['strategy'].upper():17s}] [{icon}] {sig['signal']:<4}  "
-            f"conf {sig['confidence']:.0f}%  ({sig['timeframe']})"
-        )
-        for reason in sig.get("reasoning", []):
-            print(f"    → {reason}")
-    if errors:
-        for err in errors:
-            print(f"  [!] {err}")
-
-    # -- Ensemble result --
-    print(f"\n  [ENSEMBLE SIGNAL]")
-    print(f"  Combined : {combined}  (confidence: {ensemble:.1f}%,  consensus: {consensus})")
-    if ranked:
-        print(f"  Ranked   : {', '.join(s['strategy'] for s in ranked)}")
-
-    # -- Risk --
-    balance = report.get("account_balance") or risk.get("account_balance") or 0.0
-    print(f"\n  [RISK MANAGEMENT]  (account: ${balance:,.2f})")
-    if risk["skipped"]:
-        print(f"  No position — {risk['skip_reason']}")
-    else:
-        sl_pct = (risk["stop_pct"] or 0.0) * 100
-        tp_pct = sl_pct * 2
-        direction_arrow = "▲" if risk["direction"] == "BUY" else "▼"
-        print(f"  Direction     : {direction_arrow} {risk['direction']}")
-        price = risk.get("current_price") or 0.0
-        print(
-            f"  Position Size : ${risk['position_size_usd']:,.2f}  "
-            f"({risk['shares']} shares)"
-        )
-        if price:
-            print(f"  Entry Price   : ${price:.2f}")
-        print(f"  Stop Loss     : ${risk['stop_loss']:.2f}  (-{sl_pct:.2f}%)")
-        print(f"  Take Profit   : ${risk['take_profit']:.2f}  (+{tp_pct:.2f}%)")
-        print(f"  Risk Amount   : ${risk['risk_amount']:.2f}")
-        print(f"  Kelly Frac.   : {risk['kelly_fraction']:.2%}")
-
-    print(f"\n{bar}\n")
-
-
-# ---------------------------------------------------------------------------
-# Strategy-mode dispatcher
-# ---------------------------------------------------------------------------
-
-def _run_strategy_mode(ticker: str, args) -> None:
-    """
-    Execute the multi-strategy pipeline for a single ticker.
-
-    When --strategy is a specific agent name only that agent runs standalone.
-    When --strategy all (or omitted default) all three agents run via
-    StrategyCoordinator and the ensemble result is displayed.
-    """
-    strategy = args.strategy  # "momentum" | "mean-reversion" | "swing" | "all"
-    balance  = args.balance
-
-    if strategy == "all":
-        from orchestrator.strategy_coordinator import StrategyCoordinator
-        from storage.database import Database
-        db = Database()
-
-        paper_trader = None
-        if args.execute:
-            from execution.paper_trader import PaperTrader
-            paper_trader = PaperTrader()
-
-        print(f"\nRunning all strategy agents for {ticker}  (balance: ${balance:,.2f})...")
-        coordinator = StrategyCoordinator(db=db)
-        report = coordinator.run(ticker=ticker, account_balance=balance, verbose=True)
-        print_strategy_report(report)
-
-        if args.execute and paper_trader is not None:
-            risk = report["risk"]
-            if not risk["skipped"]:
-                price = risk.get("current_price") or 0.0
-                trade_id = paper_trader.track_trade(
-                    ticker=ticker,
-                    action=risk["direction"],
-                    shares=risk["shares"],
-                    price=price,
-                    stop_loss=risk["stop_loss"],
-                    take_profit=risk["take_profit"],
-                )
-                print(f"  Paper trade logged  (trade_history id=#{trade_id})")
-                positions = paper_trader.get_portfolio()
-                if positions:
-                    print("\n  Current portfolio:")
-                    for pos in positions:
-                        print(
-                            f"    {pos['ticker']:6s}  "
-                            f"{pos['shares']} shares @ "
-                            f"${pos['avg_price']:.2f}  "
-                            f"(value: ${pos['current_value']:,.2f})"
-                        )
-            else:
-                print("  No trade logged — risk agent skipped position.")
-
-    else:
-        # Single-agent mode
-        from storage.database import Database
-        db = Database()
-        agent_map = {
-            "momentum":      ("agents.momentum_agent",       "MomentumAgent"),
-            "mean-reversion": ("agents.mean_reversion_agent", "MeanReversionAgent"),
-            "swing":         ("agents.swing_agent",          "SwingAgent"),
-        }
-        module_name, class_name = agent_map[strategy]
-        import importlib
-        mod   = importlib.import_module(module_name)
-        agent = getattr(mod, class_name)(db=db)
-
-        print(f"\nRunning {class_name} for {ticker}...")
-        sig = agent.run(ticker)
-
-        bar = "=" * 60
-        icon_map = {"BUY": "+", "SELL": "-", "HOLD": "~"}
-        icon = icon_map.get(sig.signal, "?")
-        print(f"\n{bar}")
-        print(f"  {ticker}  —  {class_name}")
-        print(bar)
-        print(f"  Signal     : [{icon}] {sig.signal}  (confidence: {sig.confidence:.0f}%)")
-        print(f"  Timeframe  : {sig.timeframe}")
-        print(f"  Indicators :")
-        for k, v in sig.indicators.items():
-            if v is not None:
-                val = f"{v:.4f}" if isinstance(v, float) else str(v)
-                print(f"    {k:<22s}: {val}")
-        print(f"  Reasoning  :")
-        for reason in sig.reasoning:
-            print(f"    → {reason}")
-        print(f"{bar}\n")
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -311,16 +152,6 @@ def main() -> None:
         help="Run a single agent only. Omit to run both agents (combined mode).",
     )
     parser.add_argument(
-        "--strategy",
-        choices=["momentum", "mean-reversion", "swing", "all"],
-        default=None,
-        metavar="STRATEGY",
-        help=(
-            "Run the multi-strategy technical pipeline instead of the sentiment pipeline. "
-            "Choices: momentum | mean-reversion | swing | all (default: all three)."
-        ),
-    )
-    parser.add_argument(
         "--balance",
         type=float,
         default=10_000.0,
@@ -330,27 +161,29 @@ def main() -> None:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Log the trade to the database (paper execution). "
-             "Only applies to combined mode. Without this flag the "
-             "recommendation is shown but nothing is recorded.",
-    )
-    parser.add_argument(
-        "--notify",
-        action="store_true",
-        help="Send Telegram notifications for signals and trades. "
-             "Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars "
-             "and telegram.enabled=true in config/watchlist.yaml.",
+        default=False,
+        help="Execute a paper trade based on the risk sizing result.",
     )
     args = parser.parse_args()
 
-    ticker = args.ticker.upper()
+    validate_api_keys()
 
-    if args.strategy is not None:
-        _run_strategy_mode(ticker, args)
-        return
+    # -- Broker status banner --
+    mode = get_trading_mode()
+    _MODE_LABELS = {
+        "paper_local": "LOCAL PAPER (simulated)",
+        "alpaca_paper": "ALPACA PAPER (sandbox)",
+        "alpaca_live": "ALPACA LIVE (real money)",
+    }
+    label = _MODE_LABELS.get(mode, mode)
+    print(f"\n  Broker: {label}")
+    print(f"  {'=' * 40}")
+
+    ticker = args.ticker.upper()
+    coordinator = Coordinator()
 
     if args.agent == "sentiment":
-        report = Coordinator().run(ticker)
+        report = coordinator.run(ticker)
         print_sentiment_report(report)
 
     elif args.agent == "technical":
@@ -360,44 +193,10 @@ def main() -> None:
         print_technical_report(result)
 
     else:
-        paper_trader = None
-        if args.execute:
-            from execution.paper_trader import PaperTrader
-            paper_trader = PaperTrader()
-
-        notifier = None
-        if args.notify:
-            import yaml
-            from pathlib import Path
-            from notifications.telegram_bot import TelegramNotifier
-            _cfg_path = Path(__file__).parent / "config" / "watchlist.yaml"
-            with open(_cfg_path, encoding="utf-8") as _fh:
-                _cfg = yaml.safe_load(_fh)
-            _cfg.setdefault("telegram", {})["enabled"] = True
-            notifier = TelegramNotifier.from_config(_cfg)
-            if notifier is None:
-                print("  [warn] --notify: Telegram credentials missing — notifications disabled.")
-
-        coordinator = Coordinator(paper_trader=paper_trader, notifier=notifier)
-        report = coordinator.run_combined(ticker, account_balance=args.balance)
+        report = coordinator.run_combined(
+            ticker, account_balance=args.balance, execute=args.execute,
+        )
         print_combined_report(report)
-
-        if args.execute:
-            trade_id = report.get("trade_id")
-            if trade_id is not None:
-                print(f"  Paper trade logged  (trade_history id=#{trade_id})")
-                positions = paper_trader.get_portfolio()
-                if positions:
-                    print("\n  Current portfolio:")
-                    for pos in positions:
-                        print(
-                            f"    {pos['ticker']:6s}  "
-                            f"{pos['shares']} shares @ "
-                            f"${pos['avg_price']:.2f}  "
-                            f"(value: ${pos['current_value']:,.2f})"
-                        )
-            else:
-                print("  No trade logged (signal skipped or no position).")
 
 
 if __name__ == "__main__":

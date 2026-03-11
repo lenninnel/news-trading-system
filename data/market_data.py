@@ -1,82 +1,116 @@
 """
-Market data source with multi-level price fallback.
+Market data source.
 
 MarketData fetches current price and basic fundamental information for a
-ticker symbol.  It delegates to PriceFallback which implements a 4-level
-chain (yfinance → Alpha Vantage → Yahoo Finance JSON → cached last price)
-so the coordinator always gets a price dict, even when primary sources fail.
+ticker symbol using the yfinance library, which wraps the Yahoo Finance API.
+
+On a 401 "Invalid Crumb" error the yfinance JSON cache is cleared and the
+request is retried once with a fresh Ticker object.  If the retry also
+fails, a fallback dict with ``price=None`` is returned instead of raising.
 
 Requires:
     pip install yfinance
 """
 
-from __future__ import annotations
+import logging
 
-from typing import Any
+import yfinance as yf
 
-from data.price_fallback import PriceFallback
+logger = logging.getLogger(__name__)
+
+
+def _is_crumb_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a yfinance crumb / auth error."""
+    msg = str(exc).lower()
+    return "401" in msg or "invalid crumb" in msg
+
+
+def _clear_yf_cache() -> None:
+    """Best-effort cache clear across yfinance versions."""
+    # Preferred: functools.lru_cache on get_json (yfinance ≥ 0.2.31)
+    utils = getattr(yf, "utils", None)
+    if utils is not None:
+        get_json = getattr(utils, "get_json", None)
+        if get_json is not None and hasattr(get_json, "cache_clear"):
+            try:
+                get_json.cache_clear()
+            except Exception:
+                pass
+
+    # Fallback: clear session cookies on known internal locations
+    for submod_name in ("data", "utils", "shared"):
+        submod = getattr(yf, submod_name, None)
+        if submod is None:
+            continue
+        for attr in ("_session", "session", "_REQUESTS_SESSION"):
+            sess = getattr(submod, attr, None)
+            if sess is not None and hasattr(sess, "cookies"):
+                try:
+                    sess.cookies.clear()
+                except Exception:
+                    pass
 
 
 class MarketData:
     """
-    Fetches current market data for a given ticker using PriceFallback.
-
-    Args:
-        db:        Optional Database for recovery event logging.
-        alpha_key: Alpha Vantage API key (reads ALPHA_VANTAGE_KEY env if None).
+    Fetches current market data for a given ticker.
 
     Example::
 
         md = MarketData()
         data = md.fetch("AAPL")
-        # {
-        #   "ticker": "AAPL",
-        #   "name": "Apple Inc.",
-        #   "price": 189.30,
-        #   "currency": "USD",
-        #   "market_cap": 2_950_000_000_000,
-        # }
+        # {"ticker": "AAPL", "name": "Apple Inc.", "price": 189.30, ...}
     """
-
-    def __init__(
-        self,
-        db: "Any | None" = None,
-        alpha_key: "str | None" = None,
-    ) -> None:
-        self._fallback = PriceFallback(db=db, alpha_key=alpha_key)
 
     def fetch(self, ticker: str) -> dict:
         """
         Retrieve current market data for *ticker*.
 
-        Uses the PriceFallback 4-level chain so the call never raises on
-        transient network issues.  When all live sources fail the returned
-        price is None and ``degraded=True`` in the result.
+        On a 401 / crumb error the cache is cleared and the call is
+        retried once with a fresh ``yf.Ticker`` object.  If the retry
+        also fails, a fallback dict with ``price=None`` is returned.
 
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL").
 
         Returns:
-            dict with keys:
-                ticker      (str):        The requested ticker symbol.
-                name        (str):        Full company name, or "".
-                price       (float|None): Current / last market price.
-                currency    (str):        Currency code (e.g. "USD").
-                market_cap  (int|None):   Market capitalisation in base currency.
-                source      (str):        Which fallback level supplied the data.
-                degraded    (bool):       True when data is not from the primary source.
-
-        Raises:
-            Exception: Only when an unexpected programming error occurs; all
-                       network / data errors are handled internally.
+            dict with keys: ticker, name, price, currency, market_cap.
         """
-        result = self._fallback.get_price(ticker)
+        try:
+            return self._fetch_once(ticker)
+        except Exception as exc:
+            if not _is_crumb_error(exc):
+                raise
+
+            logger.warning(
+                "yfinance crumb error for %s — clearing cache and retrying",
+                ticker,
+            )
+            _clear_yf_cache()
+
+            try:
+                return self._fetch_once(ticker)
+            except Exception:
+                logger.warning(
+                    "yfinance retry failed for %s — returning fallback",
+                    ticker,
+                )
+                return {
+                    "ticker": ticker,
+                    "name": "N/A",
+                    "price": None,
+                    "currency": "USD",
+                    "market_cap": None,
+                }
+
+    @staticmethod
+    def _fetch_once(ticker: str) -> dict:
+        info = yf.Ticker(ticker).info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
         return {
-            "ticker":     result.ticker,
-            "name":       result.name,
-            "price":      result.price,
-            "currency":   result.currency,
-            "market_cap": result.market_cap,
-            "source":     result.source,
-            "degraded":   result.degraded,
+            "ticker": ticker,
+            "name": info.get("longName", "N/A"),
+            "price": price,
+            "currency": info.get("currency", "USD"),
+            "market_cap": info.get("marketCap"),
         }

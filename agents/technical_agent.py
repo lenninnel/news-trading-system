@@ -2,8 +2,9 @@
 Technical analysis agent using classic price indicators.
 
 TechnicalAgent fetches recent OHLCV data for a ticker, computes RSI, MACD,
-SMA-20, SMA-50, and Bollinger Bands via the ``ta`` library, then applies
-deterministic signal rules to produce BUY / SELL / HOLD.
+SMA-20, SMA-50, Bollinger Bands, and volume/momentum indicators via the
+``ta`` library, then applies deterministic signal rules to produce
+BUY / SELL / HOLD.
 
 Signal rules (any matching condition triggers the signal):
     BUY  — RSI < 30 (oversold)
@@ -14,24 +15,10 @@ Signal rules (any matching condition triggers the signal):
            OR latest close above upper Bollinger Band
     HOLD — none of the above conditions met
 
-Recovery behaviour
-------------------
-  1. APIRecovery.call("yfinance", …) wraps every yfinance download call
-     with per-service retry logic (max 5 attempts, 5 s backoff) and a
-     circuit breaker (opens after 5 consecutive failures).
-
-  2. On each successful download the resulting indicators dict is cached in
-     the module-level ResponseCache (max age: 1 hour).
-
-  3. On yfinance failure the recovery path is:
-       a. Check the ResponseCache for a recent indicators snapshot.
-          If found, re-run signal rules on cached indicators and return a
-          result with ``"degraded": True``.
-       b. If no cache, skip technical analysis and return a HOLD signal
-          with ``"degraded": True`` and ``"skip_reason"`` explaining why.
-
-  4. All fallback activations are logged to recovery_log when a Database
-     instance has been attached to APIRecovery.
+Volume confirmation (adjusts confidence, does not change signal):
+    RVOL (Relative Volume) = current volume / 20-day average volume
+    OBV trend              = rising or falling (last 5 bars)
+    volume_confirmed       = True when RVOL > 1.5 and OBV supports direction
 
 Results are persisted to the ``technical_signals`` table.
 
@@ -50,13 +37,8 @@ import yfinance as yf
 
 from agents.base_agent import BaseAgent
 from storage.database import Database
-from utils.api_recovery import APIRecovery, CircuitOpenError
-from utils.network_recovery import get_cache
 
-log = logging.getLogger(__name__)
-
-_INDICATORS_CACHE_SERVICE = "yfinance"
-_INDICATORS_CACHE_PREFIX  = "indicators"
+logger = logging.getLogger(__name__)
 
 
 class TechnicalAgent(BaseAgent):
@@ -76,14 +58,13 @@ class TechnicalAgent(BaseAgent):
         #   "reasoning": ["RSI 28.4 is below 30 (oversold)"],
         #   "indicators": {"rsi": 28.4, "price": 189.3, ...},
         #   "signal_id": 1,
-        #   "degraded": False,
         # }
     """
 
     # Enough history for SMA-50 and indicator warm-up
     _DOWNLOAD_PERIOD = "3mo"
 
-    def __init__(self, db: "Database | None" = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         """
         Initialise the agent.
 
@@ -105,8 +86,6 @@ class TechnicalAgent(BaseAgent):
         """
         Fetch price history, calculate indicators, and return a signal.
 
-        Falls back to cached indicators or a HOLD skip when yfinance is down.
-
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL").
 
@@ -114,51 +93,36 @@ class TechnicalAgent(BaseAgent):
             dict with keys:
                 ticker     (str):   The analysed ticker symbol.
                 signal     (str):   BUY / SELL / HOLD.
-                reasoning  (list):  Human-readable triggered conditions.
-                indicators (dict):  Latest numeric indicator values.
-                signal_id  (int):   DB primary key of the persisted row.
-                degraded   (bool):  True when cached or fallback data was used.
+                reasoning  (list):  Human-readable list of triggered conditions.
+                indicators (dict):  Latest numeric values for each indicator.
+                signal_id  (int):   Database primary key of the persisted row.
+
+        Raises:
+            ValueError: If no price data can be fetched for the ticker.
+            Exception:  Propagates unexpected yfinance or pandas errors.
         """
         ticker = ticker.upper()
-        cache_key = f"{_INDICATORS_CACHE_PREFIX}:{ticker}"
-        degraded  = False
 
         # -- 1. Fetch price history ----------------------------------------
-        try:
-            df = APIRecovery.call(
-                "yfinance",
-                self._download,
-                ticker,
-                ticker=ticker,
-            )
-            # Cache fresh indicators after computing them
-            indicators = self._calculate_indicators(df)
-            get_cache().set(_INDICATORS_CACHE_SERVICE, cache_key, indicators)
+        df = self._fetch_history(ticker)
 
-        except CircuitOpenError as exc:
-            log.warning(
-                "[DEGRADED MODE] yfinance circuit OPEN for %s — trying cache", ticker
-            )
-            indicators, degraded = self._fallback_indicators(ticker, cache_key, str(exc))
+        # -- 2. Calculate indicators ----------------------------------------
+        indicators = self._calculate_indicators(df)
 
-        except Exception as exc:
-            log.warning(
-                "[DEGRADED MODE] yfinance unavailable for %s (%s) — trying cache",
-                ticker, exc,
-            )
-            indicators, degraded = self._fallback_indicators(ticker, cache_key, str(exc))
-
-        # -- 2. Apply signal rules ------------------------------------------
+        # -- 3. Apply signal rules ------------------------------------------
         signal, reasoning = self._apply_signal_rules(indicators)
 
-        if degraded:
-            reasoning = [f"[CACHED DATA] {r}" for r in reasoning]
+        # -- 4. Volume confirmation -----------------------------------------
+        volume_confirmed = self._check_volume_confirmation(signal, indicators)
 
-        # -- 3. Persist to database -----------------------------------------
+        # -- 5. Persist to database -----------------------------------------
         signal_id = self._db.log_technical_signal(
             ticker=ticker,
             signal=signal,
             reasoning="; ".join(reasoning) if reasoning else "No conditions triggered",
+            rvol=indicators.get("rvol"),
+            obv_trend=indicators.get("obv_trend"),
+            volume_confirmed=volume_confirmed,
             **{k: indicators.get(k) for k in (
                 "rsi", "macd", "macd_signal", "macd_hist",
                 "sma_20", "sma_50", "bb_upper", "bb_lower", "price",
@@ -166,53 +130,44 @@ class TechnicalAgent(BaseAgent):
         )
 
         return {
-            "ticker":     ticker,
-            "signal":     signal,
-            "reasoning":  reasoning,
+            "ticker": ticker,
+            "signal": signal,
+            "reasoning": reasoning,
             "indicators": indicators,
-            "signal_id":  signal_id,
-            "degraded":   degraded,
+            "signal_id": signal_id,
+            "volume_confirmed": volume_confirmed,
         }
-
-    # ------------------------------------------------------------------
-    # Fallback helpers
-    # ------------------------------------------------------------------
-
-    def _fallback_indicators(
-        self, ticker: str, cache_key: str, error: str
-    ) -> "tuple[dict, bool]":
-        """
-        Try the indicator cache; return empty HOLD indicators on miss.
-
-        Returns:
-            (indicators_dict, degraded=True)
-        """
-        cached, hit = get_cache().get(_INDICATORS_CACHE_SERVICE, cache_key)
-        if hit:
-            log.warning(
-                "[DEGRADED MODE] yfinance: using cached indicators for %s", ticker
-            )
-            self._log_cache_hit(ticker, error)
-            return cached, True  # type: ignore[return-value]
-
-        log.warning(
-            "[DEGRADED MODE] yfinance: no cache for %s — returning HOLD (skip)", ticker
-        )
-        self._log_skip(ticker, error)
-        # Empty indicators → _apply_signal_rules will return HOLD
-        return {
-            "rsi": None, "macd": None, "macd_signal": None, "macd_hist": None,
-            "macd_bull_cross": False, "macd_bear_cross": False,
-            "sma_20": None, "sma_50": None,
-            "bb_upper": None, "bb_lower": None, "price": None,
-        }, True
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _download(self, ticker: str) -> pd.DataFrame:
-        """Thin yfinance wrapper; raises on empty result."""
+    def _fetch_history(self, ticker: str) -> pd.DataFrame:
+        """Download OHLCV data and validate the result.
+
+        On an empty result that may be caused by a stale crumb/cookie,
+        the yfinance session cache is cleared and the download is retried
+        once before raising.
+        """
+        df = self._download_once(ticker)
+        if df.empty:
+            # Empty result may indicate a crumb error (yfinance swallows
+            # the 401 and returns an empty DataFrame).  Clear the session
+            # cache and retry once.
+            logger.warning(
+                "yfinance returned empty data for %s — "
+                "resetting session cache and retrying",
+                ticker,
+            )
+            from data.market_data import _clear_yf_cache
+            _clear_yf_cache()
+            df = self._download_once(ticker)
+            if df.empty:
+                raise ValueError(f"No price data returned for ticker '{ticker}'")
+        return df
+
+    def _download_once(self, ticker: str) -> pd.DataFrame:
+        """Single yfinance download attempt."""
         df: pd.DataFrame = yf.download(
             ticker,
             period=self._DOWNLOAD_PERIOD,
@@ -220,19 +175,16 @@ class TechnicalAgent(BaseAgent):
             progress=False,
             auto_adjust=True,
         )
-        if df.empty:
-            raise ValueError(f"No price data returned for ticker '{ticker}'")
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
 
-    # Kept for backward-compat with tests that call _fetch_history directly
-    def _fetch_history(self, ticker: str) -> pd.DataFrame:
-        return self._download(ticker)
-
     def _calculate_indicators(self, df: pd.DataFrame) -> dict:
         """
         Compute RSI, MACD, SMA-20, SMA-50, and Bollinger Bands.
+
+        Uses the ``ta`` library (pure-Python, no C dependencies).
+        NaN values are stored as None.
 
         Args:
             df: DataFrame with at least a 'Close' column.
@@ -243,30 +195,65 @@ class TechnicalAgent(BaseAgent):
         close: pd.Series = df["Close"].squeeze()
 
         def latest(series: pd.Series) -> "float | None":
+            """Return the last non-NaN value, or None."""
             clean = series.dropna()
             return float(clean.iloc[-1]) if not clean.empty else None
 
         def prev(series: pd.Series) -> "float | None":
+            """Return the second-to-last non-NaN value, or None."""
             clean = series.dropna()
             return float(clean.iloc[-2]) if len(clean) >= 2 else None
 
-        rsi_series  = ta.momentum.RSIIndicator(close=close, window=14).rsi()
-        macd_obj    = ta.trend.MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
+        # RSI (14-period)
+        rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+
+        # MACD (12, 26, 9)
+        macd_obj = ta.trend.MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
         macd_series   = macd_obj.macd()
         signal_series = macd_obj.macd_signal()
         hist_series   = macd_obj.macd_diff()
 
+        # MACD crossover detection: compare last two rows
         macd_bull_cross = False
         macd_bear_cross = False
         cur_macd, cur_sig = latest(macd_series), latest(signal_series)
         prv_macd, prv_sig = prev(macd_series),   prev(signal_series)
         if all(v is not None for v in (cur_macd, cur_sig, prv_macd, prv_sig)):
-            macd_bull_cross = (prv_macd <= prv_sig) and (cur_macd > cur_sig)  # type: ignore[operator]
-            macd_bear_cross = (prv_macd >= prv_sig) and (cur_macd < cur_sig)  # type: ignore[operator]
+            macd_bull_cross = (prv_macd <= prv_sig) and (cur_macd > cur_sig)
+            macd_bear_cross = (prv_macd >= prv_sig) and (cur_macd < cur_sig)
 
+        # SMA 20 and SMA 50
         sma20 = ta.trend.SMAIndicator(close=close, window=20).sma_indicator()
         sma50 = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
-        bb    = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+
+        # Bollinger Bands (20-period, 2 std dev)
+        bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+
+        # -- Volume & momentum indicators ---------------------------------
+        volume: pd.Series = df["Volume"].squeeze() if "Volume" in df.columns else pd.Series(dtype=float)
+
+        # RVOL: current volume / 20-day average volume
+        rvol: "float | None" = None
+        if not volume.empty and len(volume) >= 20:
+            avg_vol_20 = float(volume.iloc[-20:].mean())
+            if avg_vol_20 > 0:
+                rvol = round(float(volume.iloc[-1]) / avg_vol_20, 2)
+
+        # Volume trend: is volume increasing over last 5 bars?
+        volume_trending_up: "bool | None" = None
+        if not volume.empty and len(volume) >= 5:
+            last5 = volume.iloc[-5:]
+            volume_trending_up = bool(float(last5.iloc[-1]) > float(last5.iloc[0]))
+
+        # OBV direction: rising or falling (compare last vs 5-bars-ago)
+        obv_trend: "str | None" = None
+        if not volume.empty and len(close) == len(volume) and len(close) >= 5:
+            obv_series = ta.volume.OnBalanceVolumeIndicator(
+                close=close, volume=volume
+            ).on_balance_volume()
+            obv_clean = obv_series.dropna()
+            if len(obv_clean) >= 5:
+                obv_trend = "rising" if float(obv_clean.iloc[-1]) > float(obv_clean.iloc[-5]) else "falling"
 
         return {
             "rsi":             latest(rsi_series),
@@ -280,22 +267,31 @@ class TechnicalAgent(BaseAgent):
             "bb_upper":        latest(bb.bollinger_hband()),
             "bb_lower":        latest(bb.bollinger_lband()),
             "price":           float(close.iloc[-1]) if not close.empty else None,
+            "rvol":            rvol,
+            "volume_trending_up": volume_trending_up,
+            "obv_trend":       obv_trend,
         }
 
     @staticmethod
-    def _apply_signal_rules(ind: dict) -> "tuple[str, list[str]]":
+    def _apply_signal_rules(ind: dict) -> tuple[str, list[str]]:
         """
         Evaluate BUY / SELL / HOLD conditions against computed indicators.
 
         BUY conditions (any one triggers BUY):
             - RSI < 30 (oversold)
-            - MACD bullish crossover
+            - MACD bullish crossover (MACD crosses above signal line)
             - Price below lower Bollinger Band
 
-        SELL conditions (evaluated only when no BUY):
+        SELL conditions (any one triggers SELL; evaluated only when no BUY):
             - RSI > 70 (overbought)
-            - MACD bearish crossover
+            - MACD bearish crossover (MACD crosses below signal line)
             - Price above upper Bollinger Band
+
+        Args:
+            ind: Indicator dict from ``_calculate_indicators``.
+
+        Returns:
+            Tuple of (signal string, list of triggered condition descriptions).
         """
         buy_reasons:  list[str] = []
         sell_reasons: list[str] = []
@@ -305,60 +301,59 @@ class TechnicalAgent(BaseAgent):
         bb_low = ind.get("bb_lower")
         bb_up  = ind.get("bb_upper")
 
+        # --- BUY conditions ---
         if rsi is not None and rsi < 30:
             buy_reasons.append(f"RSI {rsi:.1f} is below 30 (oversold)")
+
         if ind.get("macd_bull_cross"):
             buy_reasons.append("MACD bullish crossover (MACD crossed above signal line)")
+
         if price is not None and bb_low is not None and price < bb_low:
             buy_reasons.append(
                 f"Price {price:.2f} is below lower Bollinger Band {bb_low:.2f}"
             )
 
+        # --- SELL conditions ---
         if rsi is not None and rsi > 70:
             sell_reasons.append(f"RSI {rsi:.1f} is above 70 (overbought)")
+
         if ind.get("macd_bear_cross"):
             sell_reasons.append("MACD bearish crossover (MACD crossed below signal line)")
+
         if price is not None and bb_up is not None and price > bb_up:
             sell_reasons.append(
                 f"Price {price:.2f} is above upper Bollinger Band {bb_up:.2f}"
             )
 
+        # BUY takes priority when both conditions appear on the same bar
         if buy_reasons:
             return "BUY", buy_reasons
         if sell_reasons:
             return "SELL", sell_reasons
         return "HOLD", ["No extreme conditions detected — staying neutral"]
 
-    # -- Recovery logging ------------------------------------------------------
+    @staticmethod
+    def _check_volume_confirmation(signal: str, ind: dict) -> bool:
+        """
+        Check whether volume supports the signal direction.
 
-    def _log_cache_hit(self, ticker: str, error: str) -> None:
-        db = APIRecovery._db
-        if db is None:
-            return
-        try:
-            db.log_recovery_event(
-                service="yfinance",
-                event_type="cache_hit",
-                ticker=ticker,
-                error_msg=error,
-                recovery_action="using_cached_indicators",
-                success=True,
-            )
-        except Exception:
-            pass
+        BUY is confirmed when RVOL > 1.5 and OBV is rising.
+        SELL is confirmed when RVOL > 1.5 and OBV is falling.
+        HOLD is never volume-confirmed.
 
-    def _log_skip(self, ticker: str, error: str) -> None:
-        db = APIRecovery._db
-        if db is None:
-            return
-        try:
-            db.log_recovery_event(
-                service="yfinance",
-                event_type="degraded_mode",
-                ticker=ticker,
-                error_msg=error,
-                recovery_action="skip_technical_analysis_hold",
-                success=False,
-            )
-        except Exception:
-            pass
+        Args:
+            signal: "BUY", "SELL", or "HOLD".
+            ind:    Indicator dict from ``_calculate_indicators``.
+
+        Returns:
+            True if volume confirms the signal direction.
+        """
+        rvol = ind.get("rvol")
+        obv_trend = ind.get("obv_trend")
+        if rvol is None or obv_trend is None or signal == "HOLD":
+            return False
+        if signal == "BUY":
+            return rvol > 1.5 and obv_trend == "rising"
+        if signal == "SELL":
+            return rvol > 1.5 and obv_trend == "falling"
+        return False

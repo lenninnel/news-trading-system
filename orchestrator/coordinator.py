@@ -17,13 +17,7 @@ Combined pipeline (run_combined):
     8. RiskAgent      → position size, stop-loss, take-profit
     9. Database       → persist to combined_signals + risk_calculations tables
 
-Strategy pipeline (run_strategy):
-
-    Delegates to StrategyCoordinator which runs three agents in parallel:
-    MomentumAgent, MeanReversionAgent, SwingAgent → ensemble signal → RiskAgent
-    DB tables: strategy_signals + strategy_performance
-
-Signal fusion matrix (combined pipeline)
+Signal fusion matrix
 --------------------
 Sentiment  Technical  Combined
 ─────────  ─────────  ─────────────
@@ -38,23 +32,21 @@ HOLD       *          HOLD
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time as _time
 
+from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
-from config.settings import BUY_THRESHOLD, SELL_THRESHOLD
+from config.settings import BUY_THRESHOLD, SELL_THRESHOLD, SOURCE_WEIGHTS
+from data.events_feed import get_days_to_earnings
 from data.market_data import MarketData
-from data.news_aggregator import NewsAggregator
 from data.news_feed import NewsFeed
+from data.social_feed import RedditFeed, StockTwitsFeed
+from execution.broker_factory import create_trader
 from storage.database import Database
-
-# Optional — only imported when execute/notify mode is active to avoid circular deps
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from execution.paper_trader import PaperTrader
-    from notifications.telegram_bot import TelegramNotifier
-    from orchestrator.strategy_coordinator import StrategyCoordinator
 
 # Maps (sentiment_signal, technical_signal) → combined label
 _FUSION_TABLE: dict[tuple[str, str], str] = {
@@ -96,77 +88,67 @@ class Coordinator:
 
     def __init__(
         self,
-        news_feed: "NewsFeed | NewsAggregator | None" = None,
+        news_feed: NewsFeed | None = None,
         market_data: MarketData | None = None,
         sentiment_agent: SentimentAgent | None = None,
         technical_agent: TechnicalAgent | None = None,
         risk_agent: RiskAgent | None = None,
+        regime_agent: RegimeAgent | None = None,
         db: Database | None = None,
-        paper_trader: "PaperTrader | None" = None,
-        notifier: "TelegramNotifier | None" = None,
-        strategy_coordinator: "StrategyCoordinator | None" = None,
+        paper_trader=None,
+        reddit_feed: RedditFeed | None = None,
+        stocktwits_feed: StockTwitsFeed | None = None,
     ) -> None:
         self.db = db or Database()
-        self.news_feed = news_feed or NewsAggregator(db=self.db)
+        self.news_feed = news_feed or NewsFeed()
         self.market_data = market_data or MarketData()
         self.sentiment_agent = sentiment_agent or SentimentAgent()
         # All agents share the same DB instance
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
-        self.paper_trader = paper_trader
-        self.notifier = notifier
-        self._strategy_coordinator = strategy_coordinator
-
-    # ------------------------------------------------------------------
-    # Strategy pipeline
-    # ------------------------------------------------------------------
-
-    def run_strategy(
-        self,
-        ticker: str,
-        account_balance: float = 10_000.0,
-        verbose: bool = True,
-        strategy: str = "all",
-    ) -> dict:
-        """
-        Run the multi-strategy pipeline (momentum + mean-reversion + swing).
-
-        Delegates entirely to StrategyCoordinator; creates one on demand when
-        no coordinator was injected at construction time.
-
-        Args:
-            ticker:          Stock ticker symbol (e.g. "AAPL").
-            account_balance: Account size in USD for position sizing.
-            verbose:         Print progress to stdout.
-            strategy:        Which agents to run: "momentum" | "mean-reversion" |
-                             "swing" | "all" (default).
-
-        Returns:
-            dict — same structure as StrategyCoordinator.run():
-                ticker, strategy, strategy_signals, ranked_signals,
-                combined_strategy_signal, ensemble_confidence,
-                consensus, risk, account_balance, strategy_run_id, errors
-        """
-        if self._strategy_coordinator is None:
-            from orchestrator.strategy_coordinator import StrategyCoordinator
-            self._strategy_coordinator = StrategyCoordinator(db=self.db)
-
-        return self._strategy_coordinator.run(
-            ticker=ticker,
-            account_balance=account_balance,
-            verbose=verbose,
-            strategy=strategy,
-        )
+        self.regime_agent = regime_agent or RegimeAgent()
+        self.paper_trader = paper_trader or create_trader(db=self.db)
+        self.reddit_feed = reddit_feed or RedditFeed()
+        self.stocktwits_feed = stocktwits_feed or StockTwitsFeed()
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _aggregate(self, scored: list[dict]) -> float:
+    @staticmethod
+    def _aggregate(scored: list[dict]) -> float:
         """Return the mean numeric score across all scored headlines."""
         if not scored:
             return 0.0
         return sum(s["score"] for s in scored) / len(scored)
+
+    @staticmethod
+    def _weighted_aggregate(scored: list[dict]) -> float:
+        """Return a weighted average score using SOURCE_WEIGHTS."""
+        if not scored:
+            return 0.0
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for s in scored:
+            w = SOURCE_WEIGHTS.get(s.get("source", "newsapi"), 1.0)
+            weighted_sum += s["score"] * w
+            total_weight += w
+        return weighted_sum / total_weight if total_weight else 0.0
+
+    @staticmethod
+    def _source_breakdown(scored: list[dict]) -> dict:
+        """Compute per-source count and average from scored items."""
+        buckets: dict[str, list[int]] = {}
+        for s in scored:
+            src = s.get("source", "newsapi")
+            buckets.setdefault(src, []).append(s["score"])
+        return {
+            src: {
+                "count": len(scores),
+                "avg": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            }
+            for src, scores in buckets.items()
+        }
 
     def _signal(self, avg_score: float) -> str:
         """Map an average score to a trading signal string."""
@@ -196,7 +178,12 @@ class Coordinator:
         return _FUSION_TABLE.get((sentiment_signal, technical_signal), "HOLD")
 
     @staticmethod
-    def confidence(combined_signal: str, avg_score: float) -> float:
+    def confidence(
+        combined_signal: str,
+        avg_score: float,
+        volume_confirmed: bool = False,
+        rvol: "float | None" = None,
+    ) -> float:
         """
         Compute a confidence score (0.0–1.0) for the combined signal.
 
@@ -205,21 +192,37 @@ class Coordinator:
         CONFLICTING is fixed at 0.10 (agents actively disagree).
         HOLD is fixed at 0.25 (no directional conviction).
 
+        Volume adjustment (applied after base calculation):
+            +0.10 when volume_confirmed is True (RVOL > 1.5 + OBV aligns).
+            −0.10 when RVOL < 0.7 (low-conviction move).
+
         Args:
-            combined_signal: Output of combine_signals().
-            avg_score:       Raw sentiment average (−1.0 to +1.0).
+            combined_signal:  Output of combine_signals().
+            avg_score:        Raw sentiment average (−1.0 to +1.0).
+            volume_confirmed: True when volume supports the signal direction.
+            rvol:             Relative volume (current / 20-day avg).
 
         Returns:
-            Confidence float rounded to two decimal places.
+            Confidence float rounded to two decimal places, clamped to [0, 1].
         """
         strength = abs(avg_score)  # 0.0 – 1.0
         if combined_signal in ("STRONG BUY", "STRONG SELL"):
-            return round(min(1.0, 0.6 + strength * 0.4), 2)
-        if combined_signal in ("WEAK BUY", "WEAK SELL"):
-            return round(min(0.6, 0.2 + strength * 0.4), 2)
-        if combined_signal == "CONFLICTING":
-            return 0.10
-        return 0.25  # HOLD
+            base = min(1.0, 0.6 + strength * 0.4)
+        elif combined_signal in ("WEAK BUY", "WEAK SELL"):
+            base = min(0.6, 0.2 + strength * 0.4)
+        elif combined_signal == "CONFLICTING":
+            base = 0.10
+        else:
+            base = 0.25  # HOLD
+
+        # Volume adjustment (only for directional signals)
+        if combined_signal not in ("HOLD", "CONFLICTING"):
+            if volume_confirmed:
+                base += 0.10
+            elif rvol is not None and rvol < 0.7:
+                base -= 0.10
+
+        return round(max(0.0, min(1.0, base)), 2)
 
     # ------------------------------------------------------------------
     # Public API
@@ -227,9 +230,10 @@ class Coordinator:
 
     def run(self, ticker: str, verbose: bool = True) -> dict:
         """
-        Execute the sentiment-only pipeline for *ticker*.
+        Execute the multi-source sentiment pipeline for *ticker*.
 
-        Unchanged from the original implementation — fully backward-compatible.
+        Collects headlines from NewsAPI, StockTwits, and Reddit, scores each
+        via Claude, and computes a weighted average using SOURCE_WEIGHTS.
 
         Args:
             ticker:  Stock ticker symbol (e.g. "AAPL").
@@ -237,7 +241,7 @@ class Coordinator:
 
         Returns:
             dict with keys: ticker, market, headlines_fetched, scored,
-                            avg_score, signal, run_id
+                            avg_score, signal, run_id, source_breakdown
         """
         ticker = ticker.upper()
 
@@ -252,20 +256,44 @@ class Coordinator:
             if verbose:
                 print(f"  [market data unavailable: {exc}]\n")
 
-        # Step 2 — headlines
+        # Step 2 — collect from all sources
+        items: list[dict] = []  # each: {"text": ..., "source": ...}
+
+        # NewsAPI
         if verbose:
             print(f"Fetching headlines for {ticker}...")
-        headlines = self.news_feed.fetch(ticker)
+        newsapi_headlines = self.news_feed.fetch(ticker)
+        for h in newsapi_headlines:
+            items.append({"text": h, "source": "newsapi"})
         if verbose:
-            print(f"Found {len(headlines)} headline(s).\n")
+            print(f"  NewsAPI: {len(newsapi_headlines)} headline(s)")
+
+        # StockTwits
+        stocktwits_items = self.stocktwits_feed.fetch(ticker)
+        for st in stocktwits_items:
+            items.append({"text": st["text"], "source": "stocktwits"})
+        if verbose:
+            print(f"  StockTwits: {len(stocktwits_items)} message(s)")
+
+        # Reddit
+        reddit_items = self.reddit_feed.fetch(ticker)
+        for rd in reddit_items:
+            items.append({"text": rd["text"], "source": "reddit"})
+        if verbose:
+            print(f"  Reddit: {len(reddit_items)} post(s)")
+            print(f"  Total: {len(items)} item(s)\n")
 
         # Step 3 — sentiment scoring
         scored: list[dict] = []
-        for i, headline in enumerate(headlines, 1):
+        for i, item in enumerate(items, 1):
+            text = item["text"]
+            source = item["source"]
+            label = f"[{source}]"
             if verbose:
-                print(f"[{i}/{len(headlines)}] Analysing: {headline}")
+                print(f"[{i}/{len(items)}] {label} {text[:80]}")
             try:
-                result = self.sentiment_agent.run(headline, ticker)
+                result = self.sentiment_agent.run(text, ticker)
+                result["source"] = source
                 scored.append(result)
                 if verbose:
                     icon = {"bullish": "+", "bearish": "-", "neutral": "~"}.get(
@@ -276,17 +304,19 @@ class Coordinator:
                 if verbose:
                     print(f"         [!] Skipped ({exc})")
 
-        # Step 4 — aggregate + signal
-        avg_score = self._aggregate(scored)
+        # Step 4 — weighted aggregate + signal
+        avg_score = self._weighted_aggregate(scored)
         signal = self._signal(avg_score)
+        breakdown = self._source_breakdown(scored)
 
         # Step 5 — persist
         run_id = self.db.log_run(
             ticker=ticker,
-            headlines_fetched=len(headlines),
+            headlines_fetched=len(items),
             headlines_analysed=len(scored),
             avg_score=avg_score,
             signal=signal,
+            source_breakdown=breakdown,
         )
         for s in scored:
             self.db.log_headline_score(
@@ -295,16 +325,18 @@ class Coordinator:
                 sentiment=s["sentiment"],
                 score=s["score"],
                 reason=s.get("reason", ""),
+                source=s.get("source", "newsapi"),
             )
 
         return {
             "ticker": ticker,
             "market": market,
-            "headlines_fetched": len(headlines),
+            "headlines_fetched": len(items),
             "scored": scored,
             "avg_score": avg_score,
             "signal": signal,
             "run_id": run_id,
+            "source_breakdown": breakdown,
         }
 
     def run_combined(
@@ -312,6 +344,7 @@ class Coordinator:
         ticker: str,
         verbose: bool = True,
         account_balance: float = 10_000.0,
+        execute: bool = False,
     ) -> dict:
         """
         Run sentiment, technical, and risk agents, then fuse their signals.
@@ -320,6 +353,7 @@ class Coordinator:
             ticker:          Stock ticker symbol (e.g. "AAPL").
             verbose:         When True, print step-by-step progress to stdout.
             account_balance: Account size in USD used for position sizing.
+            execute:         When True, execute the trade via PaperTrader.
 
         Returns:
             dict with keys:
@@ -330,8 +364,21 @@ class Coordinator:
                 confidence       (float): Confidence score 0.0–1.0.
                 combined_id      (int):   DB primary key for combined_signals row.
                 risk             (dict):  Full output of RiskAgent.run().
+                execution        (dict|None): PaperTrader result if execute=True.
         """
         ticker = ticker.upper()
+
+        # --- Market regime (once per session, cached) ---
+        regime_info: dict = {}
+        try:
+            regime_info = self.regime_agent.run()
+            if verbose:
+                regime = regime_info.get("regime", "UNKNOWN")
+                cached = " (cached)" if regime_info.get("cached") else ""
+                print(f"\n  Market regime: {regime}{cached}")
+        except Exception as exc:
+            if verbose:
+                print(f"\n  [regime detection unavailable: {exc}]")
 
         # --- Sentiment pipeline ---
         if verbose:
@@ -352,7 +399,12 @@ class Coordinator:
 
         # --- Fuse ---
         combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
-        conf = self.confidence(combined_signal, sentiment["avg_score"])
+        conf = self.confidence(
+            combined_signal,
+            sentiment["avg_score"],
+            volume_confirmed=technical.get("volume_confirmed", False),
+            rvol=technical.get("indicators", {}).get("rvol"),
+        )
 
         # --- Persist combined ---
         combined_id = self.db.log_combined_signal(
@@ -366,36 +418,37 @@ class Coordinator:
             technical_id=technical["signal_id"],
         )
 
-        # --- Telegram: signal alert ---
-        if self.notifier is not None:
-            # Build a short reasoning string from the top headline scores
-            top = sorted(
-                sentiment.get("scored", []),
-                key=lambda s: abs(s.get("score", 0)),
-                reverse=True,
-            )[:2]
-            reasoning = "  |  ".join(
-                h.get("headline", "")[:80] for h in top if h.get("headline")
-            )
-            self.notifier.send_signal(
-                ticker=ticker,
-                signal=combined_signal,
-                confidence=conf * 100,
-                reasoning=reasoning,
-            )
-
         # --- Risk sizing ---
         if verbose:
             print(f"\n[3/3] Risk sizing for {ticker}...")
         # Prefer live market price; fall back to technical close price
         price = (sentiment.get("market") or {}).get("price") \
             or technical["indicators"].get("price")
+
+        # Pre-compute event risk so we can downgrade signals before sizing
+        days_to_earn = get_days_to_earnings(ticker)
+        if days_to_earn is not None and days_to_earn <= 2:
+            event_risk_flag = "earnings_imminent"
+        elif days_to_earn is not None and days_to_earn <= 5:
+            event_risk_flag = "earnings_week"
+        else:
+            event_risk_flag = "none"
+
+        # Downgrade STRONG signals when earnings are imminent
+        sizing_signal = combined_signal
+        if event_risk_flag == "earnings_imminent":
+            if combined_signal == "STRONG BUY":
+                sizing_signal = "WEAK BUY"
+            elif combined_signal == "STRONG SELL":
+                sizing_signal = "WEAK SELL"
+
         risk = self.risk_agent.run(
             ticker=ticker,
-            signal=combined_signal,
+            signal=sizing_signal,
             confidence=conf * 100,          # convert 0–1 → 0–100
             current_price=price,
             account_balance=account_balance,
+            regime=regime_info.get("regime"),
         )
         if verbose:
             if risk["skipped"]:
@@ -408,10 +461,10 @@ class Coordinator:
                     f"TP: ${risk['take_profit']:.2f}"
                 )
 
-        # --- Paper execution ---
-        trade_id = None
-        if self.paper_trader is not None and not risk["skipped"]:
-            trade_id = self.paper_trader.track_trade(
+        # --- Paper trade execution ---
+        execution = None
+        if execute and not risk["skipped"]:
+            execution = self.paper_trader.track_trade(
                 ticker=ticker,
                 action=risk["direction"],
                 shares=risk["shares"],
@@ -420,18 +473,9 @@ class Coordinator:
                 take_profit=risk["take_profit"],
             )
             if verbose:
-                print(f"\n  [PAPER TRADE LOGGED]  trade_history id=#{trade_id}")
-
-            # --- Telegram: trade executed alert ---
-            if self.notifier is not None:
-                self.notifier.send_trade_executed(
-                    ticker=ticker,
-                    action=risk["direction"],
-                    shares=risk["shares"],
-                    price=price,
-                    stop_loss=risk["stop_loss"],
-                    take_profit=risk["take_profit"],
-                )
+                print(f"\n  [EXECUTED] Paper trade #{execution['trade_id']}: "
+                      f"{risk['direction']} {risk['shares']} {ticker} "
+                      f"@ ${price:.2f}")
 
         return {
             "ticker": ticker,
@@ -442,5 +486,217 @@ class Coordinator:
             "combined_id": combined_id,
             "risk": risk,
             "account_balance": account_balance,
-            "trade_id": trade_id,
+            "execution": execution,
+            "event_risk_flag": event_risk_flag,
+            "regime": regime_info,
+        }
+
+    # ------------------------------------------------------------------
+    # Async pipeline (for batch / scheduler usage)
+    # ------------------------------------------------------------------
+
+    async def analyse_ticker_async(
+        self,
+        ticker: str,
+        *,
+        account_balance: float = 10_000.0,
+        execute: bool = False,
+        api_semaphore: asyncio.Semaphore,
+        data_semaphore: asyncio.Semaphore,
+        db_lock: asyncio.Lock,
+    ) -> dict:
+        """
+        Async version of ``run_combined()`` with semaphore-controlled phases.
+
+        Breaks the pipeline into four phases, each guarded by the
+        appropriate concurrency primitive:
+
+        1. **Data fetch** (market data, headlines, social) — *data_semaphore*
+        2. **Sentiment scoring** (Claude API per headline) — *api_semaphore*
+        3. **Technical analysis** (yfinance indicators) — *data_semaphore*
+        4. **DB writes, risk sizing, execution** — *db_lock*
+
+        The existing synchronous ``run_combined()`` is unchanged.
+
+        Args:
+            ticker:          Stock ticker symbol.
+            account_balance: Account size in USD.
+            execute:         When True, execute via broker.
+            api_semaphore:   Limits concurrent Claude API calls.
+            data_semaphore:  Limits concurrent yfinance / HTTP fetches.
+            db_lock:         Serialises all database writes.
+
+        Returns:
+            Same dict shape as ``run_combined()``, plus ``elapsed_s``.
+        """
+        t0 = _time.monotonic()
+        ticker = ticker.upper()
+
+        # --- Market regime (cached, fast) ---
+        regime_info: dict = {}
+        try:
+            regime_info = self.regime_agent.run()
+        except Exception:
+            pass
+
+        # ── Phase 1: Data fetches ──────────────────────────────────────
+        async with data_semaphore:
+            market: dict = {}
+            try:
+                market = await asyncio.to_thread(self.market_data.fetch, ticker)
+            except Exception:
+                pass
+
+            newsapi_headlines = await asyncio.to_thread(
+                self.news_feed.fetch, ticker,
+            )
+            stocktwits_items = await asyncio.to_thread(
+                self.stocktwits_feed.fetch, ticker,
+            )
+            reddit_items = await asyncio.to_thread(
+                self.reddit_feed.fetch, ticker,
+            )
+
+        # Build items list
+        items: list[dict] = []
+        for h in newsapi_headlines:
+            items.append({"text": h, "source": "newsapi"})
+        for st_item in stocktwits_items:
+            items.append({"text": st_item["text"], "source": "stocktwits"})
+        for rd in reddit_items:
+            items.append({"text": rd["text"], "source": "reddit"})
+
+        # ── Phase 2: Sentiment scoring (Claude API) ────────────────────
+        scored: list[dict] = []
+        for item in items:
+            async with api_semaphore:
+                try:
+                    result = await asyncio.to_thread(
+                        self.sentiment_agent.run, item["text"], ticker,
+                    )
+                    result["source"] = item["source"]
+                    scored.append(result)
+                except Exception:
+                    pass
+
+        avg_score = self._weighted_aggregate(scored)
+        sentiment_signal = self._signal(avg_score)
+        breakdown = self._source_breakdown(scored)
+
+        # ── Phase 3: Technical analysis (yfinance) ─────────────────────
+        async with data_semaphore:
+            technical = await asyncio.to_thread(
+                self.technical_agent.run, ticker,
+            )
+
+        # ── Fuse signals ───────────────────────────────────────────────
+        combined_signal = self.combine_signals(
+            sentiment_signal, technical["signal"],
+        )
+        conf = self.confidence(
+            combined_signal,
+            avg_score,
+            volume_confirmed=technical.get("volume_confirmed", False),
+            rvol=technical.get("indicators", {}).get("rvol"),
+        )
+
+        # ── Phase 4: DB writes + risk sizing ───────────────────────────
+        async with db_lock:
+            run_id = self.db.log_run(
+                ticker=ticker,
+                headlines_fetched=len(items),
+                headlines_analysed=len(scored),
+                avg_score=avg_score,
+                signal=sentiment_signal,
+                source_breakdown=breakdown,
+            )
+            for s in scored:
+                self.db.log_headline_score(
+                    run_id=run_id,
+                    headline=s["headline"],
+                    sentiment=s["sentiment"],
+                    score=s["score"],
+                    reason=s.get("reason", ""),
+                    source=s.get("source", "newsapi"),
+                )
+
+            combined_id = self.db.log_combined_signal(
+                ticker=ticker,
+                combined_signal=combined_signal,
+                sentiment_signal=sentiment_signal,
+                technical_signal=technical["signal"],
+                sentiment_score=avg_score,
+                confidence=conf,
+                run_id=run_id,
+                technical_id=technical["signal_id"],
+            )
+
+        # --- Risk sizing ---
+        price = (market or {}).get("price") or \
+            technical["indicators"].get("price")
+
+        days_to_earn = get_days_to_earnings(ticker)
+        if days_to_earn is not None and days_to_earn <= 2:
+            event_risk_flag = "earnings_imminent"
+        elif days_to_earn is not None and days_to_earn <= 5:
+            event_risk_flag = "earnings_week"
+        else:
+            event_risk_flag = "none"
+
+        sizing_signal = combined_signal
+        if event_risk_flag == "earnings_imminent":
+            if combined_signal == "STRONG BUY":
+                sizing_signal = "WEAK BUY"
+            elif combined_signal == "STRONG SELL":
+                sizing_signal = "WEAK SELL"
+
+        async with db_lock:
+            risk = self.risk_agent.run(
+                ticker=ticker,
+                signal=sizing_signal,
+                confidence=conf * 100,
+                current_price=price,
+                account_balance=account_balance,
+                regime=regime_info.get("regime"),
+            )
+
+        # --- Execution ---
+        execution = None
+        if execute and not risk["skipped"]:
+            async with db_lock:
+                execution = self.paper_trader.track_trade(
+                    ticker=ticker,
+                    action=risk["direction"],
+                    shares=risk["shares"],
+                    price=price,
+                    stop_loss=risk["stop_loss"],
+                    take_profit=risk["take_profit"],
+                )
+
+        elapsed = _time.monotonic() - t0
+
+        sentiment_result = {
+            "ticker": ticker,
+            "market": market,
+            "headlines_fetched": len(items),
+            "scored": scored,
+            "avg_score": avg_score,
+            "signal": sentiment_signal,
+            "run_id": run_id,
+            "source_breakdown": breakdown,
+        }
+
+        return {
+            "ticker": ticker,
+            "sentiment": sentiment_result,
+            "technical": technical,
+            "combined_signal": combined_signal,
+            "confidence": conf,
+            "combined_id": combined_id,
+            "risk": risk,
+            "account_balance": account_balance,
+            "execution": execution,
+            "event_risk_flag": event_risk_flag,
+            "regime": regime_info,
+            "elapsed_s": round(elapsed, 2),
         }

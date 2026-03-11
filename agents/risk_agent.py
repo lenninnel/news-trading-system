@@ -36,6 +36,19 @@ Safety guards
 - shares == 0 (price > position budget) → no position
 - Transaction cost of 0.10 % deducted from position before share calculation
 
+Earnings event risk
+-------------------
+- earnings_week (≤5 trading days): position capped at 50 % of Kelly result
+- earnings_imminent (≤2 trading days): position capped at 25 % of Kelly result;
+  if confidence < 50, position is skipped entirely
+
+Market regime adjustment (applied before earnings cap)
+------------------------------------------------------
+- TRENDING_BULL:  1.0× (no change)
+- TRENDING_BEAR:  0.7× position reduction
+- RANGING:        0.8× position reduction; WEAK signals are skipped entirely
+- HIGH_VOL:       0.5× position reduction; only STRONG signals with conf > 70%
+
 Requires:
     No additional dependencies (uses only stdlib + storage layer)
 """
@@ -46,6 +59,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from data.events_feed import get_days_to_earnings
 from storage.database import Database
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -56,6 +70,14 @@ _REWARD_RISK_RATIO      = 2.0    # 2:1 take-profit
 _MIN_CONFIDENCE         = 30.0   # below this → no position
 _WIN_PROB_BASE          = 0.50   # base win probability (random)
 _WIN_PROB_RANGE         = 0.30   # additional range driven by confidence
+
+# Regime-based position multipliers
+_REGIME_MULTIPLIER: dict[str, float] = {
+    "TRENDING_BULL": 1.0,
+    "TRENDING_BEAR": 0.7,
+    "RANGING":       0.8,
+    "HIGH_VOL":      0.5,
+}
 
 # Stop-loss percentages keyed by signal strength
 _STOP_PCT: dict[str, float] = {
@@ -185,6 +207,7 @@ class RiskAgent(BaseAgent):
                 calc_id           (int):  Database primary key.
         """
         ticker = ticker.upper()
+        regime = kwargs.get("regime")
 
         # -- 1. Safety gates -----------------------------------------------
         skip_reason: str | None = None
@@ -196,9 +219,42 @@ class RiskAgent(BaseAgent):
         elif direction == "HOLD":
             skip_reason = f"Signal '{signal}' carries no directional conviction"
 
+        # -- 1c. Regime-based signal gates ---------------------------------
+        if not skip_reason and regime:
+            if regime == "RANGING" and strength == "WEAK":
+                skip_reason = f"WEAK signal skipped in RANGING regime"
+            elif regime == "HIGH_VOL":
+                if strength != "STRONG":
+                    skip_reason = f"Only STRONG signals allowed in HIGH_VOL regime"
+                elif confidence <= 70:
+                    skip_reason = (
+                        f"HIGH_VOL regime requires confidence > 70% "
+                        f"(got {confidence:.0f}%)"
+                    )
+
+        # -- 1b. Earnings event risk check ---------------------------------
+        days_to_earn = get_days_to_earnings(ticker)
+        if days_to_earn is not None and days_to_earn <= 2:
+            event_risk_flag = "earnings_imminent"
+        elif days_to_earn is not None and days_to_earn <= 5:
+            event_risk_flag = "earnings_week"
+        else:
+            event_risk_flag = "none"
+
+        # Earnings-imminent + low confidence → skip
+        if event_risk_flag == "earnings_imminent" and confidence < 50 and not skip_reason:
+            skip_reason = (
+                f"Earnings imminent ({days_to_earn} trading days) "
+                f"with low confidence ({confidence:.0f}%)"
+            )
+
         if skip_reason:
-            return self._no_position(ticker, signal, confidence, current_price,
-                                     account_balance, skip_reason)
+            result = self._no_position(ticker, signal, confidence, current_price,
+                                       account_balance, skip_reason)
+            result["event_risk_flag"] = event_risk_flag
+            result["days_to_earnings"] = days_to_earn
+            result["regime"] = regime
+            return result
 
         # -- 2. Stop-loss percentage ----------------------------------------
         stop_pct = _STOP_PCT[strength]
@@ -211,6 +267,16 @@ class RiskAgent(BaseAgent):
         max_by_risk      = (account_balance * _MAX_RISK_FRACTION) / stop_pct
 
         position_raw = min(max_by_kelly, max_by_portfolio, max_by_risk)
+
+        # -- 3b. Regime adjustment ------------------------------------------
+        if regime and regime in _REGIME_MULTIPLIER:
+            position_raw *= _REGIME_MULTIPLIER[regime]
+
+        # -- 3c. Earnings cap on position -----------------------------------
+        if event_risk_flag == "earnings_imminent":
+            position_raw *= 0.25
+        elif event_risk_flag == "earnings_week":
+            position_raw *= 0.50
 
         # -- 4. Deduct transaction cost ------------------------------------
         position_after_cost = position_raw * (1.0 - _TRANSACTION_COST)
@@ -250,6 +316,9 @@ class RiskAgent(BaseAgent):
             "stop_pct":         stop_pct,
             "skipped":          False,
             "skip_reason":      None,
+            "event_risk_flag":  event_risk_flag,
+            "days_to_earnings": days_to_earn,
+            "regime":           regime,
         }
 
         # -- 7. Persist ----------------------------------------------------
@@ -265,6 +334,9 @@ class RiskAgent(BaseAgent):
             )},
             skipped=False,
             skip_reason=None,
+            event_risk_flag=event_risk_flag,
+            days_to_earnings=days_to_earn,
+            regime=regime,
         )
 
         return result
@@ -281,6 +353,9 @@ class RiskAgent(BaseAgent):
         current_price: float,
         account_balance: float,
         skip_reason: str,
+        event_risk_flag: str = "none",
+        days_to_earnings: "int | None" = None,
+        regime: "str | None" = None,
     ) -> dict:
         """Persist and return a zero-position result."""
         calc_id = self._db.log_risk_calculation(
@@ -298,6 +373,9 @@ class RiskAgent(BaseAgent):
             stop_pct=None,
             skipped=True,
             skip_reason=skip_reason,
+            event_risk_flag=event_risk_flag,
+            days_to_earnings=days_to_earnings,
+            regime=regime,
         )
         return {
             "ticker":           ticker,
@@ -313,4 +391,7 @@ class RiskAgent(BaseAgent):
             "skipped":          True,
             "skip_reason":      skip_reason,
             "calc_id":          calc_id,
+            "event_risk_flag":  event_risk_flag,
+            "days_to_earnings": days_to_earnings,
+            "regime":           regime,
         }

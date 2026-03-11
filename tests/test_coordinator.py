@@ -146,3 +146,49 @@ class TestConfidence:
         low  = conf("WEAK BUY", 0.3)
         high = conf("WEAK BUY", 0.9)
         assert high > low
+
+
+# ===========================================================================
+# confidence — volume adjustments
+# ===========================================================================
+
+class TestConfidenceVolume:
+    """Volume confirmation should boost confidence; low RVOL should reduce it."""
+
+    def test_volume_confirmed_boosts_strong_buy(self):
+        base = conf("STRONG BUY", 0.5)
+        boosted = conf("STRONG BUY", 0.5, volume_confirmed=True)
+        assert boosted == round(base + 0.10, 2)
+
+    def test_volume_confirmed_boosts_weak_sell(self):
+        base = conf("WEAK SELL", 0.5)
+        boosted = conf("WEAK SELL", 0.5, volume_confirmed=True)
+        assert boosted == round(base + 0.10, 2)
+
+    def test_low_rvol_reduces_strong_buy(self):
+        base = conf("STRONG BUY", 0.5)
+        reduced = conf("STRONG BUY", 0.5, rvol=0.5)
+        assert reduced == round(base - 0.10, 2)
+
+    def test_low_rvol_reduces_weak_sell(self):
+        base = conf("WEAK SELL", 0.5)
+        reduced = conf("WEAK SELL", 0.5, rvol=0.5)
+        assert reduced == round(base - 0.10, 2)
+
+    def test_volume_does_not_affect_hold(self):
+        assert conf("HOLD", 0.5, volume_confirmed=True) == conf("HOLD", 0.5)
+        assert conf("HOLD", 0.5, rvol=0.3) == conf("HOLD", 0.5)
+
+    def test_volume_does_not_affect_conflicting(self):
+        assert conf("CONFLICTING", 0.5, volume_confirmed=True) == conf("CONFLICTING", 0.5)
+
+    def test_confidence_clamped_to_1_with_boost(self):
+        # STRONG BUY with max sentiment = 1.0, then +0.10 should still be 1.0
+        c = conf("STRONG BUY", 1.0, volume_confirmed=True)
+        assert c == 1.0
+
+    def test_confidence_clamped_to_0_with_reduction(self):
+        # WEAK BUY with 0.0 sentiment = 0.20, minus 0.10 = 0.10
+        c = conf("WEAK BUY", 0.0, rvol=0.3)
+        assert c == 0.10
+        assert c >= 0.0
