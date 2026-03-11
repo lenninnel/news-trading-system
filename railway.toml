@@ -1,35 +1,21 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  railway.toml — Railway.app deployment configuration
 #
-#  This file configures the PRIMARY service (web / Streamlit dashboard).
-#  Additional services (worker, monitor, health) must be created separately
-#  in the Railway dashboard and linked to this repository with the start
-#  commands shown below.
+#  Single-service mode: entrypoint.sh starts both the Streamlit dashboard
+#  (foreground) and the daily scheduler (background).
 #
-#  Multi-service start commands
-#  ----------------------------
-#  web     → streamlit run dashboard/app.py --server.port=$PORT \
-#               --server.address=0.0.0.0 --server.headless=true \
-#               --server.enableCORS=false
-#
-#  worker  → python3 scheduler/daily_runner.py
-#
-#  monitor → python3 monitoring/price_monitor.py --daemon
-#
-#  health  → uvicorn deployment.health_server:app \
-#               --host 0.0.0.0 --port ${HEALTH_PORT:-8080}
-#
-#  One-command deploy:
-#    ./deployment/deploy_railway.sh
+#  For multi-service mode, create separate Railway services with:
+#    web    → streamlit run dashboard/app.py --server.port=$PORT \
+#                --server.address=0.0.0.0 --server.headless=true
+#    worker → python3 -m scheduler.daily_runner
 # ══════════════════════════════════════════════════════════════════════════════
 
 [build]
 builder            = "DOCKERFILE"
 dockerfilePath     = "Dockerfile"
 
-# ── Web service (Streamlit dashboard) ─────────────────────────────────────────
 [deploy]
-startCommand       = "sh -c 'streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false'"
+startCommand       = "sh /app/entrypoint.sh"
 healthcheckPath    = "/_stcore/health"
 healthcheckTimeout = 300
 restartPolicyType  = "ON_FAILURE"

@@ -112,6 +112,7 @@ optimization_runs
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -119,19 +120,27 @@ from datetime import datetime, timezone
 from config.settings import DB_PATH
 
 
+def _resolve_db_path(default: str = DB_PATH) -> str:
+    """Use a Railway persistent volume if /data exists, else fall back to local."""
+    railway_dir = "/data"
+    if os.path.isdir(railway_dir):
+        return os.path.join(railway_dir, "news_trading.db")
+    return default
+
+
 class Database:
     """Thin wrapper around a SQLite database for logging trading analysis."""
 
     _write_lock = threading.Lock()
 
-    def __init__(self, db_path: str = DB_PATH) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         """
         Initialise the database and create tables if they don't exist.
 
         Args:
             db_path: Path to the SQLite file. Defaults to settings.DB_PATH.
         """
-        self.db_path = db_path
+        self.db_path = db_path or _resolve_db_path()
         self._init_schema()
 
     # ------------------------------------------------------------------

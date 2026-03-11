@@ -41,10 +41,14 @@ WORKDIR /app
 COPY . .
 
 # Create directories that the app writes to at runtime
-RUN mkdir -p logs backtest
+RUN mkdir -p logs /data
+
+# Copy entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Non-root user for security
-RUN useradd -m -u 1000 trader && chown -R trader:trader /app
+RUN useradd -m -u 1000 trader && chown -R trader:trader /app /data
 USER trader
 
 # Streamlit configuration
@@ -59,8 +63,7 @@ EXPOSE 8501
 
 # Health check — verify Streamlit responds
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8501}/ || exit 1
+    CMD curl -f http://localhost:${PORT:-8501}/_stcore/health || exit 1
 
-# Default: start Streamlit dashboard
-# Railway overrides this via railway.json startCommand
-CMD ["sh", "-c", "streamlit run dashboard/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0"]
+# Entrypoint starts both streamlit and the scheduler
+CMD ["/app/entrypoint.sh"]

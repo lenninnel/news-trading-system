@@ -34,11 +34,39 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Password protection (opt-in via DASHBOARD_PASSWORD env var)
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+
+if _DASHBOARD_PASSWORD:
+    if not st.session_state.get("authenticated"):
+        st.title("News Trading System")
+        password = st.text_input("Enter dashboard password", type="password")
+        if st.button("Login"):
+            if password == _DASHBOARD_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.stop()
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
+def _resolve_db_path() -> str:
+    """Use Railway persistent volume if available."""
+    if os.path.isdir("/data"):
+        return "/data/news_trading.db"
+    return DB_PATH
+
+
+_DB_PATH = _resolve_db_path()
+
+
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
