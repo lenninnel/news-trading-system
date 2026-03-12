@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq5 curl \
 COPY --from=builder /install /usr/local
 WORKDIR /app
 COPY . .
-RUN mkdir -p logs
+RUN mkdir -p logs && chmod +x entrypoint.sh
 
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_ENABLE_CORS=false
@@ -31,6 +31,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8501}/_stcore/health || exit 1
+    CMD curl -f http://localhost:${STREAMLIT_SERVER_PORT:-8501}/_stcore/health || exit 1
 
-CMD ["sh", "-c", "python3 -m scheduler.daily_runner & exec streamlit run dashboard/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false"]
+CMD ["sh", "/app/entrypoint.sh"]
