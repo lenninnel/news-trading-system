@@ -1,21 +1,9 @@
-# ══════════════════════════════════════════════════════════════════════════════
-#  railway.toml — Railway.app deployment configuration
-#
-#  Single-service mode: entrypoint.sh starts both the Streamlit dashboard
-#  (foreground) and the daily scheduler (background).
-#
-#  For multi-service mode, create separate Railway services with:
-#    web    → streamlit run dashboard/app.py --server.port=$PORT \
-#                --server.address=0.0.0.0 --server.headless=true
-#    worker → python3 -m scheduler.daily_runner
-# ══════════════════════════════════════════════════════════════════════════════
-
 [build]
 builder            = "DOCKERFILE"
 dockerfilePath     = "Dockerfile"
 
 [deploy]
-startCommand       = "sh /app/entrypoint.sh"
+startCommand       = "python3 -m scheduler.daily_runner & exec streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false"
 healthcheckPath    = "/_stcore/health"
 healthcheckTimeout = 300
 restartPolicyType  = "ON_FAILURE"

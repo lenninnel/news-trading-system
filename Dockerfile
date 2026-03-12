@@ -1,69 +1,36 @@
 # ══════════════════════════════════════════════════════════════════
 #  Multi-stage Dockerfile for the News Trading System
-#  Target image: < 500 MB
-#  Python: 3.11-slim (Railway / Render compatible)
+#  Python: 3.11-slim (Railway compatible)
 # ══════════════════════════════════════════════════════════════════
 
-# ── Stage 1: Builder ─────────────────────────────────────────────────────────
+# ── Stage 1: Builder ─────────────────────────────────────────────
 FROM python:3.11-slim AS builder
-
 WORKDIR /build
-
-# System build deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc \
-        libpq-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Python deps into a prefix so we can copy just that in stage 2
 COPY requirements.txt .
 RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
 
-
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+# ── Stage 2: Runtime ─────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-LABEL maintainer="news-trading-system"
-LABEL description="Multi-agent news trading system with Streamlit dashboard"
-
-# Runtime system libraries (libpq for psycopg2)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libpq5 \
-        curl \
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
-
 WORKDIR /app
-
-# Copy project source
 COPY . .
+RUN mkdir -p logs
 
-# Create directories that the app writes to at runtime
-RUN mkdir -p logs /data
-
-# Copy entrypoint
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# Non-root user for security
-RUN useradd -m -u 1000 trader && chown -R trader:trader /app /data
-USER trader
-
-# Streamlit configuration
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_ENABLE_CORS=false
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Default port (Railway overrides $PORT at runtime)
 EXPOSE 8501
 
-# Health check — verify Streamlit responds
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8501}/_stcore/health || exit 1
 
-# Entrypoint starts both streamlit and the scheduler
-CMD ["/app/entrypoint.sh"]
+CMD ["sh", "-c", "python3 -m scheduler.daily_runner & exec streamlit run dashboard/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false"]
