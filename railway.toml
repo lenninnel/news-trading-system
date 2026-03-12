@@ -3,7 +3,7 @@ builder            = "DOCKERFILE"
 dockerfilePath     = "Dockerfile"
 
 [deploy]
-startCommand       = "streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false"
+startCommand       = "sh -c 'python3 -m scheduler.daily_runner & exec streamlit run dashboard/app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false'"
 healthcheckPath    = "/_stcore/health"
 healthcheckTimeout = 300
 restartPolicyType  = "ON_FAILURE"
