@@ -125,10 +125,14 @@ def page_overview() -> None:
     getattr(st, level)(f"Broker mode: **{label}**")
 
     # --- Market regime ---
-    regime_row = _query(
-        "SELECT regime FROM risk_calculations "
-        "WHERE regime IS NOT NULL ORDER BY id DESC LIMIT 1"
-    )
+    try:
+        regime_row = _query(
+            "SELECT regime FROM risk_calculations "
+            "WHERE regime IS NOT NULL ORDER BY id DESC LIMIT 1"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
     if not regime_row.empty:
         regime = regime_row.iloc[0]["regime"]
         _REGIME_DISPLAY = {
@@ -140,8 +144,16 @@ def page_overview() -> None:
         st.subheader(_REGIME_DISPLAY.get(regime, regime))
 
     # --- KPIs ---
-    portfolio = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
-    trades = _query("SELECT * FROM trade_history ORDER BY id DESC")
+    try:
+        portfolio = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
+    try:
+        trades = _query("SELECT * FROM trade_history ORDER BY id DESC")
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
 
     total_value = portfolio["current_value"].sum() if not portfolio.empty else 0.0
     open_count = len(portfolio)
@@ -156,10 +168,14 @@ def page_overview() -> None:
 
     # --- Last 5 combined signals ---
     st.subheader("Recent Signals")
-    signals = _query(
-        "SELECT ticker, combined_signal, confidence, sentiment_score, "
-        "created_at FROM combined_signals ORDER BY id DESC LIMIT 5"
-    )
+    try:
+        signals = _query(
+            "SELECT ticker, combined_signal, confidence, sentiment_score, "
+            "created_at FROM combined_signals ORDER BY id DESC LIMIT 5"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
     if signals.empty:
         st.info("No signals recorded yet. Run an analysis first.")
     else:
@@ -176,9 +192,13 @@ def page_signals() -> None:
     # --- Filters ---
     col_a, col_b, col_c = st.columns(3)
 
-    all_tickers = _query(
-        "SELECT DISTINCT ticker FROM combined_signals ORDER BY ticker"
-    )
+    try:
+        all_tickers = _query(
+            "SELECT DISTINCT ticker FROM combined_signals ORDER BY ticker"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
     ticker_list = ["All"] + (all_tickers["ticker"].tolist() if not all_tickers.empty else [])
     ticker_filter = col_a.selectbox("Ticker", ticker_list)
 
@@ -238,7 +258,11 @@ def page_signals() -> None:
         ORDER BY cs.id DESC
         LIMIT 200
     """
-    df = _query(sql, tuple(params))
+    try:
+        df = _query(sql, tuple(params))
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
 
     if df.empty:
         st.info("No signals match the current filters.")
@@ -254,7 +278,11 @@ def page_signals() -> None:
 def page_portfolio() -> None:
     st.title("Portfolio")
 
-    positions = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
+    try:
+        positions = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
 
     if positions.empty:
         st.info("No open positions.")
@@ -310,9 +338,13 @@ def page_history() -> None:
 
     col_a, col_b = st.columns(2)
 
-    all_tickers = _query(
-        "SELECT DISTINCT ticker FROM trade_history ORDER BY ticker"
-    )
+    try:
+        all_tickers = _query(
+            "SELECT DISTINCT ticker FROM trade_history ORDER BY ticker"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
     ticker_list = ["All"] + (all_tickers["ticker"].tolist() if not all_tickers.empty else [])
     ticker_filter = col_a.selectbox("Ticker", ticker_list, key="hist_ticker")
 
@@ -339,11 +371,15 @@ def page_history() -> None:
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    df = _query(
-        f"SELECT ticker, action, shares, price, pnl, created_at "
-        f"FROM trade_history {where} ORDER BY id DESC LIMIT 500",
-        tuple(params),
-    )
+    try:
+        df = _query(
+            f"SELECT ticker, action, shares, price, pnl, created_at "
+            f"FROM trade_history {where} ORDER BY id DESC LIMIT 500",
+            tuple(params),
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
 
     if df.empty:
         st.info("No trades recorded yet.")
@@ -448,11 +484,15 @@ def page_backtesting() -> None:
     st.markdown("---")
     st.subheader("Past Optimisation Runs")
 
-    runs = _query(
-        "SELECT id, ticker, start_date, end_date, best_params, "
-        "out_of_sample_sharpe, total_windows, created_at "
-        "FROM optimization_runs ORDER BY id DESC LIMIT 20"
-    )
+    try:
+        runs = _query(
+            "SELECT id, ticker, start_date, end_date, best_params, "
+            "out_of_sample_sharpe, total_windows, created_at "
+            "FROM optimization_runs ORDER BY id DESC LIMIT 20"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
 
     if runs.empty:
         st.info("No optimisation runs recorded yet.")

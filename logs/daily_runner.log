@@ -1,0 +1,32 @@
+/Users/lennartwehrheim/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+Traceback (most recent call last):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/Users/lennartwehrheim/news-trading-system/scheduler/daily_runner.py", line 325, in <module>
+    main()
+  File "/Users/lennartwehrheim/news-trading-system/scheduler/daily_runner.py", line 281, in main
+    batch = asyncio.run(
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/base_events.py", line 642, in run_until_complete
+    return future.result()
+  File "/Users/lennartwehrheim/news-trading-system/scheduler/daily_runner.py", line 133, in run_batch
+    coordinator = Coordinator()
+  File "/Users/lennartwehrheim/news-trading-system/orchestrator/coordinator.py", line 110, in __init__
+    self.paper_trader = paper_trader or create_trader(db=self.db)
+  File "/Users/lennartwehrheim/news-trading-system/execution/broker_factory.py", line 73, in create_trader
+    return AlpacaTrader(db=db)
+  File "/Users/lennartwehrheim/news-trading-system/execution/alpaca_trader.py", line 53, in __init__
+    import alpaca_trade_api as tradeapi
+ModuleNotFoundError: No module named 'alpaca_trade_api'
+
+Async batch runner
+  Tickers:  20
+  Workers:  5
+  Balance:  $10,000.00
+  Execute:  True
+==================================================
+
