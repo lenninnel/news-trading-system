@@ -56,9 +56,10 @@ if _DASHBOARD_PASSWORD:
 # ---------------------------------------------------------------------------
 
 def _resolve_db_path() -> str:
-    """Use Railway persistent volume if available."""
-    if os.path.isdir("/data"):
-        return "/data/news_trading.db"
+    """Use Railway persistent volume if available and writable."""
+    railway_dir = "/data"
+    if os.path.isdir(railway_dir) and os.access(railway_dir, os.W_OK):
+        return os.path.join(railway_dir, "news_trading.db")
     return DB_PATH
 
 
@@ -136,10 +137,10 @@ def page_overview() -> None:
     if not regime_row.empty:
         regime = regime_row.iloc[0]["regime"]
         _REGIME_DISPLAY = {
-            "TRENDING_BULL": "TRENDING BULL :green_circle:",
-            "TRENDING_BEAR": "TRENDING BEAR :red_circle:",
-            "RANGING":       "RANGING :yellow_circle:",
-            "HIGH_VOL":      "HIGH VOL :zap:",
+            "TRENDING_BULL": "TRENDING BULL 🟢",
+            "TRENDING_BEAR": "TRENDING BEAR 🔴",
+            "RANGING":       "RANGING 🟡",
+            "HIGH_VOL":      "HIGH VOL ⚡",
         }
         st.subheader(_REGIME_DISPLAY.get(regime, regime))
 
@@ -219,17 +220,17 @@ def page_signals() -> None:
     params: list = []
 
     if ticker_filter != "All":
-        clauses.append("ticker = ?")
+        clauses.append("cs.ticker = ?")
         params.append(ticker_filter)
     if signal_filter != "All":
-        clauses.append("combined_signal = ?")
+        clauses.append("cs.combined_signal = ?")
         params.append(signal_filter)
 
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = date_range
-        clauses.append("date(created_at) >= date(?)")
+        clauses.append("date(cs.created_at) >= date(?)")
         params.append(start.isoformat())
-        clauses.append("date(created_at) <= date(?)")
+        clauses.append("date(cs.created_at) <= date(?)")
         params.append(end.isoformat())
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
