@@ -23,6 +23,7 @@ psycopg2-binary==2.9.9
 
 # ── Broker / execution ──────────────────────────────────────────────────────
 alpaca-trade-api
+alpha_vantage
 
 # ── Health check server ───────────────────────────────────────────────────────
 fastapi
