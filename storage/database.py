@@ -121,9 +121,9 @@ from config.settings import DB_PATH
 
 
 def _resolve_db_path(default: str = DB_PATH) -> str:
-    """Use a Railway persistent volume if /data exists, else fall back to local."""
+    """Use a Railway persistent volume if /data exists and is writable, else fall back."""
     railway_dir = "/data"
-    if os.path.isdir(railway_dir):
+    if os.path.isdir(railway_dir) and os.access(railway_dir, os.W_OK):
         return os.path.join(railway_dir, "news_trading.db")
     return default
 
