@@ -21,6 +21,9 @@ schedule
 # For local SQLite development it is optional.
 psycopg2-binary==2.9.9
 
+# ── Broker / execution ──────────────────────────────────────────────────────
+alpaca-trade-api
+
 # ── Health check server ───────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
