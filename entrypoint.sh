@@ -1,6 +1,9 @@
 #!/bin/sh
 # entrypoint.sh — Start Streamlit dashboard + daily scheduler.
-echo "[entrypoint] STREAMLIT_SERVER_PORT=$STREAMLIT_SERVER_PORT"
+# Railway injects $PORT at container runtime.
+
+export STREAMLIT_SERVER_PORT="${PORT:-8501}"
+echo "[entrypoint] Listening on port $STREAMLIT_SERVER_PORT"
 
 python3 -m scheduler.daily_runner 2>&1 &
 
