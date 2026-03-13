@@ -288,7 +288,11 @@ class SentimentAgent(BaseAgent):
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
+        if not message.content:
+            raise ValueError("Claude returned empty response content")
         text: str    = message.content[0].text.strip()
+        if not text:
+            raise ValueError("Claude returned empty text in response")
         result: dict = json.loads(text)
         result["score"]      = SCORE_MAP.get(result["sentiment"], 0)
         result["headline"]   = headline

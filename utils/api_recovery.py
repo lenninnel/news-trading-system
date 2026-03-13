@@ -40,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from datetime import datetime, timezone
@@ -56,7 +57,7 @@ SERVICE_CONFIGS: dict[str, dict] = {
         "max_delay":   300.0,
     },
     "anthropic": {
-        "max_retries": 2,
+        "max_retries": 3,
         "base_delay":  30.0,
         "max_delay":   120.0,
     },
@@ -245,12 +246,33 @@ class APIRecovery:
     _circuits_lock: threading.Lock            = threading.Lock()
     _db:            Any                       = None   # optional Database reference
 
+    # Per-service rate limiters (lazy-initialised)
+    _rate_limiters: dict[str, Any] = {}
+    _rate_limiters_lock: threading.Lock = threading.Lock()
+
     # -- Setup -----------------------------------------------------------------
 
     @classmethod
     def set_db(cls, db: Any) -> None:
         """Attach a Database instance; enables recovery_log persistence."""
         cls._db = db
+
+    @classmethod
+    def _get_rate_limiter(cls, service: str):
+        """Return a rate limiter for *service*, or None if not rate-limited."""
+        from utils.rate_limiter import TokenBucketRateLimiter
+        # Only rate-limit services that need it
+        _RATE_LIMITS: dict[str, int] = {
+            "anthropic": 40,  # 40 req/min (headroom below 50 API limit)
+        }
+        if service not in _RATE_LIMITS:
+            return None
+        with cls._rate_limiters_lock:
+            if service not in cls._rate_limiters:
+                cls._rate_limiters[service] = TokenBucketRateLimiter(
+                    max_per_minute=_RATE_LIMITS[service],
+                )
+            return cls._rate_limiters[service]
 
     @classmethod
     def get_circuit(cls, service: str) -> CircuitBreaker:
@@ -292,8 +314,10 @@ class APIRecovery:
 
     @staticmethod
     def _backoff(base: float, attempt: int, max_delay: float) -> float:
-        """Exponential backoff: base * 2^(attempt-1), capped at max_delay."""
-        return min(max_delay, base * (2 ** (attempt - 1)))
+        """Exponential backoff with jitter: base * 2^(attempt-1) ± 20%, capped."""
+        delay = min(max_delay, base * (2 ** (attempt - 1)))
+        jitter = delay * 0.2 * (2 * random.random() - 1)  # ±20%
+        return max(1.0, delay + jitter)
 
     # -- Core call method ------------------------------------------------------
 
@@ -349,9 +373,12 @@ class APIRecovery:
 
         last_exc: "Exception | None" = None
         t_start = time.monotonic()
+        rate_limiter = cls._get_rate_limiter(service)
 
         for attempt in range(1, max_r + 1):
             try:
+                if rate_limiter is not None:
+                    rate_limiter.acquire()
                 result = func(*args, **kwargs)
                 circuit.record_success()
                 elapsed_ms = int((time.monotonic() - t_start) * 1000)

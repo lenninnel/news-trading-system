@@ -503,7 +503,7 @@ class TestProgressTracking:
 class TestCLIArgs:
     def test_default_workers(self):
         args = _parse_args(["--now"])
-        assert args.workers == 5
+        assert args.workers == 3
 
     def test_custom_workers(self):
         args = _parse_args(["--now", "--workers", "8"])
