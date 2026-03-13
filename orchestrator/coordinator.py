@@ -44,7 +44,8 @@ from config.settings import BUY_THRESHOLD, SELL_THRESHOLD, SOURCE_WEIGHTS
 from data.events_feed import get_days_to_earnings
 from data.market_data import MarketData
 from data.news_feed import NewsFeed
-from data.social_feed import RedditFeed, StockTwitsFeed
+from data.marketaux_feed import MarketauxFeed
+from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed
 from execution.broker_factory import create_trader
 from storage.database import Database
 
@@ -98,6 +99,9 @@ class Coordinator:
         paper_trader=None,
         reddit_feed: RedditFeed | None = None,
         stocktwits_feed: StockTwitsFeed | None = None,
+        marketaux_feed: MarketauxFeed | None = None,
+        apewisdom_feed: ApeWisdomFeed | None = None,
+        adanos_feed: AdanosFeed | None = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -110,6 +114,9 @@ class Coordinator:
         self.paper_trader = paper_trader or create_trader(db=self.db)
         self.reddit_feed = reddit_feed or RedditFeed()
         self.stocktwits_feed = stocktwits_feed or StockTwitsFeed()
+        self.marketaux_feed = marketaux_feed or MarketauxFeed()
+        self.apewisdom_feed = apewisdom_feed or ApeWisdomFeed()
+        self.adanos_feed = adanos_feed or AdanosFeed()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -281,6 +288,27 @@ class Coordinator:
             items.append({"text": rd["text"], "source": "reddit"})
         if verbose:
             print(f"  Reddit: {len(reddit_items)} post(s)")
+
+        # Marketaux
+        marketaux_items = self.marketaux_feed.fetch(ticker)
+        for mx in marketaux_items:
+            items.append({"text": mx["text"], "source": "marketaux"})
+        if verbose:
+            print(f"  Marketaux: {len(marketaux_items)} article(s)")
+
+        # ApeWisdom
+        apewisdom_items = self.apewisdom_feed.fetch(ticker)
+        for aw in apewisdom_items:
+            items.append({"text": aw["text"], "source": "apewisdom"})
+        if verbose:
+            print(f"  ApeWisdom: {len(apewisdom_items)} mention(s)")
+
+        # Adanos
+        adanos_items = self.adanos_feed.fetch(ticker)
+        for ad in adanos_items:
+            items.append({"text": ad["text"], "source": "adanos"})
+        if verbose:
+            print(f"  Adanos: {len(adanos_items)} signal(s)")
             print(f"  Total: {len(items)} item(s)\n")
 
         # Step 3 — sentiment scoring
@@ -556,6 +584,15 @@ class Coordinator:
             reddit_items = await asyncio.to_thread(
                 self.reddit_feed.fetch, ticker,
             )
+            marketaux_items = await asyncio.to_thread(
+                self.marketaux_feed.fetch, ticker,
+            )
+            apewisdom_items = await asyncio.to_thread(
+                self.apewisdom_feed.fetch, ticker,
+            )
+            adanos_items = await asyncio.to_thread(
+                self.adanos_feed.fetch, ticker,
+            )
 
         # Build items list
         items: list[dict] = []
@@ -565,6 +602,12 @@ class Coordinator:
             items.append({"text": st_item["text"], "source": "stocktwits"})
         for rd in reddit_items:
             items.append({"text": rd["text"], "source": "reddit"})
+        for mx in marketaux_items:
+            items.append({"text": mx["text"], "source": "marketaux"})
+        for aw in apewisdom_items:
+            items.append({"text": aw["text"], "source": "apewisdom"})
+        for ad in adanos_items:
+            items.append({"text": ad["text"], "source": "adanos"})
 
         # ── Phase 2: Sentiment scoring (Claude API) ────────────────────
         scored: list[dict] = []

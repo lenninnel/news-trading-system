@@ -19,6 +19,7 @@ import time
 import requests
 
 from config.settings import (
+    ADANOS_API_KEY,
     MAX_HEADLINES,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
@@ -175,3 +176,150 @@ class StockTwitsFeed:
                 "stocktwits_sentiment": st_sentiment,
             })
         return results
+
+
+# ===========================================================================
+# ApeWisdom — Reddit mention leaderboard (no API key required)
+# ===========================================================================
+
+_APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/all-stocks"
+_APEWISDOM_CACHE_TTL = 3600  # 1 hour in seconds
+
+_apewisdom_cache: dict = {"data": [], "fetched_at": 0.0}
+
+
+def clear_apewisdom_cache() -> None:
+    """Reset the module-level ApeWisdom leaderboard cache."""
+    _apewisdom_cache["data"] = []
+    _apewisdom_cache["fetched_at"] = 0.0
+
+
+class ApeWisdomFeed:
+    """
+    Fetches Reddit mention data for a ticker from the ApeWisdom leaderboard.
+
+    Returns a list of dicts with keys: text, source, mentions, rank, rank_24h_ago.
+    The full leaderboard is cached for 1 hour to avoid excessive requests.
+    """
+
+    def fetch(self, ticker: str) -> list[dict]:
+        """
+        Look up *ticker* on the ApeWisdom all-stocks leaderboard.
+
+        Args:
+            ticker: Stock ticker symbol (e.g. "AAPL").
+
+        Returns:
+            Single-element list with mention data, or ``[]`` if the ticker
+            is not on the leaderboard or an error occurs.
+        """
+        try:
+            results = self._get_leaderboard()
+        except Exception as exc:
+            logger.warning("ApeWisdom fetch failed: %s", exc)
+            return []
+
+        ticker_upper = ticker.upper()
+        for entry in results:
+            if entry.get("ticker", "").upper() == ticker_upper:
+                mentions = entry.get("mentions", 0)
+                rank = entry.get("rank", 0)
+                rank_24h_ago = entry.get("rank_24h_ago", 0)
+                return [{
+                    "text": (
+                        f"{ticker_upper} has {mentions} Reddit mentions "
+                        f"(rank #{rank}, was #{rank_24h_ago})"
+                    ),
+                    "source": "apewisdom",
+                    "mentions": mentions,
+                    "rank": rank,
+                    "rank_24h_ago": rank_24h_ago,
+                }]
+
+        return []
+
+    def _get_leaderboard(self) -> list[dict]:
+        """Return the cached leaderboard, refreshing if stale."""
+        now = time.time()
+        if (
+            _apewisdom_cache["data"]
+            and (now - _apewisdom_cache["fetched_at"]) < _APEWISDOM_CACHE_TTL
+        ):
+            return _apewisdom_cache["data"]
+
+        resp = requests.get(_APEWISDOM_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+
+        _apewisdom_cache["data"] = results
+        _apewisdom_cache["fetched_at"] = now
+        return results
+
+
+# ===========================================================================
+# Adanos — AI-powered social sentiment (API key required, 250 req/month)
+# ===========================================================================
+
+_ADANOS_URL = "https://adanos.org/api/v1/sentiment?ticker={ticker}"
+
+
+class AdanosFeed:
+    """
+    Fetches AI-driven social sentiment for a ticker from the Adanos API.
+
+    Returns a list of dicts with keys: text, source, adanos_bullish, adanos_buzz.
+    Requires ``ADANOS_API_KEY`` to be set.  Free tier allows 250 requests per month;
+    once a 429 is received the feed disables itself for the rest of the session.
+    """
+
+    _request_count: int = 0
+    _quota_exhausted: bool = False
+
+    def fetch(self, ticker: str) -> list[dict]:
+        """
+        Fetch Adanos sentiment for *ticker*.
+
+        Returns an empty list when the API key is missing, the quota is
+        exhausted, or an error occurs.
+        """
+        if not ADANOS_API_KEY:
+            return []
+
+        if AdanosFeed._quota_exhausted:
+            return []
+
+        url = _ADANOS_URL.format(ticker=ticker.upper())
+        headers = {"X-API-Key": ADANOS_API_KEY}
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            AdanosFeed._request_count += 1
+
+            if resp.status_code == 429:
+                AdanosFeed._quota_exhausted = True
+                logger.warning(
+                    "Adanos API quota exhausted (429) after %d requests",
+                    AdanosFeed._request_count,
+                )
+                return []
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            bullish_pct = data.get("bullish_pct", 0.0)
+            buzz = data.get("buzz", 0)
+
+            return [{
+                "text": (
+                    f"{ticker.upper()} X sentiment: "
+                    f"{bullish_pct:.0%} bullish, buzz score {buzz}"
+                ),
+                "source": "adanos",
+                "adanos_bullish": bullish_pct,
+                "adanos_buzz": buzz,
+            }]
+
+        except Exception as exc:
+            logger.warning("Adanos fetch failed: %s", exc)
+            return []

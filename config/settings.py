@@ -20,6 +20,9 @@ ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 REDDIT_CLIENT_ID: str = os.environ.get("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET: str = os.environ.get("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT: str = os.environ.get("REDDIT_USER_AGENT", "news-trading-bot/1.0")
+MARKETAUX_API_TOKEN: str = os.environ.get("MARKETAUX_API_TOKEN", "")
+ADANOS_API_KEY: str = os.environ.get("ADANOS_API_KEY", "")
+FRED_API_KEY: str = os.environ.get("FRED_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Claude model
@@ -53,8 +56,17 @@ SELL_THRESHOLD: float = -0.3
 
 SOURCE_WEIGHTS: dict[str, float] = {
     "newsapi": 1.0,
+    "marketaux": 0.9,
     "stocktwits": 0.8,
     "reddit": 0.6,
+    "adanos": 0.5,
+    "apewisdom": 0.4,
+}
+
+# Known crypto tickers (used to route to Binance instead of yfinance)
+CRYPTO_TICKERS: set[str] = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVAX",
+    "MATIC", "LINK", "UNI", "ATOM", "LTC", "FIL", "NEAR", "APT", "ARB",
 }
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,9 @@ psycopg2-binary==2.9.9
 alpaca-trade-api
 alpha_vantage==2.3.1
 
+# ── Macro data ───────────────────────────────────────────────────────────────
+fredapi
+
 # ── Health check server ───────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
