@@ -23,6 +23,8 @@ from typing import Any
 
 import yfinance as yf
 
+from config.settings import CRYPTO_TICKERS
+
 logger = logging.getLogger(__name__)
 
 # ── Module-level cache with 4-hour TTL ────────────────────────────────────
@@ -59,6 +61,10 @@ def get_earnings_date(ticker: str) -> "date | None":
         A datetime.date or None if yfinance has no earnings data.
     """
     ticker = ticker.upper()
+
+    # Crypto tickers don't have earnings dates
+    if ticker in CRYPTO_TICKERS:
+        return None
 
     if _is_cache_valid(ticker):
         return _cache[ticker]["earnings_date"]

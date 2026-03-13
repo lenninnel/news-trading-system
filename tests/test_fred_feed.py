@@ -43,6 +43,7 @@ class TestFredFeed:
 
     # ── No API key ────────────────────────────────────────────────────────
 
+    @patch("config.settings.FRED_API_KEY", "")
     def test_no_api_key_returns_none(self) -> None:
         """Empty API key should return None without making any requests."""
         feed = FredFeed(api_key="")

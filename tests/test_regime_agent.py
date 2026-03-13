@@ -86,55 +86,72 @@ def _mock_yf(
     return mock
 
 
+def _noop_fear_greed():
+    """Stub that returns None — prevents real API calls in tests."""
+    return None
+
+
+class _NoopFred:
+    """Stub FredFeed that returns None — prevents real API calls in tests."""
+    def get_macro_regime(self):
+        return None
+
+
+def _agent(yf_mock=None, **yf_kwargs):
+    """Create a RegimeAgent with mocked yfinance and no-op macro feeds."""
+    yf = yf_mock if yf_mock is not None else _mock_yf(**yf_kwargs)
+    return RegimeAgent(
+        _yf=yf,
+        _fear_greed_fn=_noop_fear_greed,
+        _fred_feed=_NoopFred(),
+    )
+
+
 # ── Regime classification tests ──────────────────────────────────────
 
 class TestRegimeClassification:
 
     def test_trending_bull(self):
-        agent = RegimeAgent(_yf=_mock_yf(sma50_above_sma200=True, vix_level=18))
+        agent = _agent(sma50_above_sma200=True, vix_level=18)
         result = agent.run()
         assert result["regime"] == "TRENDING_BULL"
         assert result["sma50"] > result["sma200"]
         assert result["cached"] is False
 
     def test_trending_bear(self):
-        agent = RegimeAgent(_yf=_mock_yf(sma50_above_sma200=False, vix_level=18))
+        agent = _agent(sma50_above_sma200=False, vix_level=18)
         result = agent.run()
         assert result["regime"] == "TRENDING_BEAR"
         assert result["sma50"] < result["sma200"]
 
     def test_high_vol_via_vix(self):
-        agent = RegimeAgent(_yf=_mock_yf(sma50_above_sma200=True, vix_level=35))
+        agent = _agent(sma50_above_sma200=True, vix_level=35)
         result = agent.run()
         assert result["regime"] == "HIGH_VOL"
         assert result["vix"] == 35.0
 
     def test_high_vol_via_realised_vol(self):
-        agent = RegimeAgent(_yf=_mock_yf(
-            sma50_above_sma200=True, high_vol=True, vix_level=18,
-        ))
+        agent = _agent(sma50_above_sma200=True, high_vol=True, vix_level=18)
         result = agent.run()
         assert result["regime"] == "HIGH_VOL"
         assert result["realised_vol"] > 0.25
 
     def test_high_vol_priority_over_bull_trend(self):
         """HIGH_VOL should override TRENDING_BULL even when SMA50 > SMA200."""
-        agent = RegimeAgent(_yf=_mock_yf(sma50_above_sma200=True, vix_level=35))
+        agent = _agent(sma50_above_sma200=True, vix_level=35)
         result = agent.run()
         assert result["regime"] == "HIGH_VOL"
         assert result["sma50"] > result["sma200"]  # would be TRENDING_BULL
 
     def test_high_vol_priority_over_bear_trend(self):
         """HIGH_VOL should override TRENDING_BEAR."""
-        agent = RegimeAgent(_yf=_mock_yf(sma50_above_sma200=False, vix_level=35))
+        agent = _agent(sma50_above_sma200=False, vix_level=35)
         result = agent.run()
         assert result["regime"] == "HIGH_VOL"
 
     def test_vix_fallback_when_unavailable(self):
         """When VIX download fails, regime is based on realised vol only."""
-        agent = RegimeAgent(_yf=_mock_yf(
-            sma50_above_sma200=True, vix_fails=True, vix_level=0,
-        ))
+        agent = _agent(sma50_above_sma200=True, vix_fails=True, vix_level=0)
         result = agent.run()
         assert result["vix"] is None
         # Low-vol uptrend → TRENDING_BULL
@@ -159,7 +176,7 @@ class TestRegimeClassification:
             return original_dl(ticker, **kwargs)
         yf.download = patched
 
-        agent = RegimeAgent(_yf=yf)
+        agent = _agent(yf_mock=yf)
         result = agent.run()
         # SMA50 ≈ SMA200 for flat data, could be equal
         # With tiny noise either RANGING or one of the TRENDING (marginal)
@@ -172,8 +189,7 @@ class TestRegimeClassification:
 class TestRegimeCache:
 
     def test_second_call_uses_cache(self):
-        yf = _mock_yf()
-        agent = RegimeAgent(_yf=yf)
+        agent = _agent()
 
         r1 = agent.run()
         assert r1["cached"] is False
@@ -183,8 +199,7 @@ class TestRegimeCache:
         assert r2["regime"] == r1["regime"]
 
     def test_cache_expires(self):
-        yf = _mock_yf()
-        agent = RegimeAgent(_yf=yf)
+        agent = _agent()
 
         r1 = agent.run()
         assert r1["cached"] is False
@@ -196,7 +211,7 @@ class TestRegimeCache:
         assert r2["cached"] is False
 
     def test_cache_preserves_all_fields(self):
-        agent = RegimeAgent(_yf=_mock_yf())
+        agent = _agent()
         r1 = agent.run()
         r2 = agent.run()
         for key in ("regime", "vix", "realised_vol", "sma50", "sma200"):

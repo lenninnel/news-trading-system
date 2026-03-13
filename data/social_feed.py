@@ -20,6 +20,7 @@ import requests
 
 from config.settings import (
     ADANOS_API_KEY,
+    CRYPTO_TICKERS,
     MAX_HEADLINES,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
@@ -258,19 +259,25 @@ class ApeWisdomFeed:
 
 
 # ===========================================================================
-# Adanos — AI-powered social sentiment (API key required, 250 req/month)
+# Adanos — Reddit + X stock sentiment (API key required)
 # ===========================================================================
 
-_ADANOS_URL = "https://adanos.org/api/v1/sentiment?ticker={ticker}"
+_ADANOS_STOCK_URLS = [
+    ("Reddit", "https://api.adanos.org/reddit/stocks/v1/stock/{ticker}?days=1"),
+    ("X", "https://api.adanos.org/x/stocks/v1/stock/{ticker}?days=1"),
+]
+_ADANOS_CRYPTO_URLS = [
+    ("Reddit", "https://api.adanos.org/reddit/crypto/v1/token/{ticker}?days=1"),
+]
 
 
 class AdanosFeed:
     """
-    Fetches AI-driven social sentiment for a ticker from the Adanos API.
+    Fetches social sentiment for a ticker from the Adanos API (Reddit + X).
 
-    Returns a list of dicts with keys: text, source, adanos_bullish, adanos_buzz.
-    Requires ``ADANOS_API_KEY`` to be set.  Free tier allows 250 requests per month;
-    once a 429 is received the feed disables itself for the rest of the session.
+    Returns a list of dicts with keys: text, source, adanos_bullish, adanos_buzz,
+    adanos_sentiment.  Requires ``ADANOS_API_KEY`` to be set.  Once a 429 is
+    received the feed disables itself for the rest of the session.
     """
 
     _request_count: int = 0
@@ -278,7 +285,7 @@ class AdanosFeed:
 
     def fetch(self, ticker: str) -> list[dict]:
         """
-        Fetch Adanos sentiment for *ticker*.
+        Fetch Adanos sentiment for *ticker* from Reddit and X endpoints.
 
         Returns an empty list when the API key is missing, the quota is
         exhausted, or an error occurs.
@@ -289,37 +296,57 @@ class AdanosFeed:
         if AdanosFeed._quota_exhausted:
             return []
 
-        url = _ADANOS_URL.format(ticker=ticker.upper())
-        headers = {"X-API-Key": ADANOS_API_KEY}
+        ticker_upper = ticker.upper()
+        headers = {
+            "X-API-Key": ADANOS_API_KEY,
+            "Accept": "application/json",
+        }
 
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            AdanosFeed._request_count += 1
+        endpoints = (
+            _ADANOS_CRYPTO_URLS
+            if ticker_upper in CRYPTO_TICKERS
+            else _ADANOS_STOCK_URLS
+        )
 
-            if resp.status_code == 429:
-                AdanosFeed._quota_exhausted = True
-                logger.warning(
-                    "Adanos API quota exhausted (429) after %d requests",
-                    AdanosFeed._request_count,
-                )
-                return []
+        results: list[dict] = []
+        for label, url_tpl in endpoints:
+            try:
+                url = url_tpl.format(ticker=ticker_upper)
+                resp = requests.get(url, headers=headers, timeout=10)
+                AdanosFeed._request_count += 1
 
-            resp.raise_for_status()
-            data = resp.json()
+                if resp.status_code == 429:
+                    AdanosFeed._quota_exhausted = True
+                    logger.warning(
+                        "Adanos API quota exhausted (429) after %d requests",
+                        AdanosFeed._request_count,
+                    )
+                    return results  # return whatever we collected so far
 
-            bullish_pct = data.get("bullish_pct", 0.0)
-            buzz = data.get("buzz", 0)
+                resp.raise_for_status()
+                data = resp.json()
 
-            return [{
-                "text": (
-                    f"{ticker.upper()} X sentiment: "
-                    f"{bullish_pct:.0%} bullish, buzz score {buzz}"
-                ),
-                "source": "adanos",
-                "adanos_bullish": bullish_pct,
-                "adanos_buzz": buzz,
-            }]
+                if not data.get("found", False):
+                    continue
 
-        except Exception as exc:
-            logger.warning("Adanos fetch failed: %s", exc)
-            return []
+                bullish_pct = data.get("bullish_pct", 0)
+                buzz = data.get("buzz_score", 0)
+                sentiment = data.get("sentiment_score", 0.0)
+                mentions = data.get("total_mentions", 0)
+
+                results.append({
+                    "text": (
+                        f"{ticker_upper} {label} sentiment: "
+                        f"{bullish_pct}% bullish, {mentions} mentions, "
+                        f"buzz {buzz:.1f}"
+                    ),
+                    "source": "adanos",
+                    "adanos_bullish": bullish_pct,
+                    "adanos_buzz": buzz,
+                    "adanos_sentiment": sentiment,
+                })
+
+            except Exception as exc:
+                logger.warning("Adanos %s fetch failed for %s: %s", label, ticker_upper, exc)
+
+        return results

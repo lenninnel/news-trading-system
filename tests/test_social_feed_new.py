@@ -166,26 +166,45 @@ class TestAdanosFeed:
 
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
-    def test_happy_path(self, mock_get):
+    def test_happy_path_both_endpoints(self, mock_get):
         mock_get.return_value = self._mock_response({
             "ticker": "AAPL",
-            "buzz": 85,
-            "bullish_pct": 0.65,
-            "bearish_pct": 0.35,
+            "found": True,
+            "buzz_score": 85.0,
+            "bullish_pct": 65,
+            "sentiment_score": 0.07,
+            "total_mentions": 120,
         })
         feed = AdanosFeed()
         results = feed.fetch("AAPL")
 
-        assert len(results) == 1
-        assert results[0]["source"] == "adanos"
-        assert results[0]["adanos_bullish"] == 0.65
-        assert results[0]["adanos_buzz"] == 85
+        # Two results — one from Reddit endpoint, one from X endpoint
+        assert len(results) == 2
+        assert all(r["source"] == "adanos" for r in results)
+        assert results[0]["adanos_bullish"] == 65
+        assert results[0]["adanos_buzz"] == 85.0
+        assert results[0]["adanos_sentiment"] == 0.07
         assert "65% bullish" in results[0]["text"]
-        assert "buzz score 85" in results[0]["text"]
+        assert "Reddit" in results[0]["text"]
+        assert "X" in results[1]["text"]
 
         # Verify API key header was sent
         call_kwargs = mock_get.call_args
         assert call_kwargs.kwargs["headers"]["X-API-Key"] == "test-key-123"
+        # Two endpoints called
+        assert mock_get.call_count == 2
+
+    @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
+    @patch("data.social_feed.requests.get")
+    def test_ticker_not_found_returns_empty(self, mock_get):
+        mock_get.return_value = self._mock_response({
+            "ticker": "ZZZZ",
+            "found": False,
+        })
+        feed = AdanosFeed()
+        results = feed.fetch("ZZZZ")
+
+        assert results == []
 
     @patch("data.social_feed.ADANOS_API_KEY", "")
     @patch("data.social_feed.requests.get")
@@ -219,7 +238,7 @@ class TestAdanosFeed:
 
         feed = AdanosFeed()
 
-        # First call triggers 429
+        # First call triggers 429 on the first endpoint
         feed.fetch("AAPL")
         assert mock_get.call_count == 1
 
@@ -252,20 +271,23 @@ class TestAdanosFeed:
 
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
-    def test_request_count_increments(self, mock_get):
+    def test_request_count_increments_per_endpoint(self, mock_get):
         mock_get.return_value = self._mock_response({
             "ticker": "AAPL",
-            "buzz": 50,
-            "bullish_pct": 0.5,
-            "bearish_pct": 0.5,
+            "found": True,
+            "buzz_score": 50,
+            "bullish_pct": 50,
+            "sentiment_score": 0.0,
+            "total_mentions": 10,
         })
         feed = AdanosFeed()
 
         feed.fetch("AAPL")
-        assert AdanosFeed._request_count == 1
+        # 2 endpoints per fetch call
+        assert AdanosFeed._request_count == 2
 
         feed.fetch("TSLA")
-        assert AdanosFeed._request_count == 2
+        assert AdanosFeed._request_count == 4
 
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
@@ -277,7 +299,7 @@ class TestAdanosFeed:
         feed = AdanosFeed()
 
         with patch("data.social_feed.logger") as mock_logger:
-            feed.fetch("AAPL")  # triggers 429
+            feed.fetch("AAPL")  # triggers 429 on first endpoint
             feed.fetch("TSLA")  # skipped (quota exhausted)
             feed.fetch("MSFT")  # skipped (quota exhausted)
 

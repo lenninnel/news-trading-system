@@ -36,6 +36,8 @@ import ta
 import yfinance as yf
 
 from agents.base_agent import BaseAgent
+from config.settings import CRYPTO_TICKERS
+from data.binance_feed import BinanceFeed
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -64,15 +66,17 @@ class TechnicalAgent(BaseAgent):
     # Enough history for SMA-50 and indicator warm-up
     _DOWNLOAD_PERIOD = "3mo"
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Database | None = None, binance_feed: BinanceFeed | None = None) -> None:
         """
         Initialise the agent.
 
         Args:
             db: Optional Database instance for dependency injection.
                 A new instance is created automatically when omitted.
+            binance_feed: Optional BinanceFeed for crypto OHLCV data.
         """
         self._db = db or Database()
+        self._binance = binance_feed or BinanceFeed()
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -145,10 +149,15 @@ class TechnicalAgent(BaseAgent):
     def _fetch_history(self, ticker: str) -> pd.DataFrame:
         """Download OHLCV data and validate the result.
 
-        On an empty result that may be caused by a stale crumb/cookie,
-        the yfinance session cache is cleared and the download is retried
-        once before raising.
+        Crypto tickers are routed to Binance.  All others use yfinance
+        with a crumb-error retry.
         """
+        if ticker.upper() in CRYPTO_TICKERS:
+            df = self._binance.get_ohlcv(ticker)
+            if df is not None and not df.empty:
+                return df
+            raise ValueError(f"No Binance data returned for crypto ticker '{ticker}'")
+
         df = self._download_once(ticker)
         if df.empty:
             # Empty result may indicate a crumb error (yfinance swallows
