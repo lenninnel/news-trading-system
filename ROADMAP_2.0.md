@@ -25,13 +25,20 @@
 
 ---
 
-## Intelligence
+## Phase 5 — Intelligence Layer
+*Replace rule-based fusion with learned models. Needs trade history from Phase 4.*
 
-- [ ] **ML signal fusion** (replace rule-based with XGBoost trained on trade history)
-- [ ] **Multi-timeframe analysis** (confirm signals across 1D + 4H)
-- [ ] **Insider trading signals** (SEC Form 4 via OpenInsider, free)
-- [ ] **Options flow** via Unusual Whales (~€45/month)
-- [ ] **Quiver Quantitative** ($25/month — congressional trading, lobbying data)
+- [ ] **ML signal fusion** — XGBoost trained on accumulated trade history, retrained weekly
+- [ ] **Walk-forward optimisation** dashboard page (visual parameter heatmaps)
+- [ ] **Options flow** via Unusual Whales (~€45/month — informed positioning signals)
+- [ ] **WebSocket real-time feeds** — intraday signals, not just 09:30 daily run
+- [ ] **TradingView strategy import workflow**
+  - Design strategies visually in TradingView using Pine Script
+  - Export chart data (CSV) from TradingView
+  - Claude Code converts Pine Script logic → Python
+  - Run through existing backtest/engine.py + optimizer.py
+  - Deploy winning strategies to live system
+  - *Requires TradingView subscription (already have it)*
 
 ---
 
