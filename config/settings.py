@@ -23,6 +23,7 @@ REDDIT_USER_AGENT: str = os.environ.get("REDDIT_USER_AGENT", "news-trading-bot/1
 MARKETAUX_API_TOKEN: str = os.environ.get("MARKETAUX_API_TOKEN", "")
 ADANOS_API_KEY: str = os.environ.get("ADANOS_API_KEY", "")
 FRED_API_KEY: str = os.environ.get("FRED_API_KEY", "")
+EODHD_API_TOKEN: str = os.environ.get("EODHD_API_TOKEN", "")
 
 # ---------------------------------------------------------------------------
 # Claude model
@@ -74,6 +75,40 @@ CRYPTO_TICKERS: set[str] = {
 # ---------------------------------------------------------------------------
 
 DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
+
+# ---------------------------------------------------------------------------
+# German / EU ticker lists (used to route to EODHD)
+# ---------------------------------------------------------------------------
+
+DAX_TICKERS: list[str] = [
+    "SAP.XETRA", "SIE.XETRA", "ALV.XETRA", "MUV2.XETRA", "BMW.XETRA",
+    "VOW3.XETRA", "MBG.XETRA", "DTE.XETRA", "BAYN.XETRA", "BAS.XETRA",
+    "ADS.XETRA", "RWE.XETRA", "EOAN.XETRA", "DBK.XETRA", "IFX.XETRA",
+    "DHL.XETRA", "DB1.XETRA", "LIN.XETRA", "MRK.XETRA", "HEI.XETRA",
+    "HEN3.XETRA", "FRE.XETRA", "ZAL.XETRA", "CON.XETRA", "VNA.XETRA",
+    "RHM.XETRA", "AIR.XETRA", "PAH3.XETRA", "P911.XETRA", "BNR.XETRA",
+    "MTX.XETRA", "SRT3.XETRA", "DHER.XETRA", "FME.XETRA", "CBK.XETRA",
+    "HNR1.XETRA", "ENR.XETRA", "SHL.XETRA", "EVK.XETRA", "SY1.XETRA",
+]
+
+MDAX_TICKERS: list[str] = [
+    "AFX.XETRA", "AIXA.XETRA", "BC8.XETRA", "BOSS.XETRA", "DWS.XETRA",
+    "EVD.XETRA", "FNTN.XETRA", "GBF.XETRA", "HOT.XETRA", "LEG.XETRA",
+    "MLP.XETRA", "NDX1.XETRA", "PSM.XETRA", "PUM.XETRA", "QIA.XETRA",
+    "TAG.XETRA", "TUI1.XETRA", "WCHA.XETRA", "O2D.XETRA", "SDF.XETRA",
+    "RDC.XETRA", "VBK.XETRA", "LHA.XETRA", "TKA.XETRA", "UTDI.XETRA",
+]
+
+# All known German tickers (union of DAX + MDAX)
+_GERMAN_TICKERS_SET: set[str] = set(DAX_TICKERS) | set(MDAX_TICKERS)
+
+
+def is_german_ticker(ticker: str) -> bool:
+    """Return True if *ticker* should be routed to EODHD (German/EU stock)."""
+    t = ticker.upper()
+    if t.endswith(".XETRA") or t.endswith(".DE"):
+        return True
+    return t in _GERMAN_TICKERS_SET
 
 
 # ---------------------------------------------------------------------------

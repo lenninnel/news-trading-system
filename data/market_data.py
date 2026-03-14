@@ -2,7 +2,11 @@
 Market data source.
 
 MarketData fetches current price and basic fundamental information for a
-ticker symbol using the yfinance library, which wraps the Yahoo Finance API.
+ticker symbol.  Data sources are routed by ticker type:
+
+  - Crypto (BTC, ETH, …) → Binance
+  - German / EU (.XETRA, .DE) → EODHD (fallback: yfinance)
+  - Everything else → yfinance
 
 On a 401 "Invalid Crumb" error the yfinance JSON cache is cleared and the
 request is retried once with a fresh Ticker object.  If the retry also
@@ -14,10 +18,12 @@ Requires:
 
 import logging
 
+import pandas as pd
 import yfinance as yf
 
-from config.settings import CRYPTO_TICKERS
+from config.settings import CRYPTO_TICKERS, is_german_ticker
 from data.binance_feed import BinanceFeed
+from data.eodhd_feed import EODHDFeed
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +64,10 @@ class MarketData:
     """
     Fetches current market data for a given ticker.
 
-    For crypto tickers (BTC, ETH, …) the Binance API is used directly.
-    For everything else yfinance is used with a crumb-error retry.
+    Routing:
+      - Crypto tickers (BTC, ETH, …) → Binance API
+      - German/EU tickers (.XETRA, .DE) → EODHD API (fallback: yfinance)
+      - All others → yfinance
 
     Example::
 
@@ -68,15 +76,18 @@ class MarketData:
         # {"ticker": "AAPL", "name": "Apple Inc.", "price": 189.30, ...}
     """
 
-    def __init__(self, *, binance_feed: BinanceFeed | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        binance_feed: BinanceFeed | None = None,
+        eodhd_feed: EODHDFeed | None = None,
+    ) -> None:
         self._binance = binance_feed or BinanceFeed()
+        self._eodhd = eodhd_feed or EODHDFeed()
 
     def fetch(self, ticker: str) -> dict:
         """
         Retrieve current market data for *ticker*.
-
-        Crypto tickers are routed to Binance.  All others use yfinance
-        with a crumb-error retry.
 
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL") or crypto (e.g. "BTC").
@@ -86,6 +97,9 @@ class MarketData:
         """
         if ticker.upper() in CRYPTO_TICKERS:
             return self._fetch_crypto(ticker.upper())
+
+        if is_german_ticker(ticker):
+            return self._fetch_german(ticker)
 
         try:
             return self._fetch_once(ticker)
@@ -113,6 +127,73 @@ class MarketData:
                     "currency": "USD",
                     "market_cap": None,
                 }
+
+    def get_intraday(
+        self, ticker: str, interval: str = "5m"
+    ) -> pd.DataFrame | None:
+        """
+        Fetch intraday OHLCV data.
+
+        Routes to EODHD for stocks, Binance klines for crypto.
+
+        Args:
+            ticker:   Ticker symbol.
+            interval: Bar interval — "1m", "5m", or "1h".
+
+        Returns:
+            DataFrame with OHLCV columns, or None.
+        """
+        if ticker.upper() in CRYPTO_TICKERS:
+            # Binance klines: map interval to Binance format
+            binance_interval_map = {"1m": "1m", "5m": "5m", "1h": "1h"}
+            bi = binance_interval_map.get(interval, "5m")
+            return self._binance.get_ohlcv(ticker.upper(), limit=100)
+
+        if is_german_ticker(ticker) and self._eodhd.available:
+            return self._eodhd.get_ohlcv_intraday(ticker, interval=interval)
+
+        # For US stocks, try EODHD if available, otherwise skip
+        if self._eodhd.available:
+            return self._eodhd.get_ohlcv_intraday(ticker, interval=interval)
+
+        return None
+
+    def _fetch_german(self, ticker: str) -> dict:
+        """Fetch German/EU stock data via EODHD, falling back to yfinance."""
+        if self._eodhd.available:
+            price = self._eodhd.get_price(ticker)
+            if price is not None:
+                return {
+                    "ticker": ticker,
+                    "name": ticker.split(".")[0],
+                    "price": price,
+                    "currency": "EUR",
+                    "market_cap": None,
+                }
+            logger.warning(
+                "EODHD price unavailable for %s — falling back to yfinance",
+                ticker,
+            )
+
+        # Fallback: convert .XETRA to .DE for yfinance compatibility
+        yf_ticker = ticker
+        if ticker.upper().endswith(".XETRA"):
+            yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+
+        try:
+            return self._fetch_once(yf_ticker)
+        except Exception:
+            logger.warning(
+                "yfinance fallback also failed for %s — returning fallback",
+                ticker,
+            )
+            return {
+                "ticker": ticker,
+                "name": "N/A",
+                "price": None,
+                "currency": "EUR",
+                "market_cap": None,
+            }
 
     def _fetch_crypto(self, ticker: str) -> dict:
         """Fetch crypto market data from Binance."""

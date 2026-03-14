@@ -6,6 +6,11 @@ SMA-20, SMA-50, Bollinger Bands, and volume/momentum indicators via the
 ``ta`` library, then applies deterministic signal rules to produce
 BUY / SELL / HOLD.
 
+Data source routing:
+    - Crypto tickers → Binance
+    - German/EU tickers (.XETRA, .DE) → EODHD (fallback: yfinance)
+    - All others → yfinance
+
 Signal rules (any matching condition triggers the signal):
     BUY  — RSI < 30 (oversold)
            OR MACD line crosses above signal line (bullish crossover)
@@ -36,8 +41,9 @@ import ta
 import yfinance as yf
 
 from agents.base_agent import BaseAgent
-from config.settings import CRYPTO_TICKERS
+from config.settings import CRYPTO_TICKERS, is_german_ticker
 from data.binance_feed import BinanceFeed
+from data.eodhd_feed import EODHDFeed
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -66,17 +72,15 @@ class TechnicalAgent(BaseAgent):
     # Enough history for SMA-50 and indicator warm-up
     _DOWNLOAD_PERIOD = "3mo"
 
-    def __init__(self, db: Database | None = None, binance_feed: BinanceFeed | None = None) -> None:
-        """
-        Initialise the agent.
-
-        Args:
-            db: Optional Database instance for dependency injection.
-                A new instance is created automatically when omitted.
-            binance_feed: Optional BinanceFeed for crypto OHLCV data.
-        """
+    def __init__(
+        self,
+        db: Database | None = None,
+        binance_feed: BinanceFeed | None = None,
+        eodhd_feed: EODHDFeed | None = None,
+    ) -> None:
         self._db = db or Database()
         self._binance = binance_feed or BinanceFeed()
+        self._eodhd = eodhd_feed or EODHDFeed()
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -119,7 +123,12 @@ class TechnicalAgent(BaseAgent):
         # -- 4. Volume confirmation -----------------------------------------
         volume_confirmed = self._check_volume_confirmation(signal, indicators)
 
-        # -- 5. Persist to database -----------------------------------------
+        # -- 5. Intraday supplement (optional) ------------------------------
+        intraday_note = self._intraday_supplement(ticker)
+        if intraday_note:
+            reasoning.append(intraday_note)
+
+        # -- 6. Persist to database -----------------------------------------
         signal_id = self._db.log_technical_signal(
             ticker=ticker,
             signal=signal,
@@ -149,8 +158,8 @@ class TechnicalAgent(BaseAgent):
     def _fetch_history(self, ticker: str) -> pd.DataFrame:
         """Download OHLCV data and validate the result.
 
-        Crypto tickers are routed to Binance.  All others use yfinance
-        with a crumb-error retry.
+        Crypto tickers are routed to Binance.  German/EU tickers are
+        routed to EODHD with yfinance fallback.  All others use yfinance.
         """
         if ticker.upper() in CRYPTO_TICKERS:
             df = self._binance.get_ohlcv(ticker)
@@ -158,11 +167,11 @@ class TechnicalAgent(BaseAgent):
                 return df
             raise ValueError(f"No Binance data returned for crypto ticker '{ticker}'")
 
+        if is_german_ticker(ticker):
+            return self._fetch_german_history(ticker)
+
         df = self._download_once(ticker)
         if df.empty:
-            # Empty result may indicate a crumb error (yfinance swallows
-            # the 401 and returns an empty DataFrame).  Clear the session
-            # cache and retry once.
             logger.warning(
                 "yfinance returned empty data for %s — "
                 "resetting session cache and retrying",
@@ -173,6 +182,25 @@ class TechnicalAgent(BaseAgent):
             df = self._download_once(ticker)
             if df.empty:
                 raise ValueError(f"No price data returned for ticker '{ticker}'")
+        return df
+
+    def _fetch_german_history(self, ticker: str) -> pd.DataFrame:
+        """Fetch OHLCV for a German ticker via EODHD, falling back to yfinance."""
+        if self._eodhd.available:
+            df = self._eodhd.get_ohlcv_daily(ticker)
+            if df is not None and not df.empty:
+                logger.info("Using EODHD daily data for %s (%d bars)", ticker, len(df))
+                return df
+            logger.warning("EODHD returned no data for %s — falling back to yfinance", ticker)
+
+        # Fallback: convert .XETRA → .DE for yfinance
+        yf_ticker = ticker
+        if ticker.upper().endswith(".XETRA"):
+            yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+
+        df = self._download_once(yf_ticker)
+        if df.empty:
+            raise ValueError(f"No price data for German ticker '{ticker}' (tried EODHD + yfinance)")
         return df
 
     def _download_once(self, ticker: str) -> pd.DataFrame:
@@ -187,6 +215,49 @@ class TechnicalAgent(BaseAgent):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
+
+    def _intraday_supplement(self, ticker: str) -> str | None:
+        """Compute short-term RSI/MACD on 5min bars as supplementary signal."""
+        if ticker in CRYPTO_TICKERS:
+            return None
+
+        if not (is_german_ticker(ticker) and self._eodhd.available):
+            return None
+
+        try:
+            df = self._eodhd.get_ohlcv_intraday(ticker, interval="5m")
+            if df is None or len(df) < 30:
+                return None
+
+            close = df["Close"].squeeze()
+
+            # Short-term RSI-14 on 5min bars
+            rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+            rsi_clean = rsi_series.dropna()
+            rsi_5m = float(rsi_clean.iloc[-1]) if not rsi_clean.empty else None
+
+            # MACD on 5min bars
+            macd_obj = ta.trend.MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
+            macd_val = macd_obj.macd().dropna()
+            sig_val = macd_obj.macd_signal().dropna()
+
+            macd_5m = float(macd_val.iloc[-1]) if not macd_val.empty else None
+            sig_5m = float(sig_val.iloc[-1]) if not sig_val.empty else None
+
+            parts = []
+            if rsi_5m is not None:
+                parts.append(f"5m-RSI={rsi_5m:.1f}")
+            if macd_5m is not None and sig_5m is not None:
+                direction = "above" if macd_5m > sig_5m else "below"
+                parts.append(f"5m-MACD {direction} signal")
+
+            if parts:
+                return f"Intraday supplement: {', '.join(parts)}"
+
+        except Exception as exc:
+            logger.debug("Intraday supplement failed for %s: %s", ticker, exc)
+
+        return None
 
     def _calculate_indicators(self, df: pd.DataFrame) -> dict:
         """

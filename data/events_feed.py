@@ -23,7 +23,8 @@ from typing import Any
 
 import yfinance as yf
 
-from config.settings import CRYPTO_TICKERS
+from config.settings import CRYPTO_TICKERS, is_german_ticker
+from data.eodhd_feed import EODHDFeed
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,27 @@ def get_earnings_date(ticker: str) -> "date | None":
     if _is_cache_valid(ticker):
         return _cache[ticker]["earnings_date"]
 
+    # German tickers: try EODHD first
+    if is_german_ticker(ticker):
+        try:
+            eodhd = EODHDFeed()
+            earnings_dt = eodhd.get_earnings_calendar(ticker)
+            if earnings_dt is not None:
+                _cache[ticker] = {
+                    "earnings_date": earnings_dt,
+                    "fetched_at": datetime.now(timezone.utc).timestamp(),
+                }
+                return earnings_dt
+        except Exception as exc:
+            logger.debug("EODHD earnings lookup failed for %s: %s", ticker, exc)
+
+    # Convert .XETRA → .DE for yfinance
+    yf_ticker = ticker
+    if ticker.endswith(".XETRA"):
+        yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(yf_ticker)
         cal = t.calendar
 
         if cal is None or (hasattr(cal, "empty") and cal.empty):

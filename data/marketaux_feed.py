@@ -26,7 +26,8 @@ from typing import Any
 
 import requests
 
-from config.settings import MARKETAUX_API_TOKEN, MAX_HEADLINES
+from config.settings import MARKETAUX_API_TOKEN, MAX_HEADLINES, is_german_ticker
+from data.eodhd_feed import EODHDFeed
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,11 @@ class MarketauxFeed:
         self,
         api_token: str = MARKETAUX_API_TOKEN,
         max_headlines: int = MAX_HEADLINES,
+        eodhd_feed: EODHDFeed | None = None,
     ) -> None:
         self.api_token = api_token
         self.max_headlines = max_headlines
+        self._eodhd = eodhd_feed or EODHDFeed()
 
     def fetch(self, ticker: str) -> list[dict]:
         """
@@ -126,7 +129,33 @@ class MarketauxFeed:
 
         except Exception as exc:
             logger.warning("Marketaux fetch failed for %s: %s", ticker_upper, exc)
-            return []
+            items = []
+
+        # Enrich with EODHD news for German tickers (Marketaux may have gaps)
+        if is_german_ticker(ticker_upper) and self._eodhd.available:
+            items = self._enrich_with_eodhd(ticker_upper, items)
+
+        return items
+
+    def _enrich_with_eodhd(
+        self, ticker: str, existing: list[dict]
+    ) -> list[dict]:
+        """Add EODHD news items not already present in *existing*."""
+        try:
+            eodhd_news = self._eodhd.get_news(ticker, limit=5)
+            existing_titles = {item["text"] for item in existing}
+            for article in eodhd_news:
+                title = article.get("title", "")
+                if title and title not in existing_titles:
+                    existing.append({
+                        "text": title,
+                        "source": "eodhd",
+                        "marketaux_sentiment": None,
+                    })
+                    existing_titles.add(title)
+        except Exception as exc:
+            logger.debug("EODHD news enrichment failed for %s: %s", ticker, exc)
+        return existing[:self.max_headlines]
 
     def _parse_articles(self, articles: list[dict], ticker: str) -> list[dict]:
         """Extract title and per-entity sentiment from the raw API response."""

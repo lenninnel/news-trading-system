@@ -63,6 +63,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from agents.base_agent import BaseAgent
+from config.settings import is_german_ticker
+from data.eodhd_feed import EODHDFeed
 from storage.database import Database
 
 log = logging.getLogger(__name__)
@@ -253,8 +255,9 @@ class ScreenerAgent(BaseAgent):
     _VOL_RATIO_CAP    = 5.0    # volume ratios beyond 5× capped at 1.0
     _PRICE_CHG_CAP    = 10.0   # price moves beyond 10% capped at 1.0
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Database | None = None, eodhd_feed: EODHDFeed | None = None) -> None:
         self._db          = db or Database()
+        self._eodhd       = eodhd_feed or EODHDFeed()
         self._price_cache: dict[str, tuple[pd.DataFrame, float]] = {}
         self._list_cache:  dict[str, tuple[list[str], float]]    = {}
 
@@ -471,23 +474,39 @@ class ScreenerAgent(BaseAgent):
         """
         Batch-download 1-month daily OHLCV for all tickers using the 5-min cache.
 
-        Splits the ticker list into chunks of ``_BATCH_SIZE`` to avoid yfinance
-        timeouts.  Returns {ticker: DataFrame}.
+        German/EU tickers are fetched individually from EODHD.
+        All others are batch-downloaded via yfinance in chunks of ``_BATCH_SIZE``.
+        Returns {ticker: DataFrame}.
         """
         now_ts = time.monotonic()
         result: dict[str, pd.DataFrame] = {}
-        to_fetch: list[str] = []
+        to_fetch_yf: list[str] = []
 
         for t in tickers:
             cached = self._price_cache.get(t)
             if cached and (now_ts - cached[1]) < self._PRICE_CACHE_TTL:
                 result[t] = cached[0]
-            else:
-                to_fetch.append(t)
+                continue
 
-        total_chunks = math.ceil(len(to_fetch) / self._BATCH_SIZE) or 1
-        for i in range(0, len(to_fetch), self._BATCH_SIZE):
-            chunk     = to_fetch[i : i + self._BATCH_SIZE]
+            # Route German tickers to EODHD
+            if is_german_ticker(t) and self._eodhd.available:
+                try:
+                    df = self._eodhd.get_ohlcv_daily(t, limit=30)
+                    if df is not None and not df.empty:
+                        self._price_cache[t] = (df, time.monotonic())
+                        result[t] = df
+                        continue
+                except Exception as exc:
+                    log.debug("EODHD fetch failed for %s: %s — will try yfinance", t, exc)
+                # Convert .XETRA → .DE for yfinance fallback
+                yf_t = t.rsplit(".", 1)[0] + ".DE" if t.upper().endswith(".XETRA") else t
+                to_fetch_yf.append(yf_t)
+            else:
+                to_fetch_yf.append(t)
+
+        total_chunks = math.ceil(len(to_fetch_yf) / self._BATCH_SIZE) or 1
+        for i in range(0, len(to_fetch_yf), self._BATCH_SIZE):
+            chunk     = to_fetch_yf[i : i + self._BATCH_SIZE]
             chunk_idx = i // self._BATCH_SIZE + 1
             log.info("Scanning chunk %d/%d (%d tickers)…", chunk_idx, total_chunks, len(chunk))
             try:
@@ -506,7 +525,7 @@ class ScreenerAgent(BaseAgent):
                             chunk_idx, total_chunks, exc)
 
             # Brief pause between chunks to avoid hammering the API
-            if i + self._BATCH_SIZE < len(to_fetch):
+            if i + self._BATCH_SIZE < len(to_fetch_yf):
                 time.sleep(0.1)
 
         return result
@@ -557,8 +576,11 @@ class ScreenerAgent(BaseAgent):
 
     def _get_market_cap(self, ticker: str) -> float | None:
         """Fetch market cap from yfinance fast_info (used only for finalists)."""
+        yf_ticker = ticker
+        if ticker.upper().endswith(".XETRA"):
+            yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
         try:
-            fi = yf.Ticker(ticker).fast_info
+            fi = yf.Ticker(yf_ticker).fast_info
             mc = getattr(fi, "market_cap", None)
             return float(mc) if mc else None
         except Exception:
