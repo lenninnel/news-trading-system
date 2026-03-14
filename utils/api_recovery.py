@@ -57,7 +57,7 @@ SERVICE_CONFIGS: dict[str, dict] = {
         "max_delay":   300.0,
     },
     "anthropic": {
-        "max_retries": 3,
+        "max_retries": 4,
         "base_delay":  30.0,
         "max_delay":   120.0,
     },
@@ -257,13 +257,17 @@ class APIRecovery:
         """Attach a Database instance; enables recovery_log persistence."""
         cls._db = db
 
+    # Track last call time per service for minimum delay enforcement
+    _last_call_time: dict[str, float] = {}
+    _last_call_lock: threading.Lock = threading.Lock()
+
     @classmethod
     def _get_rate_limiter(cls, service: str):
         """Return a rate limiter for *service*, or None if not rate-limited."""
         from utils.rate_limiter import TokenBucketRateLimiter
         # Only rate-limit services that need it
         _RATE_LIMITS: dict[str, int] = {
-            "anthropic": 40,  # 40 req/min (headroom below 50 API limit)
+            "anthropic": 30,  # 30 req/min (conservative headroom below 50 API limit)
         }
         if service not in _RATE_LIMITS:
             return None
@@ -273,6 +277,17 @@ class APIRecovery:
                     max_per_minute=_RATE_LIMITS[service],
                 )
             return cls._rate_limiters[service]
+
+    @classmethod
+    def _enforce_min_delay(cls, service: str, min_seconds: float) -> None:
+        """Ensure at least *min_seconds* between consecutive calls to *service*."""
+        with cls._last_call_lock:
+            last = cls._last_call_time.get(service, 0.0)
+            now = time.monotonic()
+            wait = min_seconds - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+            cls._last_call_time[service] = time.monotonic()
 
     @classmethod
     def get_circuit(cls, service: str) -> CircuitBreaker:
@@ -375,8 +390,14 @@ class APIRecovery:
         t_start = time.monotonic()
         rate_limiter = cls._get_rate_limiter(service)
 
+        # Minimum delay between calls for services that need it
+        _MIN_DELAYS: dict[str, float] = {"anthropic": 2.0}
+
         for attempt in range(1, max_r + 1):
             try:
+                min_delay = _MIN_DELAYS.get(service)
+                if min_delay:
+                    cls._enforce_min_delay(service, min_delay)
                 if rate_limiter is not None:
                     rate_limiter.acquire()
                 result = func(*args, **kwargs)

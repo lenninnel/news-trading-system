@@ -20,6 +20,7 @@ import requests
 
 from config.settings import (
     ADANOS_API_KEY,
+    ADANOS_ENABLED,
     CRYPTO_TICKERS,
     MAX_HEADLINES,
     REDDIT_CLIENT_ID,
@@ -290,7 +291,7 @@ class AdanosFeed:
         Returns an empty list when the API key is missing, the quota is
         exhausted, or an error occurs.
         """
-        if not ADANOS_API_KEY:
+        if not ADANOS_ENABLED or not ADANOS_API_KEY:
             return []
 
         if AdanosFeed._quota_exhausted:

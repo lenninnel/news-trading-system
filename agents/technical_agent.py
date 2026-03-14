@@ -259,6 +259,32 @@ class TechnicalAgent(BaseAgent):
 
         return None
 
+    def _fallback_indicators(
+        self, ticker: str, cache_key: str, error: str
+    ) -> tuple[dict, bool]:
+        """Return cached indicators or an all-None placeholder on cache miss."""
+        from utils.network_recovery import get_cache
+        cache = get_cache()
+        cached, hit = cache.get("yfinance", cache_key)
+        if hit and isinstance(cached, dict):
+            logger.warning(
+                "[DEGRADED] Using cached indicators for %s: %s", ticker, error,
+            )
+            return cached, True
+
+        logger.warning(
+            "[DEGRADED] No cached indicators for %s — returning None-filled: %s",
+            ticker, error,
+        )
+        none_ind = {
+            "rsi": None, "macd": None, "macd_signal": None, "macd_hist": None,
+            "macd_bull_cross": False, "macd_bear_cross": False,
+            "sma_20": None, "sma_50": None,
+            "bb_upper": None, "bb_lower": None, "price": None,
+            "rvol": None, "volume_trending_up": None, "obv_trend": None,
+        }
+        return none_ind, True
+
     def _calculate_indicators(self, df: pd.DataFrame) -> dict:
         """
         Compute RSI, MACD, SMA-20, SMA-50, and Bollinger Bands.

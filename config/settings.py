@@ -102,6 +102,54 @@ MDAX_TICKERS: list[str] = [
 # All known German tickers (union of DAX + MDAX)
 _GERMAN_TICKERS_SET: set[str] = set(DAX_TICKERS) | set(MDAX_TICKERS)
 
+# Ticker → company name for NewsAPI search (searching "SAP.XETRA" returns junk)
+TICKER_TO_COMPANY: dict[str, str] = {
+    # DAX 40
+    "SAP.XETRA": "SAP SE", "SAP.DE": "SAP SE",
+    "SIE.XETRA": "Siemens AG", "SIE.DE": "Siemens AG",
+    "ALV.XETRA": "Allianz SE", "ALV.DE": "Allianz SE",
+    "MUV2.XETRA": "Munich Re", "MUV2.DE": "Munich Re",
+    "BMW.XETRA": "BMW AG", "BMW.DE": "BMW AG",
+    "VOW3.XETRA": "Volkswagen AG", "VOW3.DE": "Volkswagen AG",
+    "MBG.XETRA": "Mercedes-Benz Group", "MBG.DE": "Mercedes-Benz Group",
+    "DTE.XETRA": "Deutsche Telekom", "DTE.DE": "Deutsche Telekom",
+    "BAYN.XETRA": "Bayer AG", "BAYN.DE": "Bayer AG",
+    "BAS.XETRA": "BASF SE", "BAS.DE": "BASF SE",
+    "ADS.XETRA": "Adidas AG", "ADS.DE": "Adidas AG",
+    "RWE.XETRA": "RWE AG", "RWE.DE": "RWE AG",
+    "EOAN.XETRA": "E.ON SE", "EOAN.DE": "E.ON SE",
+    "DBK.XETRA": "Deutsche Bank", "DBK.DE": "Deutsche Bank",
+    "IFX.XETRA": "Infineon Technologies", "IFX.DE": "Infineon Technologies",
+    "DHL.XETRA": "DHL Group", "DHL.DE": "DHL Group",
+    "DB1.XETRA": "Deutsche Boerse", "DB1.DE": "Deutsche Boerse",
+    "LIN.XETRA": "Linde plc", "LIN.DE": "Linde plc",
+    "MRK.XETRA": "Merck KGaA", "MRK.DE": "Merck KGaA",
+    "HEI.XETRA": "HeidelbergCement", "HEI.DE": "HeidelbergCement",
+    "HEN3.XETRA": "Henkel AG", "HEN3.DE": "Henkel AG",
+    "FRE.XETRA": "Fresenius SE", "FRE.DE": "Fresenius SE",
+    "ZAL.XETRA": "Zalando SE", "ZAL.DE": "Zalando SE",
+    "CON.XETRA": "Continental AG", "CON.DE": "Continental AG",
+    "VNA.XETRA": "Vonovia SE", "VNA.DE": "Vonovia SE",
+    "RHM.XETRA": "Rheinmetall AG", "RHM.DE": "Rheinmetall AG",
+    "AIR.XETRA": "Airbus SE", "AIR.DE": "Airbus SE",
+    "PAH3.XETRA": "Porsche Automobil Holding", "PAH3.DE": "Porsche Automobil Holding",
+    "P911.XETRA": "Porsche AG", "P911.DE": "Porsche AG",
+    "BNR.XETRA": "Brenntag SE", "BNR.DE": "Brenntag SE",
+    "MTX.XETRA": "MTU Aero Engines", "MTX.DE": "MTU Aero Engines",
+    "SRT3.XETRA": "Sartorius AG", "SRT3.DE": "Sartorius AG",
+    "DHER.XETRA": "Delivery Hero", "DHER.DE": "Delivery Hero",
+    "FME.XETRA": "Fresenius Medical Care", "FME.DE": "Fresenius Medical Care",
+    "CBK.XETRA": "Commerzbank AG", "CBK.DE": "Commerzbank AG",
+    "HNR1.XETRA": "Hannover Rueck", "HNR1.DE": "Hannover Rueck",
+    "ENR.XETRA": "Siemens Energy", "ENR.DE": "Siemens Energy",
+    "SHL.XETRA": "Siemens Healthineers", "SHL.DE": "Siemens Healthineers",
+    "EVK.XETRA": "Evonik Industries", "EVK.DE": "Evonik Industries",
+    "SY1.XETRA": "Symrise AG", "SY1.DE": "Symrise AG",
+}
+
+# Adanos — disabled by default (free tier quota too small)
+ADANOS_ENABLED: bool = os.environ.get("ADANOS_ENABLED", "false").lower() in ("true", "1", "yes")
+
 
 def is_german_ticker(ticker: str) -> bool:
     """Return True if *ticker* should be routed to EODHD (German/EU stock)."""
@@ -109,6 +157,11 @@ def is_german_ticker(ticker: str) -> bool:
     if t.endswith(".XETRA") or t.endswith(".DE"):
         return True
     return t in _GERMAN_TICKERS_SET
+
+
+def get_search_term(ticker: str) -> str:
+    """Return the best NewsAPI search term for *ticker* (company name for German stocks)."""
+    return TICKER_TO_COMPANY.get(ticker.upper(), ticker)
 
 
 # ---------------------------------------------------------------------------

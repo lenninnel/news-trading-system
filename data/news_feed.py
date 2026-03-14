@@ -30,7 +30,7 @@ import logging
 
 import requests
 
-from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL
+from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL, get_search_term
 from utils.api_recovery import APIRecovery, CircuitOpenError
 from utils.network_recovery import NetworkMonitor, get_cache
 
@@ -133,8 +133,9 @@ class NewsFeed:
 
     def _live_fetch(self, ticker: str) -> list[str]:
         """Raw HTTP call to NewsAPI; raises on any error."""
+        search_term = get_search_term(ticker)
         params = {
-            "q":        ticker,
+            "q":        search_term,
             "language": "en",
             "sortBy":   "publishedAt",
             "pageSize": self.max_headlines,

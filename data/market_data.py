@@ -28,6 +28,11 @@ from data.eodhd_feed import EODHDFeed
 logger = logging.getLogger(__name__)
 
 
+def _is_no_price(exc: Exception) -> bool:
+    """Return True if *exc* indicates missing price data (not a real error)."""
+    return isinstance(exc, ValueError) and "no price" in str(exc).lower()
+
+
 def _is_crumb_error(exc: Exception) -> bool:
     """Return True if *exc* looks like a yfinance crumb / auth error."""
     msg = str(exc).lower()
@@ -93,40 +98,54 @@ class MarketData:
             ticker: Stock ticker symbol (e.g. "AAPL") or crypto (e.g. "BTC").
 
         Returns:
-            dict with keys: ticker, name, price, currency, market_cap.
+            dict with keys: ticker, name, price, currency, market_cap,
+            source, degraded.
         """
-        if ticker.upper() in CRYPTO_TICKERS:
-            return self._fetch_crypto(ticker.upper())
+        ticker_upper = ticker.upper()
 
-        if is_german_ticker(ticker):
-            return self._fetch_german(ticker)
+        if ticker_upper in CRYPTO_TICKERS:
+            return self._fetch_crypto(ticker_upper)
+
+        if is_german_ticker(ticker_upper):
+            return self._fetch_german(ticker_upper)
 
         try:
-            return self._fetch_once(ticker)
+            result = self._fetch_once(ticker_upper)
+            result["ticker"] = ticker_upper
+            result.setdefault("source", "yfinance")
+            result.setdefault("degraded", False)
+            return result
         except Exception as exc:
-            if not _is_crumb_error(exc):
+            if not _is_crumb_error(exc) and not _is_no_price(exc):
                 raise
 
-            logger.warning(
-                "yfinance crumb error for %s — clearing cache and retrying",
-                ticker,
-            )
-            _clear_yf_cache()
-
-            try:
-                return self._fetch_once(ticker)
-            except Exception:
+            if _is_crumb_error(exc):
                 logger.warning(
-                    "yfinance retry failed for %s — returning fallback",
-                    ticker,
+                    "yfinance crumb error for %s — clearing cache and retrying",
+                    ticker_upper,
                 )
-                return {
-                    "ticker": ticker,
-                    "name": "N/A",
-                    "price": None,
-                    "currency": "USD",
-                    "market_cap": None,
-                }
+                _clear_yf_cache()
+                try:
+                    result = self._fetch_once(ticker_upper)
+                    result["ticker"] = ticker_upper
+                    result.setdefault("source", "yfinance")
+                    result.setdefault("degraded", False)
+                    return result
+                except Exception:
+                    pass
+
+            logger.warning(
+                "yfinance failed for %s — returning fallback", ticker_upper,
+            )
+            return {
+                "ticker": ticker_upper,
+                "name": "N/A",
+                "price": None,
+                "currency": "USD",
+                "market_cap": None,
+                "source": "none",
+                "degraded": True,
+            }
 
     def get_intraday(
         self, ticker: str, interval: str = "5m"
@@ -210,6 +229,8 @@ class MarketData:
     def _fetch_once(ticker: str) -> dict:
         info = yf.Ticker(ticker).info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if price is None:
+            raise ValueError(f"No price data for {ticker}")
         return {
             "ticker": ticker,
             "name": info.get("longName", "N/A"),

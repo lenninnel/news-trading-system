@@ -667,8 +667,7 @@ class TestMarketDataFallback(unittest.TestCase):
             "longName": "Test Corp",
             "marketCap": 500_000_000,
         }
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
-             patch("data.price_fallback.requests.get", side_effect=Exception("no http")):
+        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
             result = md.fetch("TEST")
 
         for key in ("ticker", "name", "price", "currency", "market_cap",
@@ -683,9 +682,7 @@ class TestMarketDataFallback(unittest.TestCase):
             "currency": "USD",
             "longName": "BigCo",
         }
-        # Block HTTP so yahoo_json fallback cannot make real calls
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
-             patch("data.price_fallback.requests.get", side_effect=Exception("no http")):
+        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
             result = md.fetch("BIGC")
 
         self.assertAlmostEqual(result["price"], 250.00)
@@ -699,8 +696,7 @@ class TestMarketDataFallback(unittest.TestCase):
         mock_ticker = MagicMock()
         mock_ticker.info = {}
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
-             patch("data.price_fallback.requests.get", side_effect=Exception("fail")):
+        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
             result = md.fetch("FAIL")
 
         self.assertIsNone(result["price"])
@@ -711,8 +707,7 @@ class TestMarketDataFallback(unittest.TestCase):
         md = self.MD()
         mock_ticker = MagicMock()
         mock_ticker.info = {"currentPrice": 10.0, "currency": "USD", "longName": "X"}
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
-             patch("data.price_fallback.requests.get", side_effect=Exception("no http")):
+        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
             result = md.fetch("aapl")
         self.assertEqual(result["ticker"], "AAPL")
 

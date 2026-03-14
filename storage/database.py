@@ -266,6 +266,152 @@ class Database:
                 );
                 """
             )
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS recovery_log (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service          TEXT    NOT NULL,
+                    event_type       TEXT    NOT NULL,
+                    ticker           TEXT,
+                    attempt          INTEGER,
+                    error_msg        TEXT,
+                    recovery_action  TEXT,
+                    duration_ms      INTEGER,
+                    success          INTEGER NOT NULL DEFAULT 0,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS screener_results (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at      TEXT    NOT NULL,
+                    ticker      TEXT    NOT NULL,
+                    market      TEXT,
+                    hotness     REAL,
+                    price_change REAL,
+                    volume_ratio REAL,
+                    rsi         REAL,
+                    price       REAL,
+                    created_at  TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS strategy_signals (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT    NOT NULL,
+                    strategy         TEXT    NOT NULL,
+                    signal           TEXT    NOT NULL,
+                    confidence       REAL,
+                    timeframe        TEXT,
+                    risk_calc_id     INTEGER,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS strategy_performance (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker                TEXT    NOT NULL,
+                    run_at                TEXT    NOT NULL,
+                    combined_signal       TEXT,
+                    ensemble_confidence   REAL,
+                    voting_method         TEXT,
+                    momentum_signal       TEXT,
+                    momentum_confidence   REAL,
+                    mean_rev_signal       TEXT,
+                    mean_rev_confidence   REAL,
+                    swing_signal          TEXT,
+                    swing_confidence      REAL,
+                    created_at            TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS scheduler_logs (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at           TEXT    NOT NULL,
+                    tickers          TEXT,
+                    success_count    INTEGER NOT NULL DEFAULT 0,
+                    fail_count       INTEGER NOT NULL DEFAULT 0,
+                    elapsed_s        REAL,
+                    total_elapsed_s  REAL,
+                    errors           TEXT,
+                    status           TEXT,
+                    notes            TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS health_checks (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at           TEXT    NOT NULL,
+                    newsapi_ok       INTEGER NOT NULL DEFAULT 0,
+                    yfinance_ok      INTEGER NOT NULL DEFAULT 0,
+                    anthropic_ok     INTEGER NOT NULL DEFAULT 0,
+                    database_ok      INTEGER NOT NULL DEFAULT 0,
+                    network_ok       INTEGER NOT NULL DEFAULT 0,
+                    scheduler_ok     INTEGER NOT NULL DEFAULT 0,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS emergency_stops (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action           TEXT    NOT NULL,
+                    reason           TEXT,
+                    activated_by     TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_at      TEXT    NOT NULL,
+                    total_value      REAL,
+                    positions        TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portfolio_violations (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    violation_type   TEXT    NOT NULL,
+                    ticker           TEXT,
+                    details          TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS price_alerts (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT    NOT NULL,
+                    alert_type       TEXT    NOT NULL,
+                    price            REAL,
+                    message          TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS optimization_results (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT    NOT NULL,
+                    strategy         TEXT,
+                    params           TEXT,
+                    score            REAL,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT    NOT NULL,
+                    strategy         TEXT,
+                    start_date       TEXT,
+                    end_date         TEXT,
+                    total_return     REAL,
+                    sharpe_ratio     REAL,
+                    max_drawdown     REAL,
+                    params           TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS backtest_strategy_comparison (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at           TEXT    NOT NULL,
+                    ticker           TEXT    NOT NULL,
+                    comparison       TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+                """
+            )
+
             # Migrate existing DBs: add volume columns to technical_signals
             for col, typedef in [
                 ("rvol", "REAL"),
@@ -800,4 +946,188 @@ class Database:
                     "SELECT * FROM trade_history ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Recovery log
+    # ------------------------------------------------------------------
+
+    def log_recovery_event(
+        self,
+        service: str,
+        event_type: str,
+        *,
+        ticker: "str | None" = None,
+        attempt: "int | None" = None,
+        error_msg: "str | None" = None,
+        recovery_action: "str | None" = None,
+        duration_ms: "int | None" = None,
+        success: bool = False,
+    ) -> int:
+        """Persist a recovery event and return its row ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO recovery_log
+                    (service, event_type, ticker, attempt, error_msg,
+                     recovery_action, duration_ms, success, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (service, event_type, ticker, attempt, error_msg,
+                 recovery_action, duration_ms, int(success), now),
+            )
+            return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # Screener results
+    # ------------------------------------------------------------------
+
+    def log_screener_results(self, run_at: str, candidates: list[dict]) -> None:
+        """Persist screener results."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            for c in candidates:
+                conn.execute(
+                    """
+                    INSERT INTO screener_results
+                        (run_at, ticker, market, hotness, price_change,
+                         volume_ratio, rsi, price, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (run_at, c.get("ticker"), c.get("market"),
+                     c.get("hotness"), c.get("price_change"),
+                     c.get("volume_ratio"), c.get("rsi"),
+                     c.get("price"), now),
+                )
+
+    # ------------------------------------------------------------------
+    # Strategy signals + performance
+    # ------------------------------------------------------------------
+
+    def log_strategy_signal(
+        self,
+        ticker: str,
+        strategy: str,
+        signal: str,
+        confidence: float,
+        *,
+        timeframe: "str | None" = None,
+        risk_calc_id: "int | None" = None,
+    ) -> int:
+        """Persist a strategy signal and return its row ID."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO strategy_signals
+                    (ticker, strategy, signal, confidence, timeframe,
+                     risk_calc_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, strategy, signal, confidence, timeframe,
+                 risk_calc_id, now),
+            )
+            return cur.lastrowid
+
+    def log_strategy_performance(
+        self,
+        ticker: str,
+        run_at: str,
+        combined_signal: str,
+        ensemble_confidence: float,
+        voting_method: str,
+        *,
+        momentum_signal: "str | None" = None,
+        momentum_confidence: "float | None" = None,
+        mean_rev_signal: "str | None" = None,
+        mean_rev_confidence: "float | None" = None,
+        swing_signal: "str | None" = None,
+        swing_confidence: "float | None" = None,
+    ) -> int:
+        """Persist a strategy performance record."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO strategy_performance
+                    (ticker, run_at, combined_signal, ensemble_confidence,
+                     voting_method, momentum_signal, momentum_confidence,
+                     mean_rev_signal, mean_rev_confidence,
+                     swing_signal, swing_confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, run_at, combined_signal, ensemble_confidence,
+                 voting_method, momentum_signal, momentum_confidence,
+                 mean_rev_signal, mean_rev_confidence,
+                 swing_signal, swing_confidence, now),
+            )
+            return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # Health checks, emergency stops, scheduler logs
+    # ------------------------------------------------------------------
+
+    def log_health_check(
+        self, run_at: str,
+        newsapi_ok: bool, yfinance_ok: bool, anthropic_ok: bool,
+        database_ok: bool, network_ok: bool, scheduler_ok: bool,
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO health_checks
+                    (run_at, newsapi_ok, yfinance_ok, anthropic_ok,
+                     database_ok, network_ok, scheduler_ok, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_at, int(newsapi_ok), int(yfinance_ok), int(anthropic_ok),
+                 int(database_ok), int(network_ok), int(scheduler_ok), now),
+            )
+            return cur.lastrowid
+
+    def log_emergency_stop(
+        self, action: str, reason: "str | None" = None,
+        activated_by: "str | None" = None,
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO emergency_stops (action, reason, activated_by, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (action, reason, activated_by, now),
+            )
+            return cur.lastrowid
+
+    def log_scheduler_run(
+        self, run_at: str, tickers: list, success_count: int,
+        fail_count: int, elapsed_s: float, total_elapsed_s: float,
+        errors: list, status: str, notes: str = "",
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO scheduler_logs
+                    (run_at, tickers, success_count, fail_count, elapsed_s,
+                     total_elapsed_s, errors, status, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_at, json.dumps(tickers), success_count, fail_count,
+                 elapsed_s, total_elapsed_s, json.dumps(errors), status,
+                 notes, now),
+            )
+            return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # Generic SQL helper
+    # ------------------------------------------------------------------
+
+    def _select(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Run a raw SELECT and return rows as dicts."""
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]

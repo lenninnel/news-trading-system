@@ -188,9 +188,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=3,
+        default=2,
         metavar="N",
-        help="Max concurrent tickers (default: 3).",
+        help="Max concurrent tickers (default: 2).",
     )
     return parser.parse_args(argv)
 

@@ -164,6 +164,7 @@ class TestAdanosFeed:
         resp.raise_for_status.return_value = None
         return resp
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_happy_path_both_endpoints(self, mock_get):
@@ -194,6 +195,7 @@ class TestAdanosFeed:
         # Two endpoints called
         assert mock_get.call_count == 2
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_ticker_not_found_returns_empty(self, mock_get):
@@ -215,6 +217,7 @@ class TestAdanosFeed:
         assert results == []
         mock_get.assert_not_called()
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_quota_exhausted_on_429(self, mock_get):
@@ -229,6 +232,7 @@ class TestAdanosFeed:
         assert AdanosFeed._quota_exhausted is True
         assert AdanosFeed._request_count == 1
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_quota_exhausted_skips_subsequent_calls(self, mock_get):
@@ -247,6 +251,7 @@ class TestAdanosFeed:
         feed.fetch("MSFT")
         assert mock_get.call_count == 1  # no additional calls
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_api_error_returns_empty(self, mock_get):
@@ -256,6 +261,7 @@ class TestAdanosFeed:
 
         assert results == []
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_http_error_returns_empty(self, mock_get):
@@ -269,6 +275,7 @@ class TestAdanosFeed:
 
         assert results == []
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_request_count_increments_per_endpoint(self, mock_get):
@@ -289,6 +296,7 @@ class TestAdanosFeed:
         feed.fetch("TSLA")
         assert AdanosFeed._request_count == 4
 
+    @patch("data.social_feed.ADANOS_ENABLED", True)
     @patch("data.social_feed.ADANOS_API_KEY", "test-key-123")
     @patch("data.social_feed.requests.get")
     def test_429_logs_warning_once(self, mock_get):
