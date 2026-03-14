@@ -61,6 +61,9 @@ def _compute_indicators(df_slice: pd.DataFrame) -> dict:
 
     bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
 
+    sma50 = ta.trend.SMAIndicator(close=close, window=50).sma_indicator() if len(close) >= 50 else pd.Series(dtype=float)
+    sma200 = ta.trend.SMAIndicator(close=close, window=200).sma_indicator() if len(close) >= 200 else pd.Series(dtype=float)
+
     return {
         "rsi": latest(rsi_s),
         "macd_bull_cross": macd_bull,
@@ -68,28 +71,125 @@ def _compute_indicators(df_slice: pd.DataFrame) -> dict:
         "bb_upper": latest(bb.bollinger_hband()),
         "bb_lower": latest(bb.bollinger_lband()),
         "price": float(close.iloc[-1]),
+        "sma_50": latest(sma50),
+        "sma_200": latest(sma200),
     }
 
 
-def _signal_from_indicators(ind: dict) -> str:
-    """BUY / SELL / HOLD from indicator dict."""
+def _signal_from_indicators(ind: dict, params: dict | None = None) -> str:
+    """BUY / SELL / HOLD from indicator dict.
+
+    Supports optional params:
+        rsi_oversold   (float): RSI buy threshold (default 30).
+        rsi_overbought (float): RSI sell threshold (default 70).
+        require_trend_alignment (bool): Only signal when SMA50 > SMA200 (BUY)
+            or SMA50 < SMA200 (SELL).  Default False.
+    """
+    params = params or {}
+    rsi_os = params.get("rsi_oversold", 30)
+    rsi_ob = params.get("rsi_overbought", 70)
+    trend_req = params.get("require_trend_alignment", False)
+
     rsi = ind.get("rsi")
     price = ind.get("price")
     bb_low = ind.get("bb_lower")
     bb_up = ind.get("bb_upper")
+    sma50 = ind.get("sma_50")
+    sma200 = ind.get("sma_200")
 
-    buy = (rsi is not None and rsi < 30) or \
+    buy = (rsi is not None and rsi < rsi_os) or \
           ind.get("macd_bull_cross", False) or \
           (price is not None and bb_low is not None and price < bb_low)
-    sell = (rsi is not None and rsi > 70) or \
+    sell = (rsi is not None and rsi > rsi_ob) or \
            ind.get("macd_bear_cross", False) or \
            (price is not None and bb_up is not None and price > bb_up)
+
+    # Trend alignment filter: require SMA50 vs SMA200 confirmation
+    if trend_req and sma50 is not None and sma200 is not None:
+        if buy and sma50 <= sma200:
+            buy = False   # no buying in a downtrend
+        if sell and sma50 >= sma200:
+            sell = False  # no shorting in an uptrend
 
     if buy:
         return "BUY"
     if sell:
         return "SELL"
     return "HOLD"
+
+
+# ── Data download with fallbacks ─────────────────────────────────────
+
+_CRYPTO_SYMBOLS = {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVAX"}
+
+
+def _download_ohlcv(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Download OHLCV with yfinance; fall back to Binance for crypto."""
+    warmup_start = pd.Timestamp(start_date) - pd.Timedelta(days=300)
+
+    # Crypto tickers → Binance klines (yfinance crypto is unreliable)
+    if ticker.upper() in _CRYPTO_SYMBOLS:
+        return _download_binance(ticker.upper(), warmup_start, pd.Timestamp(end_date))
+
+    # German tickers: convert .XETRA → .DE for yfinance
+    yf_ticker = ticker
+    if ticker.upper().endswith(".XETRA"):
+        yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+
+    import yfinance as yf
+    df = yf.download(
+        yf_ticker,
+        start=warmup_start.strftime("%Y-%m-%d"),
+        end=end_date,
+        progress=False,
+    )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def _download_binance(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Download daily OHLCV from Binance public klines API."""
+    import requests
+
+    pair = f"{symbol}USDT"
+    all_rows = []
+    cursor_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    while cursor_ms < end_ms:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={
+                "symbol": pair,
+                "interval": "1d",
+                "startTime": cursor_ms,
+                "endTime": end_ms,
+                "limit": 1000,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        klines = resp.json()
+        if not klines:
+            break
+        for k in klines:
+            all_rows.append({
+                "Date": pd.to_datetime(k[0], unit="ms"),
+                "Open": float(k[1]),
+                "High": float(k[2]),
+                "Low": float(k[3]),
+                "Close": float(k[4]),
+                "Volume": float(k[5]),
+            })
+        cursor_ms = int(klines[-1][6]) + 1  # close_time + 1ms
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows).set_index("Date")
+    df.sort_index(inplace=True)
+    return df
 
 
 # ── Metrics ──────────────────────────────────────────────────────────
@@ -150,20 +250,14 @@ def run_backtest(
     sell_thresh = params.get("sell_threshold", -0.30)
     stop_pct = params.get("stop_loss_pct", 0.02)
     tp_ratio = params.get("take_profit_ratio", 2.0)
+    use_sentiment = params.get("use_sentiment", True)
+    use_technical = params.get("use_technical", True)
 
     # -- Download data (or reuse) --
     if ohlcv is not None:
         df = ohlcv.copy()
     else:
-        import yfinance as yf
-        # Fetch extra history for indicator warm-up
-        warmup_start = pd.Timestamp(start_date) - pd.Timedelta(days=90)
-        df = yf.download(
-            ticker, start=warmup_start.strftime("%Y-%m-%d"),
-            end=end_date, progress=False,
-        )
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = _download_ohlcv(ticker, start_date, end_date)
 
     if df.empty or len(df) < 50:
         return _empty_result(account_balance)
@@ -230,25 +324,38 @@ def run_backtest(
             equity_curve.append(equity)
             continue
 
-        tech_signal = _signal_from_indicators(ind)
+        tech_signal = _signal_from_indicators(ind, params) if use_technical else "HOLD"
 
         # Simulated sentiment score
         sentiment_score = float(rng.normal(0, 0.3))
 
         # Combine: sentiment threshold determines sentiment signal
-        if sentiment_score >= buy_thresh:
-            sent_signal = "BUY"
-        elif sentiment_score <= sell_thresh:
-            sent_signal = "SELL"
+        if use_sentiment:
+            if sentiment_score >= buy_thresh:
+                sent_signal = "BUY"
+            elif sentiment_score <= sell_thresh:
+                sent_signal = "SELL"
+            else:
+                sent_signal = "HOLD"
         else:
             sent_signal = "HOLD"
 
-        # Simple fusion: both agree → trade, otherwise hold
+        # Fusion logic depends on which sources are active
         combined = None
-        if sent_signal == "BUY" and tech_signal == "BUY":
-            combined = "BUY"
-        elif sent_signal == "SELL" and tech_signal == "SELL":
-            combined = "SELL"
+        if use_sentiment and use_technical:
+            # Both must agree
+            if sent_signal == "BUY" and tech_signal == "BUY":
+                combined = "BUY"
+            elif sent_signal == "SELL" and tech_signal == "SELL":
+                combined = "SELL"
+        elif use_technical and not use_sentiment:
+            # Technical only — trade on technical signal alone
+            if tech_signal in ("BUY", "SELL"):
+                combined = tech_signal
+        elif use_sentiment and not use_technical:
+            # Sentiment only — trade on sentiment signal alone
+            if sent_signal in ("BUY", "SELL"):
+                combined = sent_signal
 
         # Enter new position if flat
         if combined is not None and position is None and cash > 0:
