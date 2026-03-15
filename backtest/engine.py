@@ -33,8 +33,19 @@ import ta
 
 # ── Indicator helpers (lifted from TechnicalAgent, no DB/yf deps) ────
 
-def _compute_indicators(df_slice: pd.DataFrame) -> dict:
-    """Compute technical indicators on a DataFrame slice (look-ahead safe)."""
+def _compute_indicators(df_slice: pd.DataFrame, params: dict | None = None) -> dict:
+    """Compute technical indicators on a DataFrame slice (look-ahead safe).
+
+    Configurable via *params*:
+        rsi_period (int): RSI window (default 14).
+        sma_fast   (int): Fast SMA period (default 50).
+        sma_slow   (int): Slow SMA period (default 200).
+    """
+    params = params or {}
+    rsi_period = int(params.get("rsi_period", 14))
+    sma_fast = int(params.get("sma_fast", 50))
+    sma_slow = int(params.get("sma_slow", 200))
+
     close: pd.Series = df_slice["Close"].squeeze()
     if len(close) < 26:
         return {}
@@ -47,7 +58,7 @@ def _compute_indicators(df_slice: pd.DataFrame) -> dict:
         c = s.dropna()
         return float(c.iloc[-2]) if len(c) >= 2 else None
 
-    rsi_s = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+    rsi_s = ta.momentum.RSIIndicator(close=close, window=rsi_period).rsi()
     macd_obj = ta.trend.MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
     macd_s = macd_obj.macd()
     sig_s = macd_obj.macd_signal()
@@ -61,8 +72,18 @@ def _compute_indicators(df_slice: pd.DataFrame) -> dict:
 
     bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
 
-    sma50 = ta.trend.SMAIndicator(close=close, window=50).sma_indicator() if len(close) >= 50 else pd.Series(dtype=float)
-    sma200 = ta.trend.SMAIndicator(close=close, window=200).sma_indicator() if len(close) >= 200 else pd.Series(dtype=float)
+    sma_fast_s = ta.trend.SMAIndicator(close=close, window=sma_fast).sma_indicator() if len(close) >= sma_fast else pd.Series(dtype=float)
+    sma_slow_s = ta.trend.SMAIndicator(close=close, window=sma_slow).sma_indicator() if len(close) >= sma_slow else pd.Series(dtype=float)
+
+    # Volume confirmation: RVOL > 1.5
+    volume_confirmed = False
+    if "Volume" in df_slice.columns:
+        vol = df_slice["Volume"].squeeze()
+        if len(vol) >= 20 and not vol.empty:
+            avg_vol = float(vol.iloc[-20:].mean())
+            if avg_vol > 0:
+                rvol = float(vol.iloc[-1]) / avg_vol
+                volume_confirmed = rvol > 1.5
 
     return {
         "rsi": latest(rsi_s),
@@ -71,8 +92,9 @@ def _compute_indicators(df_slice: pd.DataFrame) -> dict:
         "bb_upper": latest(bb.bollinger_hband()),
         "bb_lower": latest(bb.bollinger_lband()),
         "price": float(close.iloc[-1]),
-        "sma_50": latest(sma50),
-        "sma_200": latest(sma200),
+        "sma_50": latest(sma_fast_s),
+        "sma_200": latest(sma_slow_s),
+        "volume_confirmed": volume_confirmed,
     }
 
 
@@ -104,12 +126,18 @@ def _signal_from_indicators(ind: dict, params: dict | None = None) -> str:
            ind.get("macd_bear_cross", False) or \
            (price is not None and bb_up is not None and price > bb_up)
 
-    # Trend alignment filter: require SMA50 vs SMA200 confirmation
+    # Trend alignment filter: require SMA_fast vs SMA_slow confirmation
     if trend_req and sma50 is not None and sma200 is not None:
         if buy and sma50 <= sma200:
             buy = False   # no buying in a downtrend
         if sell and sma50 >= sma200:
             sell = False  # no shorting in an uptrend
+
+    # Volume confirmation filter
+    if params.get("require_volume_confirmation", False):
+        if not ind.get("volume_confirmed", False):
+            buy = False
+            sell = False
 
     if buy:
         return "BUY"
@@ -318,7 +346,7 @@ def run_backtest(
 
         # Compute indicators on data visible up to today (no look-ahead)
         df_visible = df.iloc[:day_idx + 1]
-        ind = _compute_indicators(df_visible)
+        ind = _compute_indicators(df_visible, params)
         if not ind:
             equity = cash + (position["shares"] * price if position else 0)
             equity_curve.append(equity)
