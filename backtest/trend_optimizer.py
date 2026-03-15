@@ -1,9 +1,12 @@
 """
-Deep walk-forward optimization of TREND_FOLLOWING strategy parameters.
+Two-stage walk-forward optimization of TREND_FOLLOWING strategy parameters.
 
-Searches 5,184 parameter combinations per ticker using walk-forward
-validation (6mo train / 2mo test, rolling 2mo) across 2 years of data.
-Technical-only — no simulated sentiment.
+Stage 1: Coarse grid (24 combos) finds the best region.
+Stage 2: Fine grid (~16 combos) refines around the Stage 1 winner.
+3 walk-forward windows (8mo train / 4mo test) across 2023-01 to 2025-01.
+
+Total: ~120 backtests per ticker × 16 tickers = ~1,920 backtests.
+Target runtime: under 3 minutes with 8 workers.
 
 Usage::
 
@@ -13,13 +16,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import multiprocessing as mp
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -35,29 +37,17 @@ from backtest.strategies import TICKER_SECTOR, TICKERS  # noqa: E402
 
 RESULTS_DIR = PROJECT_ROOT / "backtest" / "results"
 
-# ── Parameter grid (5,184 combinations) ──────────────────────────────
+# ── Stage 1: Coarse grid (24 combinations) ───────────────────────────
 
-PARAM_GRID: dict[str, list] = {
+COARSE_GRID: dict[str, list] = {
     "sma_fast":                     [20, 50],
     "sma_slow":                     [100, 200],
-    "rsi_period":                   [14, 21],
-    "rsi_oversold":                 [25, 30],
-    "rsi_overbought":               [70, 75],
     "stop_loss_pct":                [0.015, 0.02, 0.03],
-    "take_profit_ratio":            [2.0, 2.5, 3.0],
-    "require_volume_confirmation":  [True, False],
-}
-
-# Full grid for exhaustive search (set via --full-grid flag)
-PARAM_GRID_FULL: dict[str, list] = {
-    "sma_fast":                     [20, 50, 100],
-    "sma_slow":                     [100, 200],
-    "rsi_period":                   [10, 14, 21],
-    "rsi_oversold":                 [25, 30, 35],
-    "rsi_overbought":               [65, 70, 75],
-    "stop_loss_pct":                [0.01, 0.015, 0.02, 0.03],
-    "take_profit_ratio":            [1.5, 2.0, 2.5, 3.0],
-    "require_volume_confirmation":  [True, False],
+    "take_profit_ratio":            [2.0, 2.5],
+    "rsi_period":                   [14],
+    "rsi_oversold":                 [30],
+    "rsi_overbought":               [70],
+    "require_volume_confirmation":  [False],
 }
 
 # Fixed params for all combos (pure technical, trend-following)
@@ -69,25 +59,78 @@ _FIXED_PARAMS = {
     "sell_threshold": 0.0,
 }
 
-_TRAIN_MONTHS = 6
-_TEST_MONTHS = 2
+_TRAIN_MONTHS = 8
+_TEST_MONTHS = 4
 _OPT_START = "2023-01-01"
 _OPT_END = "2025-01-01"
 
+# Tunable keys (for extracting/displaying)
+_TUNABLE_KEYS = list(COARSE_GRID.keys())
 
-def _build_combos(full: bool = False) -> list[dict]:
-    """Generate all parameter combinations."""
-    grid = PARAM_GRID_FULL if full else PARAM_GRID
-    keys = list(grid.keys())
+
+def _build_coarse_combos() -> list[dict]:
+    """Generate Stage 1 coarse grid combinations."""
+    import itertools
+    keys = list(COARSE_GRID.keys())
     combos = []
-    for vals in itertools.product(*grid.values()):
+    for vals in itertools.product(*COARSE_GRID.values()):
         combo = dict(zip(keys, vals))
-        # Skip invalid: sma_fast must be < sma_slow
         if combo["sma_fast"] >= combo["sma_slow"]:
             continue
         combo.update(_FIXED_PARAMS)
         combos.append(combo)
     return combos
+
+
+def _build_fine_combos(winner: dict) -> list[dict]:
+    """Generate Stage 2 fine grid: ±1 step around the Stage 1 winner."""
+    # Define fine-tuning ranges around each tunable param
+    fine_ranges: dict[str, list] = {}
+
+    # SMA fast: ±10 around winner
+    wf = winner["sma_fast"]
+    fine_ranges["sma_fast"] = sorted({max(10, wf - 10), wf, wf + 10})
+
+    # SMA slow: ±25 around winner
+    ws = winner["sma_slow"]
+    fine_ranges["sma_slow"] = sorted({max(50, ws - 25), ws, ws + 25})
+
+    # Stop loss: ±0.005 around winner
+    wsl = winner["stop_loss_pct"]
+    fine_ranges["stop_loss_pct"] = sorted({
+        round(max(0.005, wsl - 0.005), 4), round(wsl, 4), round(wsl + 0.005, 4)
+    })
+
+    # Take profit ratio: ±0.25 around winner
+    wtp = winner["take_profit_ratio"]
+    fine_ranges["take_profit_ratio"] = sorted({
+        round(max(1.0, wtp - 0.25), 2), round(wtp, 2), round(wtp + 0.25, 2)
+    })
+
+    # Fixed at standard values
+    fine_ranges["rsi_period"] = [14]
+    fine_ranges["rsi_oversold"] = [30]
+    fine_ranges["rsi_overbought"] = [70]
+    fine_ranges["require_volume_confirmation"] = [False]
+
+    import itertools
+    keys = list(fine_ranges.keys())
+    combos = []
+    for vals in itertools.product(*fine_ranges.values()):
+        combo = dict(zip(keys, vals))
+        if combo["sma_fast"] >= combo["sma_slow"]:
+            continue
+        combo.update(_FIXED_PARAMS)
+        combos.append(combo)
+
+    # Remove the winner itself (already tested) and any duplicates
+    winner_sig = _combo_signature(winner)
+    combos = [c for c in combos if _combo_signature(c) != winner_sig]
+    return combos
+
+
+def _combo_signature(combo: dict) -> str:
+    return str(sorted((k, combo[k]) for k in _TUNABLE_KEYS if k in combo))
 
 
 def _add_months(d: date, months: int) -> date:
@@ -102,7 +145,7 @@ def _add_months(d: date, months: int) -> date:
 def _build_windows(
     start: date, end: date
 ) -> list[tuple[date, date, date, date]]:
-    """Generate walk-forward windows."""
+    """Generate walk-forward windows (8mo train / 4mo test)."""
     windows = []
     cursor = start
     while True:
@@ -117,10 +160,31 @@ def _build_windows(
     return windows
 
 
+def _grid_search(
+    combos: list[dict], ticker: str, df: pd.DataFrame,
+    tr_s: date, tr_e: date,
+) -> tuple[dict, float]:
+    """Run grid search on training window, return (best_params, best_sharpe)."""
+    best_sharpe = -999.0
+    best_params = combos[0]
+    for combo in combos:
+        r = run_backtest(
+            ticker=ticker,
+            start_date=tr_s.isoformat(),
+            end_date=tr_e.isoformat(),
+            params=combo,
+            ohlcv=df,
+        )
+        if r["sharpe_ratio"] > best_sharpe:
+            best_sharpe = r["sharpe_ratio"]
+            best_params = combo
+    return best_params, best_sharpe
+
+
 # ── Per-ticker optimizer (top-level for multiprocessing) ─────────────
 
 def _optimize_ticker(args: tuple) -> dict[str, Any]:
-    """Run full walk-forward optimization for one ticker."""
+    """Run 2-stage walk-forward optimization for one ticker."""
     ticker, idx, total, opt_start, opt_end, ohlcv_dict = args
     t0 = time.monotonic()
 
@@ -135,7 +199,7 @@ def _optimize_ticker(args: tuple) -> dict[str, Any]:
             print(f"  [{idx}/{total}] {ticker:12s}  SKIP (insufficient data)", flush=True)
             return _empty_ticker_result(ticker, "insufficient data")
 
-        combos = _build_combos()
+        coarse_combos = _build_coarse_combos()
         start_d = date.fromisoformat(opt_start)
         end_d = date.fromisoformat(opt_end)
         windows = _build_windows(start_d, end_d)
@@ -145,25 +209,28 @@ def _optimize_ticker(args: tuple) -> dict[str, Any]:
             return _empty_ticker_result(ticker, "no valid windows")
 
         window_results: list[dict] = []
+        stage1_evals = 0
+        stage2_evals = 0
 
         for wi, (tr_s, tr_e, te_s, te_e) in enumerate(windows):
-            # Grid search on training window
-            best_sharpe = -999.0
-            best_params = combos[0]
+            # ── Stage 1: Coarse grid search ──────────────────────────
+            best_params, best_sharpe = _grid_search(
+                coarse_combos, ticker, df, tr_s, tr_e,
+            )
+            stage1_evals += len(coarse_combos)
 
-            for combo in combos:
-                r = run_backtest(
-                    ticker=ticker,
-                    start_date=tr_s.isoformat(),
-                    end_date=tr_e.isoformat(),
-                    params=combo,
-                    ohlcv=df,
+            # ── Stage 2: Fine grid around Stage 1 winner ─────────────
+            fine_combos = _build_fine_combos(best_params)
+            if fine_combos:
+                fine_best, fine_sharpe = _grid_search(
+                    fine_combos, ticker, df, tr_s, tr_e,
                 )
-                if r["sharpe_ratio"] > best_sharpe:
-                    best_sharpe = r["sharpe_ratio"]
-                    best_params = combo
+                stage2_evals += len(fine_combos)
+                if fine_sharpe > best_sharpe:
+                    best_sharpe = fine_sharpe
+                    best_params = fine_best
 
-            # Evaluate on test window
+            # ── Evaluate on test window ──────────────────────────────
             test_r = run_backtest(
                 ticker=ticker,
                 start_date=te_s.isoformat(),
@@ -203,11 +270,12 @@ def _optimize_ticker(args: tuple) -> dict[str, Any]:
 
         elapsed = time.monotonic() - t0
         overfitted = (avg_is - avg_oos) > 0.5
+        total_evals = stage1_evals + stage2_evals
 
         print(
             f"  [{idx}/{total}] {ticker:12s}  "
             f"OOS Sharpe: {avg_oos:+.2f}  IS: {avg_is:+.2f}  "
-            f"trades: {oos_trades}  "
+            f"trades: {oos_trades}  evals: {total_evals}  "
             f"{'OVERFIT' if overfitted else 'OK':>7s}  "
             f"— {elapsed:.1f}s",
             flush=True,
@@ -225,7 +293,9 @@ def _optimize_ticker(args: tuple) -> dict[str, Any]:
             "consensus_params": consensus_params,
             "windows": window_results,
             "num_windows": len(windows),
-            "num_combos": len(combos),
+            "stage1_evals": stage1_evals,
+            "stage2_evals": stage2_evals,
+            "total_evals": stage1_evals + stage2_evals,
             "elapsed_s": round(elapsed, 1),
             "error": None,
         }
@@ -237,8 +307,8 @@ def _optimize_ticker(args: tuple) -> dict[str, Any]:
 
 
 def _extract_tunable(params: dict) -> dict:
-    """Extract only the tunable params (not fixed ones)."""
-    return {k: params[k] for k in PARAM_GRID if k in params}
+    """Extract only the tunable params."""
+    return {k: params[k] for k in _TUNABLE_KEYS if k in params}
 
 
 def _empty_ticker_result(ticker: str, error: str) -> dict:
@@ -254,7 +324,9 @@ def _empty_ticker_result(ticker: str, error: str) -> dict:
         "consensus_params": {},
         "windows": [],
         "num_windows": 0,
-        "num_combos": 0,
+        "stage1_evals": 0,
+        "stage2_evals": 0,
+        "total_evals": 0,
         "elapsed_s": 0.0,
         "error": error,
     }
@@ -266,21 +338,24 @@ def run_optimization(
     workers: int = 8,
     opt_start: str = _OPT_START,
     opt_end: str = _OPT_END,
-    full_grid: bool = False,
 ) -> dict[str, Any]:
-    """Run walk-forward optimization across all tickers."""
+    """Run 2-stage walk-forward optimization across all tickers."""
     from backtest.strategies import ALL_TICKERS
 
-    combos = _build_combos(full=full_grid)
+    coarse_combos = _build_coarse_combos()
     windows = _build_windows(date.fromisoformat(opt_start), date.fromisoformat(opt_end))
 
-    print(f"\nTrend-Following Deep Optimization")
-    print(f"  Tickers:      {len(ALL_TICKERS)}")
-    print(f"  Param combos: {len(combos)}")
-    print(f"  WF windows:   {len(windows)} per ticker")
-    print(f"  Total evals:  {len(combos) * len(windows) * len(ALL_TICKERS):,}")
-    print(f"  Period:       {opt_start} to {opt_end}")
-    print(f"  Workers:      {workers}")
+    est_per_ticker = len(coarse_combos) * len(windows) + 16 * len(windows)
+    est_total = est_per_ticker * len(ALL_TICKERS)
+
+    print(f"\nTrend-Following 2-Stage Optimization")
+    print(f"  Tickers:           {len(ALL_TICKERS)}")
+    print(f"  Stage 1 combos:    {len(coarse_combos)} (coarse grid)")
+    print(f"  Stage 2 combos:    ~16 (fine grid around winner)")
+    print(f"  WF windows:        {len(windows)} per ticker ({_TRAIN_MONTHS}mo train / {_TEST_MONTHS}mo test)")
+    print(f"  Est. total evals:  ~{est_total:,}")
+    print(f"  Period:            {opt_start} to {opt_end}")
+    print(f"  Workers:           {workers}")
     print(f"{'=' * 70}\n")
 
     # Pre-download all OHLCV data sequentially (avoids yfinance rate limits)
@@ -311,9 +386,11 @@ def run_optimization(
 
     elapsed = time.monotonic() - t0
     succeeded = sum(1 for r in results if r["error"] is None)
+    total_evals = sum(r.get("total_evals", 0) for r in results)
 
     print(f"\n{'=' * 70}")
     print(f"  Done: {succeeded}/{len(ALL_TICKERS)} tickers optimized")
+    print(f"  Total evaluations: {total_evals:,}")
     print(f"  Time: {elapsed:.1f}s")
     print(f"{'=' * 70}\n")
 
@@ -322,8 +399,9 @@ def run_optimization(
         "meta": {
             "opt_start": opt_start,
             "opt_end": opt_end,
-            "num_combos": len(combos),
+            "stage1_combos": len(coarse_combos),
             "num_windows": len(windows),
+            "total_evals": total_evals,
             "elapsed_s": round(elapsed, 1),
         },
     }
@@ -343,10 +421,12 @@ def generate_report(data: dict[str, Any]) -> Path:
         print(text)
         lines.append(text)
 
-    out("# Trend-Following Deep Optimization Report")
+    out("# Trend-Following 2-Stage Optimization Report")
     out(f"**Period:** {meta['opt_start']} to {meta['opt_end']}  ")
-    out(f"**Combos tested:** {meta['num_combos']} per ticker  ")
+    out(f"**Stage 1 combos:** {meta['stage1_combos']} (coarse) + ~16 (fine) per window  ")
     out(f"**Walk-forward windows:** {meta['num_windows']} per ticker  ")
+    out(f"**Total evaluations:** {meta['total_evals']:,}  ")
+    out(f"**Runtime:** {meta['elapsed_s']:.1f}s  ")
     out()
 
     # ── Per-ticker results ───────────────────────────────────────────
@@ -379,7 +459,6 @@ def generate_report(data: dict[str, Any]) -> Path:
     sector_consensus: dict[str, dict] = {}
     for sector in sorted(sectors):
         s_results = sectors[sector]
-        # Pick consensus from best-performing ticker in sector
         best = max(s_results, key=lambda x: x["avg_oos_sharpe"])
         sector_consensus[sector] = best["consensus_params"]
         out(f"**{sector}** (from {best['ticker']}, OOS Sharpe {best['avg_oos_sharpe']:+.2f}):")
@@ -455,7 +534,9 @@ def _send_telegram(data: dict[str, Any]) -> None:
             if r["consensus_params"]:
                 sectors[r["sector"]].append(r)
 
-        lines = ["Trend Optimization Complete\n"]
+        lines = ["Trend 2-Stage Optimization Complete\n"]
+        lines.append(f"Runtime: {data['meta']['elapsed_s']:.0f}s | "
+                     f"Evals: {data['meta']['total_evals']:,}\n")
         lines.append("Best validated combinations:")
         for i, r in enumerate(top3, 1):
             p = r.get("consensus_params", {})
@@ -489,19 +570,14 @@ def _send_telegram(data: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Deep walk-forward optimization of TREND_FOLLOWING strategy.",
+        description="Two-stage walk-forward optimization of TREND_FOLLOWING strategy.",
     )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--start", default=_OPT_START)
     parser.add_argument("--end", default=_OPT_END)
-    parser.add_argument("--full-grid", action="store_true",
-                        help="Use full 4320-combo grid (slow). Default: focused 288-combo grid.")
     args = parser.parse_args(argv)
 
-    data = run_optimization(
-        workers=args.workers, opt_start=args.start, opt_end=args.end,
-        full_grid=args.full_grid,
-    )
+    data = run_optimization(workers=args.workers, opt_start=args.start, opt_end=args.end)
 
     report_path = generate_report(data)
     print(f"\nReport saved → {report_path}")

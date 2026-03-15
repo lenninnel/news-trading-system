@@ -151,6 +151,41 @@ TICKER_TO_COMPANY: dict[str, str] = {
 ADANOS_ENABLED: bool = os.environ.get("ADANOS_ENABLED", "false").lower() in ("true", "1", "yes")
 
 
+# ---------------------------------------------------------------------------
+# Optimized trend-following parameters (2-stage walk-forward, 2023–2025)
+# 9 production-ready tickers; 7 skipped (overfit / low trades / negative OOS)
+# ---------------------------------------------------------------------------
+
+TREND_PARAMS: dict[str, dict] = {
+    # --- AI_CHIPS (sector consensus: SMA 10/200, SL 1.0%, TP 2.25x) ---
+    "MSFT":  {"sma_fast": 10, "sma_slow": 200, "stop_loss_pct": 0.010, "take_profit_ratio": 2.25},
+    "META":  {"sma_fast": 50, "sma_slow": 100, "stop_loss_pct": 0.020, "take_profit_ratio": 2.75},
+    "GOOGL": {"sma_fast": 20, "sma_slow": 200, "stop_loss_pct": 0.015, "take_profit_ratio": 2.50},
+    # --- DATACENTER (sector consensus: SMA 20/200, SL 1.5%, TP 2.5x) ---
+    "VST":   {"sma_fast": 20, "sma_slow": 200, "stop_loss_pct": 0.015, "take_profit_ratio": 2.50},
+    "CEG":   {"sma_fast": 50, "sma_slow": 200, "stop_loss_pct": 0.030, "take_profit_ratio": 2.00},
+    "AAPL":  {"sma_fast": 30, "sma_slow":  75, "stop_loss_pct": 0.015, "take_profit_ratio": 2.25},
+    "DELL":  {"sma_fast": 20, "sma_slow": 200, "stop_loss_pct": 0.015, "take_profit_ratio": 2.50},
+    # --- GERMAN_TECH ---
+    "SAP.XETRA": {"sma_fast": 10, "sma_slow": 175, "stop_loss_pct": 0.035, "take_profit_ratio": 2.50},
+    # --- CRYPTO ---
+    "SOL":   {"sma_fast": 20, "sma_slow": 125, "stop_loss_pct": 0.035, "take_profit_ratio": 2.50},
+}
+
+# Shared defaults for all trend tickers (RSI fixed at standard values)
+TREND_DEFAULTS: dict[str, object] = {
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "require_volume_confirmation": False,
+    "use_sentiment": False,
+    "use_technical": True,
+    "require_trend_alignment": True,
+}
+
+# Tickers skipped (overfit/low trades): NVDA, AMD, TSLA, SMCI, SIE.XETRA, BTC, ETH
+
+
 def is_german_ticker(ticker: str) -> bool:
     """Return True if *ticker* should be routed to EODHD (German/EU stock)."""
     t = ticker.upper()
