@@ -109,7 +109,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 517.0,
+      "elapsed_s": 0.6,
       "error": null
     },
     {
@@ -221,7 +221,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 517.2,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -333,13 +333,13 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 514.8,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
       "ticker": "MSFT",
       "sector": "AI_CHIPS",
-      "avg_oos_sharpe": 3.0651,
+      "avg_oos_sharpe": 3.065,
       "avg_is_sharpe": 1.9349,
       "sharpe_gap": -1.1301,
       "overfitted": false,
@@ -424,7 +424,7 @@
           "train": "2024-01-01 to 2024-09-01",
           "test": "2024-09-01 to 2025-01-01",
           "is_sharpe": 2.1253,
-          "oos_sharpe": 4.7175,
+          "oos_sharpe": 4.7174,
           "oos_return": 1.59,
           "oos_drawdown": 0.26,
           "oos_trades": 4,
@@ -445,7 +445,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 517.2,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -557,7 +557,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 523.6,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -669,7 +669,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 516.7,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -781,7 +781,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 517.1,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -893,7 +893,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 516.6,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -1005,7 +1005,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 500.8,
+      "elapsed_s": 0.6,
       "error": null
     },
     {
@@ -1117,7 +1117,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 497.7,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -1145,7 +1145,7 @@
           "train": "2023-01-01 to 2023-09-01",
           "test": "2023-09-01 to 2024-01-01",
           "is_sharpe": 1.5072,
-          "oos_sharpe": 1.6451,
+          "oos_sharpe": 1.645,
           "oos_return": 2.02,
           "oos_drawdown": 1.05,
           "oos_trades": 23,
@@ -1165,7 +1165,7 @@
           "window": 2,
           "train": "2023-05-01 to 2024-01-01",
           "test": "2024-01-01 to 2024-05-01",
-          "is_sharpe": 1.6844,
+          "is_sharpe": 1.6843,
           "oos_sharpe": 1.7508,
           "oos_return": 1.54,
           "oos_drawdown": 0.89,
@@ -1229,7 +1229,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 500.2,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -1341,7 +1341,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 506.9,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -1453,7 +1453,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 506.0,
+      "elapsed_s": 0.7,
       "error": null
     },
     {
@@ -1565,7 +1565,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 701.4,
+      "elapsed_s": 0.8,
       "error": null
     },
     {
@@ -1677,7 +1677,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 703.3,
+      "elapsed_s": 0.8,
       "error": null
     },
     {
@@ -1789,7 +1789,7 @@
       "stage1_evals": 96,
       "stage2_evals": 320,
       "total_evals": 416,
-      "elapsed_s": 706.3,
+      "elapsed_s": 0.9,
       "error": null
     }
   ],
@@ -1799,6 +1799,6 @@
     "stage1_combos": 24,
     "num_windows": 4,
     "total_evals": 6656,
-    "elapsed_s": 1230.4
+    "elapsed_s": 1.9
   }
 }

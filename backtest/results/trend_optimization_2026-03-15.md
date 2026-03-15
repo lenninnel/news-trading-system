@@ -3,13 +3,13 @@
 **Stage 1 combos:** 24 (coarse) + ~16 (fine) per window  
 **Walk-forward windows:** 4 per ticker  
 **Total evaluations:** 6,656  
-**Runtime:** 1230.4s  
+**Runtime:** 1.9s  
 
 ## Per-Ticker Results
 
 | Ticker | Sector | OOS Sharpe | IS Sharpe | Gap | Trades | Status |
 |--------|--------|-----------|----------|-----|--------|--------|
-| MSFT         | AI_CHIPS   |     +3.07 |    +1.93 | -1.13 |    71 | OK         |
+| MSFT         | AI_CHIPS   |     +3.06 |    +1.93 | -1.13 |    71 | OK         |
 | META         | AI_CHIPS   |     +2.99 |    +2.17 | -0.82 |    51 | OK         |
 | VST          | DATACENTER |     +2.69 |    +2.31 | -0.38 |    62 | OK         |
 | AAPL         | DATACENTER |     +2.32 |    +1.73 | -0.59 |    57 | OK         |
@@ -28,7 +28,7 @@
 
 ## Sector Consensus Parameters
 
-**AI_CHIPS** (from MSFT, OOS Sharpe +3.07):
+**AI_CHIPS** (from MSFT, OOS Sharpe +3.06):
   - require_volume_confirmation: False
   - rsi_overbought: 70
   - rsi_oversold: 30
@@ -70,7 +70,7 @@
 
 ## Top 5 Ticker+Param Combinations (by OOS Sharpe)
 
-1. **MSFT** — OOS Sharpe: +3.07 (IS: +1.93, trades: 71, VALID)
+1. **MSFT** — OOS Sharpe: +3.06 (IS: +1.93, trades: 71, VALID)
    SMA 10/200, RSI-14 (30/70), SL 1.0%, TP 2.25x, vol_confirm=False
 2. **META** — OOS Sharpe: +2.99 (IS: +2.17, trades: 51, VALID)
    SMA 50/100, RSI-14 (30/70), SL 2.0%, TP 2.75x, vol_confirm=False

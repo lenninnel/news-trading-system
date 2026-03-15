@@ -5,6 +5,10 @@ Replays historical OHLCV data bar-by-bar, applies TechnicalAgent signal
 rules with configurable thresholds, simulates a sentiment score, and
 tracks an equity curve with realistic stop-loss / take-profit exits.
 
+Indicators are pre-computed once for the full series using vectorised
+numpy / pandas operations, then the simulation loop runs over numpy
+arrays — no per-bar re-computation.
+
 No live API calls — uses pre-downloaded price data and deterministic
 random sentiment so results are reproducible.
 
@@ -146,6 +150,177 @@ def _signal_from_indicators(ind: dict, params: dict | None = None) -> str:
     return "HOLD"
 
 
+# ── Vectorised indicator pre-computation ─────────────────────────────
+
+def _ema_np(data: np.ndarray, period: int) -> np.ndarray:
+    """Exponential moving average, seeded with SMA of first *period* values."""
+    n = len(data)
+    out = np.full(n, np.nan)
+    if n < period:
+        return out
+    alpha = 2.0 / (period + 1)
+    out[period - 1] = np.mean(data[:period])
+    for i in range(period, n):
+        out[i] = alpha * data[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def _ema_of_valid(data: np.ndarray, period: int) -> np.ndarray:
+    """EMA of array that may have leading NaNs."""
+    n = len(data)
+    out = np.full(n, np.nan)
+    alpha = 2.0 / (period + 1)
+    valid = ~np.isnan(data)
+    count = 0
+    start = -1
+    for i in range(n):
+        if valid[i]:
+            count += 1
+            if count >= period:
+                start = i - period + 1
+                break
+        else:
+            count = 0
+    if start < 0:
+        return out
+    end = start + period
+    out[end - 1] = np.nanmean(data[start:end])
+    for i in range(end, n):
+        if np.isnan(data[i]):
+            out[i] = out[i - 1]
+        else:
+            out[i] = alpha * data[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def _precompute_indicators(df: pd.DataFrame, params: dict) -> dict[str, np.ndarray]:
+    """Compute all indicator arrays once for the full DataFrame."""
+    close = df["Close"].values.astype(np.float64)
+    if close.ndim > 1:
+        close = close[:, 0]
+    n = len(close)
+
+    rsi_period = int(params.get("rsi_period", 14))
+    sma_fast_p = int(params.get("sma_fast", 50))
+    sma_slow_p = int(params.get("sma_slow", 200))
+
+    # ── RSI (Wilder's smoothing) ─────────────────────────────────────
+    rsi = np.full(n, np.nan)
+    if n > rsi_period:
+        delta = np.diff(close)
+        gain = np.maximum(delta, 0.0)
+        loss = np.maximum(-delta, 0.0)
+        ag = np.mean(gain[:rsi_period])
+        al = np.mean(loss[:rsi_period])
+        rsi[rsi_period] = 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+        for i in range(rsi_period, len(delta)):
+            ag = (ag * (rsi_period - 1) + gain[i]) / rsi_period
+            al = (al * (rsi_period - 1) + loss[i]) / rsi_period
+            rsi[i + 1] = 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+
+    # ── MACD (12 / 26 / 9) ──────────────────────────────────────────
+    ema12 = _ema_np(close, 12)
+    ema26 = _ema_np(close, 26)
+    macd_line = ema12 - ema26
+    macd_sig = _ema_of_valid(macd_line, 9)
+
+    # Crossover detection
+    macd_bull = np.zeros(n, dtype=bool)
+    macd_bear = np.zeros(n, dtype=bool)
+    valid_macd = (~np.isnan(macd_line)) & (~np.isnan(macd_sig))
+    for i in range(1, n):
+        if valid_macd[i] and valid_macd[i - 1]:
+            if macd_line[i - 1] <= macd_sig[i - 1] and macd_line[i] > macd_sig[i]:
+                macd_bull[i] = True
+            if macd_line[i - 1] >= macd_sig[i - 1] and macd_line[i] < macd_sig[i]:
+                macd_bear[i] = True
+
+    # ── Bollinger Bands (20, 2σ) ─────────────────────────────────────
+    s_close = pd.Series(close)
+    bb_mean = s_close.rolling(20).mean().values
+    bb_std = s_close.rolling(20).std(ddof=0).values
+    bb_upper = bb_mean + 2.0 * bb_std
+    bb_lower = bb_mean - 2.0 * bb_std
+
+    # ── SMA fast / slow ──────────────────────────────────────────────
+    sma_fast = s_close.rolling(sma_fast_p).mean().values if n >= sma_fast_p else np.full(n, np.nan)
+    sma_slow = s_close.rolling(sma_slow_p).mean().values if n >= sma_slow_p else np.full(n, np.nan)
+
+    # ── Volume RVOL ──────────────────────────────────────────────────
+    if "Volume" in df.columns:
+        volume = df["Volume"].values.astype(np.float64)
+        if volume.ndim > 1:
+            volume = volume[:, 0]
+        vol_avg = pd.Series(volume).rolling(20).mean().values
+        rvol = np.where((vol_avg > 0) & (~np.isnan(vol_avg)), volume / vol_avg, 0.0)
+    else:
+        rvol = np.zeros(n)
+
+    high = df["High"].values.astype(np.float64)
+    low = df["Low"].values.astype(np.float64)
+    if high.ndim > 1:
+        high = high[:, 0]
+    if low.ndim > 1:
+        low = low[:, 0]
+
+    return {
+        "close": close,
+        "high": high,
+        "low": low,
+        "rsi": rsi,
+        "macd_bull": macd_bull,
+        "macd_bear": macd_bear,
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
+        "sma_fast": sma_fast,
+        "sma_slow": sma_slow,
+        "rvol": rvol,
+    }
+
+
+def _precompute_signals(ind: dict[str, np.ndarray], params: dict) -> np.ndarray:
+    """Convert pre-computed indicators to signal array (1=BUY, -1=SELL, 0=HOLD)."""
+    n = len(ind["close"])
+    rsi_os = params.get("rsi_oversold", 30)
+    rsi_ob = params.get("rsi_overbought", 70)
+    trend_req = params.get("require_trend_alignment", False)
+    vol_req = params.get("require_volume_confirmation", False)
+
+    rsi = ind["rsi"]
+    close = ind["close"]
+    bb_lower = ind["bb_lower"]
+    bb_upper = ind["bb_upper"]
+    sma_fast = ind["sma_fast"]
+    sma_slow = ind["sma_slow"]
+    rvol = ind["rvol"]
+
+    valid_rsi = ~np.isnan(rsi)
+    valid_bbl = ~np.isnan(bb_lower)
+    valid_bbu = ~np.isnan(bb_upper)
+
+    buy = ((valid_rsi & (rsi < rsi_os))
+           | ind["macd_bull"]
+           | (valid_bbl & (close < bb_lower)))
+    sell = ((valid_rsi & (rsi > rsi_ob))
+            | ind["macd_bear"]
+            | (valid_bbu & (close > bb_upper)))
+
+    if trend_req:
+        both_valid = (~np.isnan(sma_fast)) & (~np.isnan(sma_slow))
+        buy = buy & ~(both_valid & (sma_fast <= sma_slow))
+        sell = sell & ~(both_valid & (sma_fast >= sma_slow))
+
+    if vol_req:
+        vol_ok = rvol > 1.5
+        buy = buy & vol_ok
+        sell = sell & vol_ok
+
+    signals = np.zeros(n, dtype=np.int8)
+    signals[sell] = -1
+    signals[buy] = 1   # BUY takes priority when both are true
+    return signals
+
+
 # ── Data download with fallbacks ─────────────────────────────────────
 
 _CRYPTO_SYMBOLS = {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVAX"}
@@ -281,9 +456,12 @@ def run_backtest(
     use_sentiment = params.get("use_sentiment", True)
     use_technical = params.get("use_technical", True)
 
-    # -- Download data (or reuse) --
+    # -- Data --
     if ohlcv is not None:
-        df = ohlcv.copy()
+        df = ohlcv
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.copy()
+            df.columns = df.columns.get_level_values(0)
     else:
         df = _download_ohlcv(ticker, start_date, end_date)
 
@@ -294,143 +472,135 @@ def run_backtest(
     sim_mask = df.index >= pd.Timestamp(start_date)
     if not sim_mask.any():
         return _empty_result(account_balance)
-    sim_start_idx = int(np.argmax(sim_mask))
+    sim_start = int(np.argmax(sim_mask))
 
     # Need at least 26 rows of warm-up before simulation start
-    if sim_start_idx < 26:
+    if sim_start < 26:
         return _empty_result(account_balance)
 
-    # -- Simulate --
+    n_total = len(df)
+    n_sim = n_total - sim_start
+
+    # -- Pre-compute indicators & signals once for the full series --
+    indicators = _precompute_indicators(df, params)
+    if use_technical:
+        tech_signals = _precompute_signals(indicators, params)
+    else:
+        tech_signals = np.zeros(n_total, dtype=np.int8)
+
+    # -- Pre-generate all sentiment scores --
     rng = np.random.RandomState(seed)
+    sent_scores = rng.normal(0, 0.3, size=n_sim)
+
+    # -- Extract arrays for the tight loop --
+    close = indicators["close"]
+    high = indicators["high"]
+    low = indicators["low"]
+
+    # -- Simulation (scalar state, numpy reads) --
     cash = account_balance
-    position: dict | None = None  # {shares, entry, stop, tp, direction}
-    equity_curve: list[float] = []
-    trades: list[dict] = []
+    pos_shares = 0
+    pos_entry = 0.0
+    pos_stop = 0.0
+    pos_tp = 0.0
+    pos_dir = 0        # 0=flat, 1=long, -1=short
+    eq = np.empty(n_sim, dtype=np.float64)
+    trade_pnls: list[float] = []
+    trade_exits: list[str] = []
 
-    for day_idx in range(sim_start_idx, len(df)):
-        row = df.iloc[day_idx]
-        price = float(row["Close"])
+    for i in range(n_sim):
+        idx = sim_start + i
+        price = close[idx]
 
-        # Check stop-loss / take-profit on open positions
-        if position is not None:
-            high = float(row["High"])
-            low = float(row["Low"])
-            closed = False
+        # ── Stop-loss / take-profit ──────────────────────────────────
+        if pos_dir != 0:
+            hi = high[idx]
+            lo = low[idx]
+            if pos_dir == 1:
+                if lo <= pos_stop:
+                    pnl = (pos_stop - pos_entry) * pos_shares
+                    cash += pos_shares * pos_stop
+                    trade_pnls.append(pnl)
+                    trade_exits.append("stop_loss")
+                    pos_dir = 0
+                elif hi >= pos_tp:
+                    pnl = (pos_tp - pos_entry) * pos_shares
+                    cash += pos_shares * pos_tp
+                    trade_pnls.append(pnl)
+                    trade_exits.append("take_profit")
+                    pos_dir = 0
+            else:  # short
+                if hi >= pos_stop:
+                    pnl = (pos_entry - pos_stop) * pos_shares
+                    cash += pos_shares * (2.0 * pos_entry - pos_stop)
+                    trade_pnls.append(pnl)
+                    trade_exits.append("stop_loss")
+                    pos_dir = 0
+                elif lo <= pos_tp:
+                    pnl = (pos_entry - pos_tp) * pos_shares
+                    cash += pos_shares * (2.0 * pos_entry - pos_tp)
+                    trade_pnls.append(pnl)
+                    trade_exits.append("take_profit")
+                    pos_dir = 0
 
-            if position["direction"] == "BUY":
-                if low <= position["stop"]:
-                    pnl = (position["stop"] - position["entry"]) * position["shares"]
-                    cash += position["shares"] * position["stop"]
-                    trades.append({"pnl": pnl, "exit": "stop_loss"})
-                    position = None
-                    closed = True
-                elif high >= position["tp"]:
-                    pnl = (position["tp"] - position["entry"]) * position["shares"]
-                    cash += position["shares"] * position["tp"]
-                    trades.append({"pnl": pnl, "exit": "take_profit"})
-                    position = None
-                    closed = True
-            else:  # SELL (short)
-                if high >= position["stop"]:
-                    pnl = (position["entry"] - position["stop"]) * position["shares"]
-                    cash += position["shares"] * (2 * position["entry"] - position["stop"])
-                    trades.append({"pnl": pnl, "exit": "stop_loss"})
-                    position = None
-                    closed = True
-                elif low <= position["tp"]:
-                    pnl = (position["entry"] - position["tp"]) * position["shares"]
-                    cash += position["shares"] * (2 * position["entry"] - position["tp"])
-                    trades.append({"pnl": pnl, "exit": "take_profit"})
-                    position = None
-                    closed = True
+        # ── Signal fusion ────────────────────────────────────────────
+        t = int(tech_signals[idx])
 
-        # Compute indicators on data visible up to today (no look-ahead)
-        df_visible = df.iloc[:day_idx + 1]
-        ind = _compute_indicators(df_visible, params)
-        if not ind:
-            equity = cash + (position["shares"] * price if position else 0)
-            equity_curve.append(equity)
-            continue
-
-        tech_signal = _signal_from_indicators(ind, params) if use_technical else "HOLD"
-
-        # Simulated sentiment score
-        sentiment_score = float(rng.normal(0, 0.3))
-
-        # Combine: sentiment threshold determines sentiment signal
         if use_sentiment:
-            if sentiment_score >= buy_thresh:
-                sent_signal = "BUY"
-            elif sentiment_score <= sell_thresh:
-                sent_signal = "SELL"
-            else:
-                sent_signal = "HOLD"
+            s = sent_scores[i]
+            sent = 1 if s >= buy_thresh else (-1 if s <= sell_thresh else 0)
         else:
-            sent_signal = "HOLD"
+            sent = 0
 
-        # Fusion logic depends on which sources are active
-        combined = None
+        combined = 0
         if use_sentiment and use_technical:
-            # Both must agree
-            if sent_signal == "BUY" and tech_signal == "BUY":
-                combined = "BUY"
-            elif sent_signal == "SELL" and tech_signal == "SELL":
-                combined = "SELL"
-        elif use_technical and not use_sentiment:
-            # Technical only — trade on technical signal alone
-            if tech_signal in ("BUY", "SELL"):
-                combined = tech_signal
-        elif use_sentiment and not use_technical:
-            # Sentiment only — trade on sentiment signal alone
-            if sent_signal in ("BUY", "SELL"):
-                combined = sent_signal
+            if sent == t and t != 0:
+                combined = t
+        elif use_technical:
+            combined = t
+        elif use_sentiment:
+            combined = sent
 
-        # Enter new position if flat
-        if combined is not None and position is None and cash > 0:
+        # ── Entry ────────────────────────────────────────────────────
+        if combined != 0 and pos_dir == 0 and cash > 0:
             risk_budget = cash * 0.02 / stop_pct
             position_budget = min(cash * 0.10, risk_budget)
             shares = int(position_budget / price)
             if shares > 0:
-                cost = shares * price
-                cash -= cost
-
-                if combined == "BUY":
-                    stop = round(price * (1 - stop_pct), 2)
-                    tp_price = round(price * (1 + stop_pct * tp_ratio), 2)
+                cash -= shares * price
+                pos_shares = shares
+                pos_entry = price
+                if combined == 1:
+                    pos_stop = round(price * (1.0 - stop_pct), 2)
+                    pos_tp = round(price * (1.0 + stop_pct * tp_ratio), 2)
+                    pos_dir = 1
                 else:
-                    stop = round(price * (1 + stop_pct), 2)
-                    tp_price = round(price * (1 - stop_pct * tp_ratio), 2)
+                    pos_stop = round(price * (1.0 + stop_pct), 2)
+                    pos_tp = round(price * (1.0 - stop_pct * tp_ratio), 2)
+                    pos_dir = -1
 
-                position = {
-                    "shares": shares,
-                    "entry": price,
-                    "stop": stop,
-                    "tp": tp_price,
-                    "direction": combined,
-                }
-
-        # Mark-to-market equity
-        if position is not None:
-            if position["direction"] == "BUY":
-                mtm = position["shares"] * price
-            else:
-                mtm = position["shares"] * (2 * position["entry"] - price)
-            equity = cash + mtm
+        # ── Mark-to-market ───────────────────────────────────────────
+        if pos_dir == 1:
+            eq[i] = cash + pos_shares * price
+        elif pos_dir == -1:
+            eq[i] = cash + pos_shares * (2.0 * pos_entry - price)
         else:
-            equity = cash
-        equity_curve.append(equity)
+            eq[i] = cash
 
-    # Close any remaining position at last price
-    if position is not None:
-        last_price = float(df.iloc[-1]["Close"])
-        if position["direction"] == "BUY":
-            pnl = (last_price - position["entry"]) * position["shares"]
+    # Close remaining position at last price
+    if pos_dir != 0:
+        last_price = close[-1]
+        if pos_dir == 1:
+            pnl = (last_price - pos_entry) * pos_shares
         else:
-            pnl = (position["entry"] - last_price) * position["shares"]
-        trades.append({"pnl": pnl, "exit": "end_of_period"})
+            pnl = (pos_entry - last_price) * pos_shares
+        trade_pnls.append(pnl)
+        trade_exits.append("end_of_period")
 
     # -- Metrics --
-    wins = sum(1 for t in trades if t["pnl"] > 0)
+    equity_curve = eq.tolist()
+    trades = [{"pnl": p, "exit": e} for p, e in zip(trade_pnls, trade_exits)]
+    wins = sum(1 for p in trade_pnls if p > 0)
     total_return_pct = (equity_curve[-1] / account_balance - 1) if equity_curve else 0.0
 
     return {
