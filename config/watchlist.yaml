@@ -2,13 +2,17 @@
 # News Trading System — daily scheduler configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Tickers to analyse every day
+# Tickers to analyse every day (9 production-ready from trend optimization)
 watchlist:
-  - AAPL
-  - NVDA
-  - TSLA
   - MSFT
+  - META
+  - VST
+  - AAPL
+  - CEG
   - GOOGL
+  - DELL
+  - SAP.XETRA
+  - SOL
 
 # ── Account ───────────────────────────────────────────────────────────────────
 account:
@@ -27,9 +31,10 @@ schedule:
 
 # ── Scheduler strategy ────────────────────────────────────────────────────────
 scheduler:
-  default_strategy: all     # all | momentum | mean-reversion | swing
-                            # Controls which strategy agents run each cycle.
-                            # Override at runtime with --strategy CLI flag.
+  default_strategy: momentum  # all | momentum | mean-reversion | swing
+                              # Controls which strategy agents run each cycle.
+                              # Override at runtime with --strategy CLI flag.
+                              # Using momentum — closest to TREND_FOLLOWING optimized params.
 
 # ── Email notifications (optional) ───────────────────────────────────────────
 email:
