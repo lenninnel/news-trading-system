@@ -28,8 +28,8 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Railway sets $PORT dynamically — do not hardcode or use Docker HEALTHCHECK
-# (Railway handles healthchecks externally via railway.toml healthcheckPath)
-EXPOSE ${PORT:-8501}
+# Railway sets $PORT dynamically (default 8080). EXPOSE is documentation only.
+# Railway handles healthchecks externally via railway.toml healthcheckPath.
+EXPOSE 8080
 
 CMD ["sh", "/app/entrypoint.sh"]

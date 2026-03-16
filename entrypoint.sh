@@ -13,8 +13,7 @@ echo "[entrypoint] Starting Streamlit on port $STREAMLIT_SERVER_PORT..."
 streamlit run dashboard/app.py \
     --server.port="$STREAMLIT_SERVER_PORT" \
     --server.address=0.0.0.0 \
-    --server.headless=true \
-    --server.enableCORS=false &
+    --server.headless=true &
 STREAMLIT_PID=$!
 
 # Wait for Streamlit to become ready (up to 60s)
