@@ -28,9 +28,8 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-EXPOSE 8501
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${STREAMLIT_SERVER_PORT:-8501}/_stcore/health || exit 1
+# Railway sets $PORT dynamically — do not hardcode or use Docker HEALTHCHECK
+# (Railway handles healthchecks externally via railway.toml healthcheckPath)
+EXPOSE ${PORT:-8501}
 
 CMD ["sh", "/app/entrypoint.sh"]
