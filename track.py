@@ -35,7 +35,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from notifications.telegram_bot import TelegramNotifier  # noqa: E402
-from scheduler.daily_runner import DEFAULT_WATCHLIST, run_batch  # noqa: E402
+from scheduler.daily_runner import (  # noqa: E402
+    DEFAULT_WATCHLIST,
+    run_batch,
+    send_eod_summary,
+)
 
 
 def _load_watchlist_config() -> dict:
@@ -192,6 +196,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="N",
         help="Max concurrent tickers (default: 2).",
     )
+    parser.add_argument(
+        "--eod",
+        action="store_true",
+        default=False,
+        help="Send end-of-day P&L summary via Telegram after the run.",
+    )
     return parser.parse_args(argv)
 
 
@@ -246,6 +256,18 @@ def main(argv: list[str] | None = None) -> None:
             print("Telegram notifications sent.")
         except Exception as exc:
             print(f"Telegram notification error (non-fatal): {exc}", file=sys.stderr)
+
+    # EOD summary
+    if args.eod:
+        eod_tg = tg or _build_telegram(_load_watchlist_config())
+        if eod_tg:
+            try:
+                send_eod_summary(eod_tg, batch, tickers)
+                print("EOD summary sent.")
+            except Exception as exc:
+                print(f"EOD summary error (non-fatal): {exc}", file=sys.stderr)
+        else:
+            print("WARNING: --eod requires Telegram credentials.", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -15,16 +15,15 @@ streamlit run dashboard/app.py \
     --server.address=0.0.0.0 \
     --server.headless=true \
     --server.enableCORS=false &
-STREAMLIT_PID=$!
 
 # Give Streamlit a moment to bind the port
 sleep 3
 
-echo "[entrypoint] Running initial pipeline in background..."
+echo "[entrypoint] Running initial pipeline..."
 python3 -m scheduler.daily_runner --now --workers 2 2>&1 &
 
-echo "[entrypoint] Starting background scheduler..."
-python3 -m scheduler.daily_runner 2>&1 &
+echo "[entrypoint] Starting daemon scheduler (4 runs/day, weekdays UTC)..."
+python3 -m scheduler.daily_runner --daemon 2>&1 &
 
-# Wait on Streamlit (the main process)
-wait $STREAMLIT_PID
+# Keep container alive — wait for ALL background jobs
+wait
