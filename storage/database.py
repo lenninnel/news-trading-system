@@ -43,6 +43,17 @@ technical_signals
     rvol            REAL     Relative volume (current / 20-day avg)
     obv_trend       TEXT     OBV direction: "rising" or "falling"
     volume_confirmed INTEGER 1 = volume confirms signal, 0 = not confirmed
+    sma_200         REAL     200-period simple moving average
+    ma200_distance_pct REAL  Distance from SMA-200 as a percentage
+    golden_cross_recent INTEGER 1 = golden cross detected recently
+    death_cross_recent  INTEGER 1 = death cross detected recently
+    adx             REAL     Average Directional Index value
+    trend_strength  TEXT     Trend strength label (e.g. "strong", "weak")
+    bull_flag_detected INTEGER 1 = bull flag pattern detected
+    wedge_type      TEXT     Wedge pattern type (e.g. "rising", "falling")
+    wedge_breakout  INTEGER 1 = wedge breakout detected
+    nearest_support REAL     Nearest support level price
+    nearest_resistance REAL  Nearest resistance level price
     created_at      TEXT     ISO-8601 UTC timestamp
 
 combined_signals
@@ -463,6 +474,27 @@ class Database:
                 except sqlite3.OperationalError:
                     pass  # column already exists
 
+            # Migrate existing DBs: add advanced TA columns to technical_signals
+            for col, typedef in [
+                ("sma_200", "REAL"),
+                ("ma200_distance_pct", "REAL"),
+                ("golden_cross_recent", "INTEGER DEFAULT 0"),
+                ("death_cross_recent", "INTEGER DEFAULT 0"),
+                ("adx", "REAL"),
+                ("trend_strength", "TEXT"),
+                ("bull_flag_detected", "INTEGER DEFAULT 0"),
+                ("wedge_type", "TEXT"),
+                ("wedge_breakout", "INTEGER DEFAULT 0"),
+                ("nearest_support", "REAL"),
+                ("nearest_resistance", "REAL"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE technical_signals ADD COLUMN {col} {typedef}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
             # Migrate existing DBs: add multi-source columns
             for table, col, typedef in [
                 ("runs", "source_breakdown", "TEXT"),
@@ -580,26 +612,48 @@ class Database:
         rvol: "float | None" = None,
         obv_trend: "str | None" = None,
         volume_confirmed: bool = False,
+        sma_200: "float | None" = None,
+        ma200_distance_pct: "float | None" = None,
+        golden_cross_recent: bool = False,
+        death_cross_recent: bool = False,
+        adx: "float | None" = None,
+        trend_strength: "str | None" = None,
+        bull_flag_detected: bool = False,
+        wedge_type: "str | None" = None,
+        wedge_breakout: bool = False,
+        nearest_support: "float | None" = None,
+        nearest_resistance: "float | None" = None,
     ) -> int:
         """
         Persist a technical analysis signal and return its auto-generated ID.
 
         Args:
-            ticker:           Stock ticker symbol.
-            signal:           BUY / SELL / HOLD.
-            reasoning:        Semicolon-separated list of triggered conditions.
-            rsi:              RSI-14 value.
-            macd:             MACD line value.
-            macd_signal:      MACD signal line value.
-            macd_hist:        MACD histogram value.
-            sma_20:           20-period SMA.
-            sma_50:           50-period SMA.
-            bb_upper:         Upper Bollinger Band.
-            bb_lower:         Lower Bollinger Band.
-            price:            Latest close price.
-            rvol:             Relative volume (current / 20-day avg).
-            obv_trend:        OBV direction: "rising" or "falling".
-            volume_confirmed: True when volume confirms the signal direction.
+            ticker:              Stock ticker symbol.
+            signal:              BUY / SELL / HOLD.
+            reasoning:           Semicolon-separated list of triggered conditions.
+            rsi:                 RSI-14 value.
+            macd:                MACD line value.
+            macd_signal:         MACD signal line value.
+            macd_hist:           MACD histogram value.
+            sma_20:              20-period SMA.
+            sma_50:              50-period SMA.
+            bb_upper:            Upper Bollinger Band.
+            bb_lower:            Lower Bollinger Band.
+            price:               Latest close price.
+            rvol:                Relative volume (current / 20-day avg).
+            obv_trend:           OBV direction: "rising" or "falling".
+            volume_confirmed:    True when volume confirms the signal direction.
+            sma_200:             200-period SMA.
+            ma200_distance_pct:  Distance from SMA-200 as a percentage.
+            golden_cross_recent: True if golden cross detected recently.
+            death_cross_recent:  True if death cross detected recently.
+            adx:                 Average Directional Index value.
+            trend_strength:      Trend strength label (e.g. "strong", "weak").
+            bull_flag_detected:  True if bull flag pattern detected.
+            wedge_type:          Wedge pattern type (e.g. "rising", "falling").
+            wedge_breakout:      True if wedge breakout detected.
+            nearest_support:     Nearest support level price.
+            nearest_resistance:  Nearest resistance level price.
 
         Returns:
             The integer primary key of the newly inserted row.
@@ -611,13 +665,25 @@ class Database:
                 INSERT INTO technical_signals
                     (ticker, signal, rsi, macd, macd_signal, macd_hist,
                      sma_20, sma_50, bb_upper, bb_lower, price, reasoning,
-                     rvol, obv_trend, volume_confirmed, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     rvol, obv_trend, volume_confirmed,
+                     sma_200, ma200_distance_pct, golden_cross_recent,
+                     death_cross_recent, adx, trend_strength,
+                     bull_flag_detected, wedge_type, wedge_breakout,
+                     nearest_support, nearest_resistance,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticker, signal, rsi, macd, macd_signal, macd_hist,
                     sma_20, sma_50, bb_upper, bb_lower, price, reasoning,
-                    rvol, obv_trend, int(volume_confirmed), now,
+                    rvol, obv_trend, int(volume_confirmed),
+                    sma_200, ma200_distance_pct,
+                    int(golden_cross_recent), int(death_cross_recent),
+                    adx, trend_strength,
+                    int(bull_flag_detected), wedge_type, int(wedge_breakout),
+                    nearest_support, nearest_resistance,
+                    now,
                 ),
             )
             return cur.lastrowid

@@ -245,6 +245,14 @@ def page_signals() -> None:
             COALESCE(rc.event_risk_flag, 'none')  AS event_risk_flag,
             CASE WHEN ts.volume_confirmed = 1 THEN 'Yes' ELSE 'No' END
                 AS volume_confirmed,
+            CASE WHEN ts.golden_cross_recent = 1 THEN '⭐ Golden Cross'
+                 WHEN ts.death_cross_recent = 1 THEN '💀 Death Cross'
+                 ELSE '' END AS ma_cross,
+            CASE WHEN ts.bull_flag_detected = 1 THEN '🚩 Bull Flag' ELSE '' END AS patterns,
+            CASE WHEN ts.wedge_breakout = 1 THEN '📐 ' || COALESCE(ts.wedge_type, '') || ' Wedge Breakout'
+                 ELSE '' END AS wedge,
+            COALESCE(printf('%.1f', ts.adx), '') AS adx,
+            COALESCE(printf('%.1f%%', ts.ma200_distance_pct), '') AS ma200_dist,
             cs.created_at
         FROM combined_signals cs
         LEFT JOIN technical_signals ts ON cs.technical_id = ts.id
@@ -270,6 +278,31 @@ def page_signals() -> None:
     else:
         st.dataframe(df, width="stretch", hide_index=True)
         st.caption(f"{len(df)} signal(s) shown (max 200)")
+
+    # Pattern alerts (recent golden crosses, bull flags, wedge breakouts)
+    try:
+        patterns_df = _query("""
+            SELECT ts.ticker, ts.signal, ts.price,
+                CASE WHEN ts.golden_cross_recent = 1 THEN '⭐ Golden Cross' ELSE '' END ||
+                CASE WHEN ts.bull_flag_detected = 1 THEN ' 🚩 Bull Flag' ELSE '' END ||
+                CASE WHEN ts.wedge_breakout = 1 THEN ' 📐 Wedge Breakout' ELSE '' END AS patterns,
+                printf('%.1f', ts.adx) AS adx,
+                printf('%.1f%%', ts.ma200_distance_pct) AS ma200_dist,
+                ts.trend_strength,
+                ts.created_at
+            FROM technical_signals ts
+            WHERE ts.golden_cross_recent = 1
+               OR ts.bull_flag_detected = 1
+               OR ts.wedge_breakout = 1
+            ORDER BY ts.id DESC
+            LIMIT 20
+        """)
+        if not patterns_df.empty:
+            st.markdown("---")
+            st.subheader("Pattern Alerts")
+            st.dataframe(patterns_df, width="stretch", hide_index=True)
+    except sqlite3.OperationalError:
+        pass  # new columns may not exist yet on older DBs
 
 
 # ===================================================================
