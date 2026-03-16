@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from emergency_stop import KillSwitch
 from storage.database import Database
 
 
@@ -100,6 +101,7 @@ class PaperTrader:
         Raises:
             ValueError: If action is not "BUY" or "SELL", or shares < 1.
         """
+        KillSwitch.assert_trading_allowed()
         ticker = ticker.upper()
         action = action.upper()
         if action not in ("BUY", "SELL"):

@@ -262,32 +262,34 @@ class TestPaperTrader(IntegrationTestBase):
 
     def test_buy_and_sell_cycle(self):
         from execution.paper_trader import PaperTrader
-        pt = PaperTrader(self.db_path)
+        from storage.database import Database
+        pt = PaperTrader(db=Database(self.db_path))
 
-        trade_id = pt.track_trade("AAPL", "BUY", 5, 150.0,
-                                   stop_loss=147.0, take_profit=156.0)
-        self.assertIsInstance(trade_id, int)
+        trade = pt.track_trade("AAPL", "BUY", 5, 150.0,
+                                stop_loss=147.0, take_profit=156.0)
+        self.assertIsInstance(trade["trade_id"], int)
 
         portfolio = pt.get_portfolio()
         self.assertEqual(len(portfolio), 1)
         self.assertEqual(portfolio[0]["ticker"], "AAPL")
         self.assertEqual(portfolio[0]["shares"], 5)
 
-        sell_id = pt.track_trade("AAPL", "SELL", 5, 156.0)
-        self.assertIsInstance(sell_id, int)
+        sell = pt.track_trade("AAPL", "SELL", 5, 156.0)
+        self.assertIsInstance(sell["trade_id"], int)
 
         portfolio = pt.get_portfolio()
         self.assertEqual(len(portfolio), 0)
 
     def test_kill_switch_blocks_trade(self):
         from execution.paper_trader import PaperTrader
+        from storage.database import Database
         flag = PROJECT_ROOT / "emergency_stop.flag"
         flag.write_text(
             json.dumps({"action": "stop_trading", "activated_at": "2025-01-15T00:00:00"}),
             encoding="utf-8",
         )
         try:
-            pt = PaperTrader(self.db_path)
+            pt = PaperTrader(db=Database(self.db_path))
             with self.assertRaises(RuntimeError, msg="Kill switch should block trade"):
                 pt.track_trade("AAPL", "BUY", 1, 150.0)
         finally:
@@ -295,7 +297,8 @@ class TestPaperTrader(IntegrationTestBase):
 
     def test_averaging_up(self):
         from execution.paper_trader import PaperTrader
-        pt = PaperTrader(self.db_path)
+        from storage.database import Database
+        pt = PaperTrader(db=Database(self.db_path))
         pt.track_trade("AAPL", "BUY", 4, 100.0)
         pt.track_trade("AAPL", "BUY", 4, 120.0)  # avg = 110
         p = pt.get_portfolio()[0]
@@ -304,7 +307,8 @@ class TestPaperTrader(IntegrationTestBase):
 
     def test_pnl_on_sell(self):
         from execution.paper_trader import PaperTrader
-        pt = PaperTrader(self.db_path)
+        from storage.database import Database
+        pt = PaperTrader(db=Database(self.db_path))
         pt.track_trade("AAPL", "BUY", 10, 100.0)
         pt.track_trade("AAPL", "SELL", 10, 110.0)
         history = pt.get_trade_history()

@@ -414,12 +414,6 @@ class StrategyCoordinator:
                     signal=sig.signal,
                     confidence=sig.confidence,
                     timeframe=sig.timeframe,
-                    reasoning="; ".join(sig.reasoning),
-                    indicators_json=json.dumps(sig.indicators),
-                    ensemble_confidence=ensemble_conf,
-                    combined_signal=combined_signal,
-                    consensus=consensus,
-                    account_balance=account_balance,
                     risk_calc_id=risk_calc_id,
                 )
                 ids.append(sid)
@@ -446,20 +440,17 @@ class StrategyCoordinator:
         sw = sig_map.get("swing")
         try:
             return self._db.log_strategy_performance(
-                ticker=ticker,
-                run_at=run_at,
+                ticker,
+                run_at,
+                combined_signal,
+                ensemble_conf,
+                consensus,
                 momentum_signal=m.signal if m else None,
                 momentum_confidence=m.confidence if m else None,
-                mean_reversion_signal=r.signal if r else None,
-                mean_reversion_confidence=r.confidence if r else None,
+                mean_rev_signal=r.signal if r else None,
+                mean_rev_confidence=r.confidence if r else None,
                 swing_signal=sw.signal if sw else None,
                 swing_confidence=sw.confidence if sw else None,
-                combined_signal=combined_signal,
-                ensemble_confidence=ensemble_conf,
-                consensus=consensus,
-                risk_calc_id=risk_calc_id,
-                account_balance=account_balance,
-                errors_json=json.dumps(errors),
             )
         except Exception as exc:
             log.warning("Could not persist strategy performance: %s", exc)

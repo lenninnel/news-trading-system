@@ -14,10 +14,10 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backtest.trend_optimizer import (
-    PARAM_GRID,
+    COARSE_GRID,
     _FIXED_PARAMS,
     _add_months,
-    _build_combos,
+    _build_coarse_combos,
     _build_windows,
     _extract_tunable,
     generate_report,
@@ -32,25 +32,19 @@ class TestParamGrid:
 
     def test_combos_exclude_invalid_sma(self):
         """sma_fast must be < sma_slow — combos with sma_fast >= sma_slow filtered."""
-        combos = _build_combos()
+        combos = _build_coarse_combos()
         for c in combos:
             assert c["sma_fast"] < c["sma_slow"], f"Invalid: {c['sma_fast']} >= {c['sma_slow']}"
 
-    def test_combos_count_default(self):
-        """Default grid: 4 valid sma pairs × 2 × 2 × 2 × 3 × 3 × 2 = 576."""
-        combos = _build_combos(full=False)
-        # sma pairs from default: (20,100), (20,200), (50,100), (50,200) = 4 valid
-        expected = 4 * 2 * 2 * 2 * 3 * 3 * 2
-        assert len(combos) == expected
-
-    def test_combos_count_full(self):
-        """Full grid: 5 valid sma pairs × 3 × 3 × 3 × 4 × 4 × 2 = 4320."""
-        combos = _build_combos(full=True)
-        expected = 5 * 3 * 3 * 3 * 4 * 4 * 2
+    def test_combos_count_coarse(self):
+        """Coarse grid: 4 valid sma pairs × 3 stop_loss × 2 take_profit × 1 × 1 × 1 × 1 = 24."""
+        combos = _build_coarse_combos()
+        # sma pairs from COARSE_GRID: (20,100), (20,200), (50,100), (50,200) = 4 valid
+        expected = 4 * 3 * 2 * 1 * 1 * 1 * 1
         assert len(combos) == expected
 
     def test_all_combos_have_fixed_params(self):
-        combos = _build_combos()
+        combos = _build_coarse_combos()
         for c in combos:
             assert c["use_sentiment"] is False
             assert c["use_technical"] is True
@@ -73,7 +67,7 @@ class TestWalkForwardWindows:
 
     def test_windows_generated_for_2_years(self):
         windows = _build_windows(date(2023, 1, 1), date(2025, 1, 1))
-        assert len(windows) >= 5  # 2 years with 6mo train + 2mo test, rolling 2mo
+        assert len(windows) >= 4  # 2 years with 8mo train + 4mo test, rolling 4mo
 
     def test_window_structure(self):
         windows = _build_windows(date(2023, 1, 1), date(2025, 1, 1))
@@ -129,7 +123,8 @@ class TestReportGeneration:
             ],
             "meta": {
                 "opt_start": "2023-01-01", "opt_end": "2025-01-01",
-                "num_combos": 2592, "num_windows": 6, "elapsed_s": 10.0,
+                "stage1_combos": 24, "num_windows": 6,
+                "total_evals": 2592, "elapsed_s": 10.0,
             },
         }
 
@@ -137,7 +132,7 @@ class TestReportGeneration:
         path = generate_report(self._sample_data())
         assert path.exists()
         content = path.read_text()
-        assert "Trend-Following Deep Optimization" in content
+        assert "Trend-Following 2-Stage Optimization" in content
         assert "AAPL" in content
         assert "OVERFIT" in content
         path.unlink(missing_ok=True)

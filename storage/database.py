@@ -111,13 +111,48 @@ optimization_runs
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 
 from config.settings import DB_PATH
+
+logger = logging.getLogger(__name__)
+
+_MAX_RETRIES = 3
+_BASE_BACKOFF = 0.5  # seconds
+
+
+def _retry_on_locked(func):
+    """Decorator that retries on 'database is locked' OperationalError.
+
+    Retries up to _MAX_RETRIES times with exponential back-off
+    (0.5s, 1.0s, 2.0s).
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc):
+                    raise
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    wait = _BASE_BACKOFF * (2 ** attempt)
+                    logger.warning(
+                        "database is locked (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1, _MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+        raise last_exc  # type: ignore[misc]
+    return wrapper
 
 
 def _resolve_db_path(default: str = DB_PATH) -> str:
@@ -150,10 +185,13 @@ class Database:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    @_retry_on_locked
     def _init_schema(self) -> None:
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -454,6 +492,7 @@ class Database:
     # Public API
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_run(
         self,
         ticker: str,
@@ -479,7 +518,7 @@ class Database:
         """
         now = datetime.now(timezone.utc).isoformat()
         breakdown_json = json.dumps(source_breakdown) if source_breakdown else None
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO runs
@@ -492,6 +531,7 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_headline_score(
         self,
         run_id: int,
@@ -512,7 +552,7 @@ class Database:
             reason:    Claude's one-sentence explanation.
             source:    Data source: newsapi / stocktwits / reddit.
         """
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO headline_scores
@@ -522,6 +562,7 @@ class Database:
                 (run_id, headline, sentiment, score, reason, source),
             )
 
+    @_retry_on_locked
     def log_technical_signal(
         self,
         ticker: str,
@@ -564,7 +605,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO technical_signals
@@ -581,6 +622,7 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_combined_signal(
         self,
         ticker: str,
@@ -610,7 +652,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO combined_signals
@@ -625,6 +667,7 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_risk_calculation(
         self,
         ticker: str,
@@ -671,7 +714,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO risk_calculations
@@ -745,6 +788,7 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    @_retry_on_locked
     def set_portfolio_position(
         self,
         ticker: str,
@@ -762,7 +806,7 @@ class Database:
             current_value: shares x latest price.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO portfolio_positions
@@ -777,6 +821,7 @@ class Database:
                 (ticker, shares, avg_price, current_value, now),
             )
 
+    @_retry_on_locked
     def delete_portfolio_position(self, ticker: str) -> None:
         """
         Remove a position from the portfolio (called when shares reach zero).
@@ -784,11 +829,12 @@ class Database:
         Args:
             ticker: Stock ticker symbol.
         """
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             conn.execute(
                 "DELETE FROM portfolio_positions WHERE ticker = ?", (ticker,)
             )
 
+    @_retry_on_locked
     def log_trade_history(
         self,
         ticker: str,
@@ -815,7 +861,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO trade_history
@@ -844,6 +890,7 @@ class Database:
     # Optimisation runs
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_optimization_run(
         self,
         ticker: str,
@@ -874,7 +921,7 @@ class Database:
         now = datetime.now(timezone.utc).isoformat()
         params_json = json.dumps(best_params)
         curve_json = json.dumps(equity_curve) if equity_curve else None
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO optimization_runs
@@ -952,6 +999,7 @@ class Database:
     # Recovery log
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_recovery_event(
         self,
         service: str,
@@ -966,7 +1014,7 @@ class Database:
     ) -> int:
         """Persist a recovery event and return its row ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO recovery_log
@@ -983,10 +1031,11 @@ class Database:
     # Screener results
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_screener_results(self, run_at: str, candidates: list[dict]) -> None:
         """Persist screener results."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             for c in candidates:
                 conn.execute(
                     """
@@ -1005,6 +1054,7 @@ class Database:
     # Strategy signals + performance
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_strategy_signal(
         self,
         ticker: str,
@@ -1017,7 +1067,7 @@ class Database:
     ) -> int:
         """Persist a strategy signal and return its row ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO strategy_signals
@@ -1030,6 +1080,7 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_strategy_performance(
         self,
         ticker: str,
@@ -1047,7 +1098,7 @@ class Database:
     ) -> int:
         """Persist a strategy performance record."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO strategy_performance
@@ -1068,13 +1119,14 @@ class Database:
     # Health checks, emergency stops, scheduler logs
     # ------------------------------------------------------------------
 
+    @_retry_on_locked
     def log_health_check(
         self, run_at: str,
         newsapi_ok: bool, yfinance_ok: bool, anthropic_ok: bool,
         database_ok: bool, network_ok: bool, scheduler_ok: bool,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO health_checks
@@ -1087,12 +1139,13 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_emergency_stop(
         self, action: str, reason: "str | None" = None,
         activated_by: "str | None" = None,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO emergency_stops (action, reason, activated_by, created_at)
@@ -1102,13 +1155,14 @@ class Database:
             )
             return cur.lastrowid
 
+    @_retry_on_locked
     def log_scheduler_run(
         self, run_at: str, tickers: list, success_count: int,
         fail_count: int, elapsed_s: float, total_elapsed_s: float,
         errors: list, status: str, notes: str = "",
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO scheduler_logs

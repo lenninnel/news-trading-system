@@ -14,11 +14,14 @@ ALPACA_MODE         "paper" (default) or "live"
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
 
 from storage.database import Database
+
+log = logging.getLogger(__name__)
 
 _PAPER_URL = "https://paper-api.alpaca.markets"
 _LIVE_URL = "https://api.alpaca.markets"
@@ -115,7 +118,14 @@ class AlpacaTrader:
             order_params["stop_loss"] = {"stop_price": str(round(stop_loss, 2))}
             order_params["take_profit"] = {"limit_price": str(round(take_profit, 2))}
 
-        order = self._api.submit_order(**order_params)
+        try:
+            order = self._api.submit_order(**order_params)
+        except Exception as exc:
+            log.error(
+                "TRADE FAILED: %s %s %d shares — %s", action, ticker, shares, exc,
+            )
+            self._notify_trade_failed(ticker, action, shares, price, str(exc))
+            raise
 
         # Poll until filled or timeout
         fill_price = self._wait_for_fill(order.id)
@@ -133,6 +143,16 @@ class AlpacaTrader:
             stop_loss=stop_loss,
             take_profit=take_profit,
             pnl=pnl,
+        )
+
+        log.info(
+            "TRADE EXECUTED: %s %s %d shares @ $%.2f (trade_id=%s, SL=%.2f, TP=%.2f)",
+            action, ticker, shares, fill_price, trade_id,
+            stop_loss or 0.0, take_profit or 0.0,
+        )
+
+        self._notify_trade_executed(
+            ticker, action, shares, fill_price, stop_loss, take_profit,
         )
 
         return {
@@ -241,3 +261,73 @@ class AlpacaTrader:
                     )
 
         return pnl
+
+    # ------------------------------------------------------------------
+    # Telegram notifications (best-effort, never crashes the pipeline)
+    # ------------------------------------------------------------------
+
+    def _get_telegram(self):
+        """Lazily build a TelegramNotifier, returning None if unconfigured."""
+        if hasattr(self, "_telegram"):
+            return self._telegram
+        try:
+            from notifications.telegram_bot import TelegramNotifier
+
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+            if token and chat_id:
+                self._telegram = TelegramNotifier(
+                    bot_token=token, chat_id=chat_id,
+                )
+            else:
+                self._telegram = None
+        except Exception:
+            self._telegram = None
+        return self._telegram
+
+    def _notify_trade_executed(
+        self,
+        ticker: str,
+        action: str,
+        shares: int,
+        price: float,
+        stop_loss: "float | None",
+        take_profit: "float | None",
+    ) -> None:
+        """Send a Telegram alert for a successful trade. Never raises."""
+        try:
+            tg = self._get_telegram()
+            if tg is None:
+                return
+            tg.send_trade_executed(
+                ticker=ticker,
+                action=action,
+                shares=shares,
+                price=price,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+            )
+        except Exception as exc:
+            log.debug("Telegram trade notification failed (non-fatal): %s", exc)
+
+    def _notify_trade_failed(
+        self,
+        ticker: str,
+        action: str,
+        shares: int,
+        price: float,
+        reason: str,
+    ) -> None:
+        """Send a Telegram alert for a failed trade. Never raises."""
+        try:
+            tg = self._get_telegram()
+            if tg is None:
+                return
+            msg = (
+                f"\u274c *Trade FAILED* \u2014 `{ticker}`\n"
+                f"Action: {action} {shares} shares @ ${price:,.2f}\n"
+                f"Reason: _{reason[:300]}_"
+            )
+            tg._send(msg)
+        except Exception as exc:
+            log.debug("Telegram failure notification failed (non-fatal): %s", exc)
