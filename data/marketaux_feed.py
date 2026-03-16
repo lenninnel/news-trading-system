@@ -8,8 +8,19 @@ and the per-entity sentiment score returned by the API (``-1`` to ``+1``).
 Caching
 -------
 The free tier allows only 100 requests per day, so every successful response
-is cached in a module-level dict with a 4-hour TTL.  Repeated calls for the
+is cached in a module-level dict with an 8-hour TTL.  Repeated calls for the
 same ticker within that window are served from cache without hitting the API.
+
+Rate limiting
+-------------
+A daily request counter tracks API usage.  When usage exceeds 80 requests,
+all further calls are skipped for the rest of the UTC day and served from
+cache (or return ``[]``).
+
+Signal-based filtering
+----------------------
+Pass ``signal_hint="HOLD"`` to skip the API call for tickers that had a
+HOLD signal on their last run.  This saves ~60% of daily quota.
 
 Recovery behaviour
 ------------------
@@ -22,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -32,15 +44,50 @@ from data.eodhd_feed import EODHDFeed
 logger = logging.getLogger(__name__)
 
 _MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
-_CACHE_TTL_SECONDS = 4 * 60 * 60  # 4 hours
+_CACHE_TTL_SECONDS = 8 * 60 * 60  # 8 hours
+
+_DAILY_LIMIT = 100
+_DAILY_SKIP_THRESHOLD = 80
 
 # {ticker_upper: {"items": list[dict], "fetched_at": float}}
 _cache: dict[str, dict[str, Any]] = {}
 
+# Daily request counter (resets at midnight UTC)
+_daily_requests: int = 0
+_daily_reset_date: str = ""
+
+
+def _get_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _increment_daily_counter() -> int:
+    """Increment and return the daily request count. Resets at midnight UTC."""
+    global _daily_requests, _daily_reset_date
+    today = _get_today()
+    if _daily_reset_date != today:
+        _daily_requests = 0
+        _daily_reset_date = today
+    _daily_requests += 1
+    if _daily_requests == 75:
+        logger.warning("Marketaux: 75/%d daily requests used", _DAILY_LIMIT)
+    return _daily_requests
+
+
+def get_daily_request_count() -> int:
+    """Return current daily request count (for monitoring)."""
+    global _daily_requests, _daily_reset_date
+    if _daily_reset_date != _get_today():
+        return 0
+    return _daily_requests
+
 
 def clear_cache() -> None:
     """Clear the module-level response cache (useful for testing)."""
+    global _daily_requests, _daily_reset_date
     _cache.clear()
+    _daily_requests = 0
+    _daily_reset_date = ""
 
 
 def _is_cache_valid(ticker: str) -> bool:
@@ -82,15 +129,18 @@ class MarketauxFeed:
         self.max_headlines = max_headlines
         self._eodhd = eodhd_feed or EODHDFeed()
 
-    def fetch(self, ticker: str) -> list[dict]:
+    def fetch(self, ticker: str, signal_hint: str = "") -> list[dict]:
         """
         Fetch recent headlines mentioning *ticker* from Marketaux.
 
-        Successful responses are cached for 4 hours.  Returns ``[]`` silently
+        Successful responses are cached for 8 hours.  Returns ``[]`` silently
         when the API token is empty, on network errors, or on non-200 responses.
 
         Args:
-            ticker: Stock ticker symbol (e.g. ``"AAPL"``).
+            ticker:      Stock ticker symbol (e.g. ``"AAPL"``).
+            signal_hint: Last known combined signal (e.g. ``"HOLD"``).
+                         When ``"HOLD"``, the API is skipped and only
+                         cached results (or ``[]``) are returned.
 
         Returns:
             List of dicts with keys ``text``, ``source``, ``marketaux_sentiment``.
@@ -106,7 +156,21 @@ class MarketauxFeed:
         if _is_cache_valid(ticker_upper):
             return _cache[ticker_upper]["items"]
 
+        # -- Skip HOLD tickers (save API quota) -------------------------------
+        if signal_hint.upper() == "HOLD":
+            logger.debug("Marketaux: skipping %s (last signal was HOLD)", ticker_upper)
+            return []
+
+        # -- Skip if daily quota nearly exhausted -----------------------------
+        if get_daily_request_count() >= _DAILY_SKIP_THRESHOLD:
+            logger.warning(
+                "Marketaux: skipping %s — daily limit approaching (%d/%d used)",
+                ticker_upper, get_daily_request_count(), _DAILY_LIMIT,
+            )
+            return []
+
         # -- Live fetch -------------------------------------------------------
+        _increment_daily_counter()
         try:
             params = {
                 "symbols": ticker_upper,

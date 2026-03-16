@@ -122,6 +122,19 @@ class Coordinator:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _last_combined_signal(self, ticker: str) -> str:
+        """Return the last combined_signal for *ticker* from DB, or ''."""
+        try:
+            with self.db._connect() as conn:
+                row = conn.execute(
+                    "SELECT combined_signal FROM combined_signals "
+                    "WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+                    (ticker.upper(),),
+                ).fetchone()
+            return row[0] if row else ""
+        except Exception:
+            return ""
+
     @staticmethod
     def _aggregate(scored: list[dict]) -> float:
         """Return the mean numeric score across all scored headlines."""
@@ -289,8 +302,9 @@ class Coordinator:
         if verbose:
             print(f"  Reddit: {len(reddit_items)} post(s)")
 
-        # Marketaux
-        marketaux_items = self.marketaux_feed.fetch(ticker)
+        # Marketaux (pass last signal hint to skip HOLD tickers and save quota)
+        _last_sig = self._last_combined_signal(ticker)
+        marketaux_items = self.marketaux_feed.fetch(ticker, signal_hint=_last_sig)
         for mx in marketaux_items:
             items.append({"text": mx["text"], "source": "marketaux"})
         if verbose:
@@ -597,8 +611,9 @@ class Coordinator:
             reddit_items = await asyncio.to_thread(
                 self.reddit_feed.fetch, ticker,
             )
+            _last_sig = self._last_combined_signal(ticker)
             marketaux_items = await asyncio.to_thread(
-                self.marketaux_feed.fetch, ticker,
+                self.marketaux_feed.fetch, ticker, _last_sig,
             )
             apewisdom_items = await asyncio.to_thread(
                 self.apewisdom_feed.fetch, ticker,

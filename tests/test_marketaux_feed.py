@@ -178,8 +178,8 @@ class TestMarketauxCaching:
         feed = MarketauxFeed(api_token="tok")
         feed.fetch("AAPL")
 
-        # Second call at t=5 hours (past 4-hour TTL)
-        mock_time.return_value = 5 * 60 * 60
+        # Second call at t=9 hours (past 8-hour TTL)
+        mock_time.return_value = 9 * 60 * 60
         feed.fetch("AAPL")
 
         assert mock_get.call_count == 2
