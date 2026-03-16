@@ -20,6 +20,7 @@ schedule
 # psycopg2-binary is only needed in production (PostgreSQL).
 # For local SQLite development it is optional.
 psycopg2-binary==2.9.9
+filelock
 
 # ── Broker / execution ──────────────────────────────────────────────────────
 alpaca-trade-api

@@ -1,14 +1,18 @@
 """
 Tests for concurrent SQLite access in the Database class.
 
-Verifies that the WAL mode, busy_timeout, threading lock, and retry
-decorator together prevent "database is locked" errors when multiple
-threads perform writes simultaneously.
+Verifies that the WAL mode, busy_timeout, filelock (cross-process),
+threading lock (in-process), and retry decorator together prevent
+"database is locked" errors when multiple threads AND multiple
+processes perform writes simultaneously.
 """
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import sqlite3
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,6 +26,46 @@ def shared_db(tmp_path):
     """A single Database instance shared across threads."""
     return Database(str(tmp_path / "concurrent_test.db"))
 
+
+# ── Helper for multi-process tests ─────────────────────────────────────
+
+def _mp_writer(db_path: str, worker_id: int, results_queue):
+    """Each process creates its own Database instance and writes 20 rows."""
+    db = Database(db_path=db_path)
+    errors = 0
+    for i in range(20):
+        try:
+            db.log_run(
+                ticker=f"TEST_{worker_id}_{i}",
+                headlines_fetched=1,
+                headlines_analysed=1,
+                avg_score=0.5,
+                signal="HOLD",
+            )
+        except Exception:
+            errors += 1
+    results_queue.put(errors)
+
+
+def _mp_heavy_writer(db_path: str, worker_id: int, results_queue):
+    """Each process creates its own Database instance and writes 10 rows."""
+    db = Database(db_path=db_path)
+    errors = 0
+    for i in range(10):
+        try:
+            db.log_run(
+                ticker=f"HEAVY_{worker_id}_{i}",
+                headlines_fetched=1,
+                headlines_analysed=1,
+                avg_score=0.5,
+                signal="HOLD",
+            )
+        except Exception:
+            errors += 1
+    results_queue.put(errors)
+
+
+# ── Thread-based tests (in-process concurrency) ────────────────────────
 
 class TestConcurrentWrites:
     """Verify zero lock errors under concurrent write pressure."""
@@ -161,10 +205,112 @@ class TestConcurrentWrites:
             conn.close()
 
     def test_busy_timeout_set(self, shared_db: Database):
-        """Verify that busy_timeout is set to 5000ms on new connections."""
+        """Verify that busy_timeout is set to 30000ms on new connections."""
         conn = shared_db._connect()
         try:
             timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-            assert timeout == 5000, f"Expected 5000ms timeout, got {timeout}"
+            assert timeout == 30000, f"Expected 30000ms timeout, got {timeout}"
         finally:
             conn.close()
+
+
+# ── Multi-process tests (cross-process concurrency) ────────────────────
+
+class TestMultiProcessConcurrency:
+    """Verify zero lock errors when separate OS processes write simultaneously."""
+
+    def test_five_concurrent_processes_zero_lock_errors(self):
+        """5 separate processes writing simultaneously -- zero errors."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        lock_path = db_path + ".lock"
+
+        try:
+            # Initialize schema
+            Database(db_path=db_path)
+
+            results_queue = multiprocessing.Queue()
+            processes = []
+            for i in range(5):
+                p = multiprocessing.Process(
+                    target=_mp_writer,
+                    args=(db_path, i, results_queue),
+                )
+                processes.append(p)
+                p.start()
+
+            for p in processes:
+                p.join(timeout=60)
+
+            total_errors = 0
+            while not results_queue.empty():
+                total_errors += results_queue.get()
+
+            assert total_errors == 0, (
+                f"Got {total_errors} lock errors across 5 processes"
+            )
+
+            # Verify all 100 rows were written (5 processes x 20 rows each)
+            db = Database(db_path=db_path)
+            rows = db.get_recent_runs(limit=200)
+            assert len(rows) == 100, (
+                f"Expected 100 rows, got {len(rows)}"
+            )
+        finally:
+            # Clean up temp files
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+            if os.path.exists(lock_path):
+                os.unlink(lock_path)
+            # Also clean up WAL/SHM files SQLite may have left behind
+            for suffix in ("-wal", "-shm"):
+                path = db_path + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_ten_concurrent_processes_heavy_writes(self):
+        """10 processes x 10 rows each -- zero errors under heavier load."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        lock_path = db_path + ".lock"
+
+        try:
+            Database(db_path=db_path)
+
+            results_queue = multiprocessing.Queue()
+            processes = []
+            for i in range(10):
+                p = multiprocessing.Process(
+                    target=_mp_heavy_writer,
+                    args=(db_path, i, results_queue),
+                )
+                processes.append(p)
+                p.start()
+
+            for p in processes:
+                p.join(timeout=120)
+
+            total_errors = 0
+            while not results_queue.empty():
+                total_errors += results_queue.get()
+
+            assert total_errors == 0, (
+                f"Got {total_errors} lock errors across 10 processes"
+            )
+
+            db = Database(db_path=db_path)
+            rows = db.get_recent_runs(limit=200)
+            assert len(rows) == 100, (
+                f"Expected 100 rows (10x10), got {len(rows)}"
+            )
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+            if os.path.exists(lock_path):
+                os.unlink(lock_path)
+            for suffix in ("-wal", "-shm"):
+                path = db_path + suffix
+                if os.path.exists(path):
+                    os.unlink(path)

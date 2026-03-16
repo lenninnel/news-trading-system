@@ -131,19 +131,21 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from filelock import FileLock
+
 from config.settings import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 3
-_BASE_BACKOFF = 0.5  # seconds
+_MAX_RETRIES = 5
+_BASE_BACKOFF = 1.0  # seconds
 
 
 def _retry_on_locked(func):
     """Decorator that retries on 'database is locked' OperationalError.
 
     Retries up to _MAX_RETRIES times with exponential back-off
-    (0.5s, 1.0s, 2.0s).
+    (1s, 2s, 4s, 8s, 16s).
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -187,6 +189,7 @@ class Database:
             db_path: Path to the SQLite file. Defaults to settings.DB_PATH.
         """
         self.db_path = db_path or _resolve_db_path()
+        self._file_lock = FileLock(self.db_path + ".lock", timeout=30)
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -197,12 +200,12 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     @_retry_on_locked
     def _init_schema(self) -> None:
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -550,7 +553,7 @@ class Database:
         """
         now = datetime.now(timezone.utc).isoformat()
         breakdown_json = json.dumps(source_breakdown) if source_breakdown else None
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO runs
@@ -584,7 +587,7 @@ class Database:
             reason:    Claude's one-sentence explanation.
             source:    Data source: newsapi / stocktwits / reddit.
         """
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO headline_scores
@@ -659,7 +662,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO technical_signals
@@ -718,7 +721,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO combined_signals
@@ -780,7 +783,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO risk_calculations
@@ -872,7 +875,7 @@ class Database:
             current_value: shares x latest price.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO portfolio_positions
@@ -895,7 +898,7 @@ class Database:
         Args:
             ticker: Stock ticker symbol.
         """
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             conn.execute(
                 "DELETE FROM portfolio_positions WHERE ticker = ?", (ticker,)
             )
@@ -927,7 +930,7 @@ class Database:
             The integer primary key of the newly inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO trade_history
@@ -987,7 +990,7 @@ class Database:
         now = datetime.now(timezone.utc).isoformat()
         params_json = json.dumps(best_params)
         curve_json = json.dumps(equity_curve) if equity_curve else None
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO optimization_runs
@@ -1080,7 +1083,7 @@ class Database:
     ) -> int:
         """Persist a recovery event and return its row ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO recovery_log
@@ -1101,7 +1104,7 @@ class Database:
     def log_screener_results(self, run_at: str, candidates: list[dict]) -> None:
         """Persist screener results."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             for c in candidates:
                 conn.execute(
                     """
@@ -1133,7 +1136,7 @@ class Database:
     ) -> int:
         """Persist a strategy signal and return its row ID."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO strategy_signals
@@ -1164,7 +1167,7 @@ class Database:
     ) -> int:
         """Persist a strategy performance record."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO strategy_performance
@@ -1192,7 +1195,7 @@ class Database:
         database_ok: bool, network_ok: bool, scheduler_ok: bool,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO health_checks
@@ -1211,7 +1214,7 @@ class Database:
         activated_by: "str | None" = None,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO emergency_stops (action, reason, activated_by, created_at)
@@ -1228,7 +1231,7 @@ class Database:
         errors: list, status: str, notes: str = "",
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._write_lock, self._connect() as conn:
+        with self._file_lock, self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO scheduler_logs
