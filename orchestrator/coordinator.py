@@ -492,18 +492,31 @@ class Coordinator:
         # --- Paper trade execution ---
         execution = None
         if execute and not risk["skipped"]:
-            execution = self.paper_trader.track_trade(
-                ticker=ticker,
-                action=risk["direction"],
-                shares=risk["shares"],
-                price=price,
-                stop_loss=risk["stop_loss"],
-                take_profit=risk["take_profit"],
-            )
-            if verbose:
-                print(f"\n  [EXECUTED] Paper trade #{execution['trade_id']}: "
-                      f"{risk['direction']} {risk['shares']} {ticker} "
-                      f"@ ${price:.2f}")
+            # Guard: abort if price is invalid
+            if not price or price <= 0:
+                if verbose:
+                    print(f"\n  [ABORTED] No valid price for {ticker} — skipping trade")
+            # Guard: abort if stop_loss or take_profit missing
+            elif not risk.get("stop_loss") or not risk.get("take_profit"):
+                if verbose:
+                    print(f"\n  [ABORTED] Missing stop_loss/take_profit for {ticker}")
+            # Guard: skip if position already open (duplicate trade prevention)
+            elif risk["direction"] == "BUY" and self.db.get_portfolio_position(ticker):
+                if verbose:
+                    print(f"\n  [SKIPPED] Position already open for {ticker}")
+            else:
+                execution = self.paper_trader.track_trade(
+                    ticker=ticker,
+                    action=risk["direction"],
+                    shares=risk["shares"],
+                    price=price,
+                    stop_loss=risk["stop_loss"],
+                    take_profit=risk["take_profit"],
+                )
+                if verbose:
+                    print(f"\n  [EXECUTED] Paper trade #{execution['trade_id']}: "
+                          f"{risk['direction']} {risk['shares']} {ticker} "
+                          f"@ ${price:.2f}")
 
         return {
             "ticker": ticker,
@@ -706,15 +719,38 @@ class Coordinator:
         # --- Execution ---
         execution = None
         if execute and not risk["skipped"]:
-            async with db_lock:
-                execution = self.paper_trader.track_trade(
-                    ticker=ticker,
-                    action=risk["direction"],
-                    shares=risk["shares"],
-                    price=price,
-                    stop_loss=risk["stop_loss"],
-                    take_profit=risk["take_profit"],
-                )
+            # Guard: abort if price is invalid
+            if not price or price <= 0:
+                pass  # skip — no valid price
+            # Guard: abort if stop_loss or take_profit missing
+            elif not risk.get("stop_loss") or not risk.get("take_profit"):
+                pass  # skip — missing protective levels
+            # Guard: skip if position already open (duplicate trade prevention)
+            elif risk["direction"] == "BUY":
+                async with db_lock:
+                    existing = self.db.get_portfolio_position(ticker)
+                if existing:
+                    pass  # skip — position already open
+                else:
+                    async with db_lock:
+                        execution = self.paper_trader.track_trade(
+                            ticker=ticker,
+                            action=risk["direction"],
+                            shares=risk["shares"],
+                            price=price,
+                            stop_loss=risk["stop_loss"],
+                            take_profit=risk["take_profit"],
+                        )
+            else:
+                async with db_lock:
+                    execution = self.paper_trader.track_trade(
+                        ticker=ticker,
+                        action=risk["direction"],
+                        shares=risk["shares"],
+                        price=price,
+                        stop_loss=risk["stop_loss"],
+                        take_profit=risk["take_profit"],
+                    )
 
         elapsed = _time.monotonic() - t0
 

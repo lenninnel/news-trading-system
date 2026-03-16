@@ -101,6 +101,14 @@ class AlpacaTrader:
             raise ValueError(f"action must be BUY or SELL, got '{action}'")
         if shares < 1:
             raise ValueError(f"shares must be >= 1, got {shares}")
+        if not price or price <= 0:
+            raise ValueError(f"Invalid price ${price} for {ticker} — trade aborted")
+        if action == "BUY" and (not stop_loss or stop_loss <= 0
+                                or not take_profit or take_profit <= 0):
+            raise ValueError(
+                f"BUY requires valid stop_loss/take_profit for {ticker} "
+                f"(got SL={stop_loss}, TP={take_profit}) — trade aborted"
+            )
 
         side = "buy" if action == "BUY" else "sell"
 

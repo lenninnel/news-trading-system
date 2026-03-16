@@ -299,8 +299,8 @@ class TestPaperTrader(IntegrationTestBase):
         from execution.paper_trader import PaperTrader
         from storage.database import Database
         pt = PaperTrader(db=Database(self.db_path))
-        pt.track_trade("AAPL", "BUY", 4, 100.0)
-        pt.track_trade("AAPL", "BUY", 4, 120.0)  # avg = 110
+        pt.track_trade("AAPL", "BUY", 4, 100.0, stop_loss=95.0, take_profit=110.0)
+        pt.track_trade("AAPL", "BUY", 4, 120.0, stop_loss=114.0, take_profit=132.0)
         p = pt.get_portfolio()[0]
         self.assertEqual(p["shares"], 8)
         self.assertAlmostEqual(p["avg_price"], 110.0, places=2)
@@ -309,7 +309,7 @@ class TestPaperTrader(IntegrationTestBase):
         from execution.paper_trader import PaperTrader
         from storage.database import Database
         pt = PaperTrader(db=Database(self.db_path))
-        pt.track_trade("AAPL", "BUY", 10, 100.0)
+        pt.track_trade("AAPL", "BUY", 10, 100.0, stop_loss=95.0, take_profit=110.0)
         pt.track_trade("AAPL", "SELL", 10, 110.0)
         history = pt.get_trade_history()
         sell = [t for t in history if t["action"] == "SELL"][0]

@@ -156,7 +156,11 @@ def page_overview() -> None:
         st.info("No data yet — run the pipeline first.")
         return
 
-    total_value = portfolio["current_value"].sum() if not portfolio.empty else 0.0
+    # Use Alpaca portfolio value if available (source of truth)
+    alpaca_val, _ = _try_alpaca_portfolio()
+    total_value = alpaca_val if alpaca_val is not None else (
+        portfolio["current_value"].sum() if not portfolio.empty else 0.0
+    )
     open_count = len(portfolio)
     total_pnl = trades["pnl"].sum() if not trades.empty else 0.0
 
@@ -309,8 +313,56 @@ def page_signals() -> None:
 # PAGE: Portfolio
 # ===================================================================
 
+def _try_alpaca_portfolio() -> tuple[float | None, pd.DataFrame | None]:
+    """Try to read portfolio from Alpaca API. Returns (value, positions_df) or (None, None)."""
+    try:
+        import alpaca_trade_api as tradeapi
+        key = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        mode = os.environ.get("ALPACA_MODE", "paper").lower()
+        if not key or not secret:
+            return None, None
+        base_url = "https://api.alpaca.markets" if mode == "live" \
+            else "https://paper-api.alpaca.markets"
+        api = tradeapi.REST(key_id=key, secret_key=secret,
+                            base_url=base_url, api_version="v2")
+        account = api.get_account()
+        positions = api.list_positions()
+        portfolio_value = float(account.portfolio_value)
+        rows = []
+        for p in positions:
+            rows.append({
+                "Ticker": p.symbol,
+                "Shares": int(p.qty),
+                "Side": "SHORT" if float(p.qty) < 0 else "LONG",
+                "Avg Price": f"${float(p.avg_entry_price):.2f}",
+                "Live Price": f"${float(p.current_price):.2f}",
+                "Market Value": f"${float(p.market_value):,.2f}",
+                "Unrealised PnL": f"${float(p.unrealized_pl):+,.2f}",
+                "PnL %": f"{float(p.unrealized_plpc) * 100:+.2f}%",
+            })
+        return portfolio_value, pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return None, None
+
+
 def page_portfolio() -> None:
     st.title("Portfolio")
+
+    # Try Alpaca API first (source of truth for live/paper trading)
+    alpaca_value, alpaca_df = _try_alpaca_portfolio()
+
+    if alpaca_value is not None:
+        st.success(f"Live from Alpaca | Portfolio Value: **${alpaca_value:,.2f}**")
+        if alpaca_df is not None and not alpaca_df.empty:
+            st.dataframe(alpaca_df, width="stretch", hide_index=True)
+        else:
+            st.info("No open positions on Alpaca.")
+        st.caption("Data from Alpaca paper trading API")
+        return
+
+    # Fallback: local DB
+    st.warning("Alpaca unavailable — showing local DB (may be stale)")
 
     try:
         positions = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
@@ -332,7 +384,6 @@ def page_portfolio() -> None:
         close = data.get("Close")
         if close is not None:
             if isinstance(close, pd.Series):
-                # Single ticker returns a Series
                 live_prices[tickers[0]] = (
                     float(close.iloc[-1]) if not close.empty else None
                 )
@@ -342,7 +393,7 @@ def page_portfolio() -> None:
                         val = close[t].dropna()
                         live_prices[t] = float(val.iloc[-1]) if not val.empty else None
     except Exception:
-        pass  # fall back to stored current_value
+        pass
 
     rows = []
     for _, pos in positions.iterrows():

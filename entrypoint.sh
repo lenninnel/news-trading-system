@@ -19,9 +19,9 @@ streamlit run dashboard/app.py \
 # Give Streamlit a moment to bind the port
 sleep 3
 
-echo "[entrypoint] Running initial pipeline..."
-python3 -m scheduler.daily_runner --now --workers 2 2>&1 &
-
+# Start ONLY the daemon scheduler — it handles all runs including
+# an immediate first run if within trading hours.
+# Do NOT also run --now separately — that causes duplicate trades.
 echo "[entrypoint] Starting daemon scheduler (4 runs/day, weekdays UTC)..."
 python3 -m scheduler.daily_runner --daemon 2>&1 &
 

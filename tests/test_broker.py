@@ -158,7 +158,8 @@ class TestAlpacaTrader:
     def test_sell_order_with_pnl(self):
         trader = self._make_trader()
         # Buy at filled price 150.25
-        trader.track_trade("AAPL", "BUY", 10, 150.00)
+        trader.track_trade("AAPL", "BUY", 10, 150.00,
+                           stop_loss=145.0, take_profit=160.0)
 
         # Change mock fill price for the sell
         sell_order = _make_order(filled_avg_price="155.00")
@@ -171,11 +172,10 @@ class TestAlpacaTrader:
         assert result["pnl"] == 47.50
 
     def test_market_order_without_bracket(self):
+        """BUY without stop_loss/take_profit is now rejected."""
         trader = self._make_trader()
-        trader.track_trade("AAPL", "BUY", 5, 150.00)
-
-        call_kwargs = trader._api.submit_order.call_args[1]
-        assert "order_class" not in call_kwargs
+        with pytest.raises(ValueError, match="requires valid stop_loss"):
+            trader.track_trade("AAPL", "BUY", 5, 150.00)
 
     def test_invalid_action_raises(self):
         trader = self._make_trader()
@@ -198,7 +198,8 @@ class TestAlpacaTrader:
 
     def test_get_trade_history_delegates_to_db(self):
         trader = self._make_trader()
-        trader.track_trade("AAPL", "BUY", 5, 150.00)
+        trader.track_trade("AAPL", "BUY", 5, 150.00,
+                           stop_loss=145.0, take_profit=160.0)
         history = trader.get_trade_history(ticker="AAPL")
         assert len(history) >= 1
         assert history[0]["ticker"] == "AAPL"
@@ -213,7 +214,8 @@ class TestAlpacaTrader:
         trader = AlpacaTrader(db=db, api=api)
 
         with patch("execution.alpaca_trader._FILL_TIMEOUT", 0):
-            result = trader.track_trade("AAPL", "BUY", 5, 149.99)
+            result = trader.track_trade("AAPL", "BUY", 5, 149.99,
+                                        stop_loss=145.0, take_profit=160.0)
 
         assert result["price"] == 149.99
 
@@ -225,7 +227,8 @@ class TestAlpacaTrader:
         )
         db = Database(db_path=tempfile.mktemp(suffix=".db"))
         trader = AlpacaTrader(db=db, api=api)
-        result = trader.track_trade("AAPL", "BUY", 5, 149.99)
+        result = trader.track_trade("AAPL", "BUY", 5, 149.99,
+                                    stop_loss=145.0, take_profit=160.0)
         assert result["price"] == 149.99
 
 

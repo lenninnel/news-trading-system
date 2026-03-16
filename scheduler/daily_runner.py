@@ -328,6 +328,15 @@ class DailyScheduler:
         print(f"[scheduler] Daemon started — full watchlist: "
               f"{', '.join(self._full_watchlist)}", flush=True)
 
+        # Run once immediately on startup if within trading hours
+        session = self.current_session()
+        if session != "CLOSED":
+            startup_run = self._run_for_session(session)
+            if startup_run:
+                print(f"[scheduler] Immediate startup run: {startup_run['name']}",
+                      flush=True)
+                self._execute_run(startup_run)
+
         while True:
             nrt = self.next_run_time()
             wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
@@ -350,6 +359,13 @@ class DailyScheduler:
     def _run_for_time(self, dt: datetime) -> dict | None:
         for run in SCHEDULE:
             if dt.hour == run["hour"] and dt.minute == run["minute"]:
+                return run
+        return None
+
+    def _run_for_session(self, session_name: str) -> dict | None:
+        """Return the schedule entry matching the given session name."""
+        for run in SCHEDULE:
+            if run["name"] == session_name:
                 return run
         return None
 
