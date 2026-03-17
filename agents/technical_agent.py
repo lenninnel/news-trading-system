@@ -11,14 +11,15 @@ Data source routing:
     - German/EU tickers (.XETRA, .DE) → EODHD (fallback: yfinance)
     - All others → yfinance
 
-Signal rules (any matching condition triggers the signal):
-    BUY  — RSI < 30 (oversold)
-           OR MACD line crosses above signal line (bullish crossover)
-           OR latest close below lower Bollinger Band
-    SELL — RSI > 70 (overbought)
-           OR MACD line crosses below signal line (bearish crossover)
-           OR latest close above upper Bollinger Band
-    HOLD — none of the above conditions met
+Signal rules (weighted scoring system — score >= +2 → BUY, <= -2 → SELL):
+    RSI           — graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
+                     >70 (-2), >65 (-1.5), >55 (-0.5)
+    MACD crossover — bullish (+2), bearish (-2)
+    MACD histogram — positive (+1), negative (-1)
+    Bollinger Band — below lower (+1.5), above upper (-1.5)
+    SMA alignment  — price > SMA20 > SMA50 (+1), price < SMA20 < SMA50 (-1)
+    Golden/Death X — golden cross (+1), death cross (-1)
+    HOLD           — net score between -2 and +2
 
 Volume confirmation (adjusts confidence, does not change signal):
     RVOL (Relative Volume) = current volume / 20-day average volume
@@ -476,17 +477,25 @@ class TechnicalAgent(BaseAgent):
     @staticmethod
     def _apply_signal_rules(ind: dict) -> tuple[str, list[str]]:
         """
-        Evaluate BUY / SELL / HOLD conditions against computed indicators.
+        Evaluate BUY / SELL / HOLD using a weighted scoring system.
 
-        BUY conditions (any one triggers BUY):
-            - RSI < 30 (oversold)
-            - MACD bullish crossover (MACD crosses above signal line)
-            - Price below lower Bollinger Band
+        Each indicator contributes a score: positive for bullish, negative for
+        bearish.  The final signal is determined by the total score crossing a
+        threshold.  This avoids the previous all-or-nothing approach where
+        every single indicator had to be at an extreme before any signal fired.
 
-        SELL conditions (any one triggers SELL; evaluated only when no BUY):
-            - RSI > 70 (overbought)
-            - MACD bearish crossover (MACD crosses below signal line)
-            - Price above upper Bollinger Band
+        Scoring weights:
+            RSI           — up to +/- 2 points (strong oversold/overbought)
+            MACD crossover — 2 points (exact crossover bar)
+            MACD histogram — 1 point  (sustained momentum direction)
+            Bollinger Band — 1.5 points (price outside band)
+            SMA trend      — 1 point  (price vs SMA-20/SMA-50 alignment)
+            Golden/Death X — 1 point  (recent major cross)
+
+        Thresholds:
+            score >= +1.5  → BUY
+            score <= -1.5  → SELL
+            otherwise      → HOLD
 
         Args:
             ind: Indicator dict from ``_calculate_indicators``.
@@ -494,44 +503,98 @@ class TechnicalAgent(BaseAgent):
         Returns:
             Tuple of (signal string, list of triggered condition descriptions).
         """
-        buy_reasons:  list[str] = []
-        sell_reasons: list[str] = []
+        score = 0.0
+        reasons: list[str] = []
 
-        rsi    = ind.get("rsi")
-        price  = ind.get("price")
-        bb_low = ind.get("bb_lower")
-        bb_up  = ind.get("bb_upper")
+        rsi        = ind.get("rsi")
+        price      = ind.get("price")
+        bb_low     = ind.get("bb_lower")
+        bb_up      = ind.get("bb_upper")
+        sma_20     = ind.get("sma_20")
+        sma_50     = ind.get("sma_50")
+        macd_hist  = ind.get("macd_hist")
 
-        # --- BUY conditions ---
-        if rsi is not None and rsi < 30:
-            buy_reasons.append(f"RSI {rsi:.1f} is below 30 (oversold)")
+        # --- RSI (relaxed thresholds with graduated scoring) ---
+        if rsi is not None:
+            if rsi < 30:
+                score += 2.0
+                reasons.append(f"RSI {rsi:.1f} < 30 (strongly oversold, +2)")
+            elif rsi < 35:
+                score += 1.5
+                reasons.append(f"RSI {rsi:.1f} < 35 (oversold, +1.5)")
+            elif rsi < 45:
+                score += 0.5
+                reasons.append(f"RSI {rsi:.1f} < 45 (mildly oversold, +0.5)")
+            elif rsi > 70:
+                score -= 2.0
+                reasons.append(f"RSI {rsi:.1f} > 70 (strongly overbought, -2)")
+            elif rsi > 65:
+                score -= 1.5
+                reasons.append(f"RSI {rsi:.1f} > 65 (overbought, -1.5)")
+            elif rsi > 55:
+                score -= 0.5
+                reasons.append(f"RSI {rsi:.1f} > 55 (mildly overbought, -0.5)")
 
+        # --- MACD crossover (exact bar — strong signal) ---
         if ind.get("macd_bull_cross"):
-            buy_reasons.append("MACD bullish crossover (MACD crossed above signal line)")
-
-        if price is not None and bb_low is not None and price < bb_low:
-            buy_reasons.append(
-                f"Price {price:.2f} is below lower Bollinger Band {bb_low:.2f}"
-            )
-
-        # --- SELL conditions ---
-        if rsi is not None and rsi > 70:
-            sell_reasons.append(f"RSI {rsi:.1f} is above 70 (overbought)")
+            score += 2.0
+            reasons.append("MACD bullish crossover (+2)")
 
         if ind.get("macd_bear_cross"):
-            sell_reasons.append("MACD bearish crossover (MACD crossed below signal line)")
+            score -= 2.0
+            reasons.append("MACD bearish crossover (-2)")
 
-        if price is not None and bb_up is not None and price > bb_up:
-            sell_reasons.append(
-                f"Price {price:.2f} is above upper Bollinger Band {bb_up:.2f}"
+        # --- MACD histogram momentum (sustained direction) ---
+        if macd_hist is not None:
+            if macd_hist > 0:
+                score += 1.0
+                reasons.append(f"MACD histogram {macd_hist:.3f} positive (bullish momentum, +1)")
+            elif macd_hist < 0:
+                score -= 1.0
+                reasons.append(f"MACD histogram {macd_hist:.3f} negative (bearish momentum, -1)")
+
+        # --- Bollinger Band breach ---
+        if price is not None and bb_low is not None and price < bb_low:
+            score += 1.5
+            reasons.append(
+                f"Price {price:.2f} below lower BB {bb_low:.2f} (+1.5)"
             )
 
-        # BUY takes priority when both conditions appear on the same bar
-        if buy_reasons:
-            return "BUY", buy_reasons
-        if sell_reasons:
-            return "SELL", sell_reasons
-        return "HOLD", ["No extreme conditions detected — staying neutral"]
+        if price is not None and bb_up is not None and price > bb_up:
+            score -= 1.5
+            reasons.append(
+                f"Price {price:.2f} above upper BB {bb_up:.2f} (-1.5)"
+            )
+
+        # --- SMA trend alignment ---
+        if price is not None and sma_20 is not None and sma_50 is not None:
+            if price > sma_20 > sma_50:
+                score += 1.0
+                reasons.append(
+                    f"Bullish SMA alignment: price {price:.2f} > SMA20 {sma_20:.2f} > SMA50 {sma_50:.2f} (+1)"
+                )
+            elif price < sma_20 < sma_50:
+                score -= 1.0
+                reasons.append(
+                    f"Bearish SMA alignment: price {price:.2f} < SMA20 {sma_20:.2f} < SMA50 {sma_50:.2f} (-1)"
+                )
+
+        # --- Golden / Death cross ---
+        if ind.get("golden_cross_recent"):
+            score += 1.0
+            reasons.append("Recent golden cross (SMA50 crossed above SMA200, +1)")
+
+        if ind.get("death_cross_recent"):
+            score -= 1.0
+            reasons.append("Recent death cross (SMA50 crossed below SMA200, -1)")
+
+        # --- Determine final signal ---
+        if score >= 1.5:
+            return "BUY", reasons
+        if score <= -1.5:
+            return "SELL", reasons
+        reasons.append(f"Net score {score:.1f} is between -1.5 and +1.5 — staying neutral")
+        return "HOLD", reasons
 
     @staticmethod
     def _check_volume_confirmation(signal: str, ind: dict) -> bool:

@@ -236,11 +236,12 @@ class Coordinator:
             base = 0.25  # HOLD
 
         # Volume adjustment (only for directional signals)
+        # Note: low-rvol penalty removed — rvol compares partial intraday
+        # volume to full-day average, making it structurally < 1.0 during
+        # market hours and penalising every signal incorrectly.
         if combined_signal not in ("HOLD", "CONFLICTING"):
             if volume_confirmed:
                 base += 0.10
-            elif rvol is not None and rvol < 0.7:
-                base -= 0.10
 
         return round(max(0.0, min(1.0, base)), 2)
 
@@ -465,10 +466,21 @@ class Coordinator:
             print(f"\n[3/3] Risk sizing for {ticker}...")
         # Prefer live market price; fall back to technical close price for analysis only
         market_info = sentiment.get("market") or {}
-        price = market_info.get("price") or technical["indicators"].get("price")
-        price_is_live = bool(market_info.get("price")) and not market_info.get("degraded")
+        market_price = market_info.get("price")
+        tech_price = technical["indicators"].get("price")
+        price = market_price or tech_price
+        price_is_live = bool(market_price) and not market_info.get("degraded")
         if not price_is_live and verbose:
             print(f"  [WARNING] No live market price for {ticker} — using technical close")
+        # Cross-validate: if both prices exist but diverge >20%, flag as suspicious
+        if market_price and tech_price and tech_price > 0:
+            divergence = abs(market_price - tech_price) / tech_price
+            if divergence > 0.20:
+                log.error(
+                    "[%s] PRICE MISMATCH: market=$%.2f vs technical=$%.2f (%.0f%% divergence) — aborting trade",
+                    ticker, market_price, tech_price, divergence * 100,
+                )
+                price_is_live = False  # block trade on suspicious data
 
         # Pre-compute event risk so we can downgrade signals before sizing
         days_to_earn = get_days_to_earnings(ticker)
@@ -514,6 +526,11 @@ class Coordinator:
                 if verbose:
                     print(f"\n  [ABORTED] No valid price for {ticker} — skipping trade")
             elif not price_is_live:
+                log.warning(
+                    "[%s] Trade blocked — no live market price (price=%s, source=%s, degraded=%s)",
+                    ticker, price, market_info.get("source", "none"),
+                    market_info.get("degraded", "key_missing"),
+                )
                 if verbose:
                     print(f"\n  [ABORTED] No live market price for {ticker} — refusing to trade on stale data")
             # Guard: abort if stop_loss or take_profit missing/zero
@@ -607,8 +624,8 @@ class Coordinator:
             market: dict = {}
             try:
                 market = await asyncio.to_thread(self.market_data.fetch, ticker)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("[%s] Market data fetch failed: %s", ticker, exc)
 
             newsapi_headlines = await asyncio.to_thread(
                 self.news_feed.fetch, ticker,
@@ -711,9 +728,19 @@ class Coordinator:
             )
 
         # --- Risk sizing ---
-        price = (market or {}).get("price") or \
-            technical["indicators"].get("price")
-        price_is_live = bool((market or {}).get("price")) and not (market or {}).get("degraded")
+        market_price = (market or {}).get("price")
+        tech_price = technical["indicators"].get("price")
+        price = market_price or tech_price
+        price_is_live = bool(market_price) and not (market or {}).get("degraded")
+        # Cross-validate: if both prices exist but diverge >20%, flag as suspicious
+        if market_price and tech_price and tech_price > 0:
+            divergence = abs(market_price - tech_price) / tech_price
+            if divergence > 0.20:
+                log.error(
+                    "[%s] PRICE MISMATCH: market=$%.2f vs technical=$%.2f (%.0f%% divergence) — aborting trade",
+                    ticker, market_price, tech_price, divergence * 100,
+                )
+                price_is_live = False
 
         days_to_earn = get_days_to_earnings(ticker)
         if days_to_earn is not None and days_to_earn <= 2:
@@ -748,7 +775,11 @@ class Coordinator:
                 pass  # skip — no valid price
             # Guard: abort if price is not live (stale/fallback data)
             elif not price_is_live:
-                log.warning("[%s] No live market price — refusing to trade on stale data", ticker)
+                log.warning(
+                    "[%s] Trade blocked — no live market price (price=%s, source=%s, degraded=%s)",
+                    ticker, price, (market or {}).get("source", "none"),
+                    (market or {}).get("degraded", "key_missing"),
+                )
             # Guard: abort if stop_loss or take_profit missing/zero
             elif not risk.get("stop_loss") or risk["stop_loss"] <= 0 \
                     or not risk.get("take_profit") or risk["take_profit"] <= 0:

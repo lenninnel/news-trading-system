@@ -165,15 +165,17 @@ class TestConfidenceVolume:
         boosted = conf("WEAK SELL", 0.5, volume_confirmed=True)
         assert boosted == round(base + 0.10, 2)
 
-    def test_low_rvol_reduces_strong_buy(self):
+    def test_low_rvol_does_not_reduce_strong_buy(self):
+        """Low rvol penalty was removed — rvol < 1.0 is normal intraday."""
         base = conf("STRONG BUY", 0.5)
-        reduced = conf("STRONG BUY", 0.5, rvol=0.5)
-        assert reduced == round(base - 0.10, 2)
+        same = conf("STRONG BUY", 0.5, rvol=0.5)
+        assert same == base
 
-    def test_low_rvol_reduces_weak_sell(self):
+    def test_low_rvol_does_not_reduce_weak_sell(self):
+        """Low rvol penalty was removed — rvol < 1.0 is normal intraday."""
         base = conf("WEAK SELL", 0.5)
-        reduced = conf("WEAK SELL", 0.5, rvol=0.5)
-        assert reduced == round(base - 0.10, 2)
+        same = conf("WEAK SELL", 0.5, rvol=0.5)
+        assert same == base
 
     def test_volume_does_not_affect_hold(self):
         assert conf("HOLD", 0.5, volume_confirmed=True) == conf("HOLD", 0.5)
@@ -187,8 +189,8 @@ class TestConfidenceVolume:
         c = conf("STRONG BUY", 1.0, volume_confirmed=True)
         assert c == 1.0
 
-    def test_confidence_clamped_to_0_with_reduction(self):
-        # WEAK BUY with 0.0 sentiment = 0.20, minus 0.10 = 0.10
+    def test_confidence_floor_with_low_rvol(self):
+        # WEAK BUY with 0.0 sentiment = 0.20 (no rvol penalty)
         c = conf("WEAK BUY", 0.0, rvol=0.3)
-        assert c == 0.10
+        assert c == 0.20
         assert c >= 0.0

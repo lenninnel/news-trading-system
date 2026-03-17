@@ -73,7 +73,7 @@ class RedditFeed:
         try:
             import praw  # noqa: F811
         except ImportError:
-            logger.warning("praw not installed — skipping Reddit feed")
+            logger.info("praw not installed — skipping Reddit feed")
             return []
 
         try:
