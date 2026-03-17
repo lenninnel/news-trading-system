@@ -37,6 +37,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from orchestrator.coordinator import Coordinator
 
@@ -265,8 +268,11 @@ class DailyScheduler:
             chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
             if token and chat_id:
                 return TelegramNotifier(bot_token=token, chat_id=chat_id)
-        except Exception:
-            pass
+            log.warning(
+                "Telegram disabled — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
+            )
+        except Exception as exc:
+            log.warning("Failed to build TelegramNotifier: %s", exc)
         return None
 
     # ── Helper methods ────────────────────────────────────────────────
@@ -328,7 +334,20 @@ class DailyScheduler:
         print(f"[scheduler] Daemon started — full watchlist: "
               f"{', '.join(self._full_watchlist)}", flush=True)
 
+        # Startup notification so we know the daemon is alive
+        if self._tg:
+            nrt = self.next_run_time()
+            try:
+                self._tg._send(
+                    "\U0001f7e2 *News Trading Daemon started*\n"
+                    f"Watchlist: {len(self._full_watchlist)} tickers\n"
+                    f"Next run: {nrt.strftime('%Y-%m-%d %H:%M')} UTC"
+                )
+            except Exception as exc:
+                log.warning("Telegram startup notification failed: %s", exc)
+
         # Run once immediately on startup if within trading hours
+        last_executed: str | None = None
         session = self.current_session()
         if session != "CLOSED":
             startup_run = self._run_for_session(session)
@@ -336,12 +355,21 @@ class DailyScheduler:
                 print(f"[scheduler] Immediate startup run: {startup_run['name']}",
                       flush=True)
                 self._execute_run(startup_run)
+                last_executed = startup_run["name"]
 
         while True:
             nrt = self.next_run_time()
             wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
             run_info = self._run_for_time(nrt)
             run_name = run_info["name"] if run_info else "UNKNOWN"
+
+            # Skip if this is the same session we just ran at startup
+            if run_info and run_info["name"] == last_executed and wait_s == 0:
+                log.info("Skipping %s — already executed at startup", run_name)
+                print(f"[scheduler] Skipping {run_name} — already ran at startup",
+                      flush=True)
+                last_executed = None  # only skip once
+                continue
 
             print(f"[scheduler] Next: {run_name} at "
                   f"{nrt.strftime('%Y-%m-%d %H:%M')} UTC ({wait_s}s away)",
@@ -353,6 +381,7 @@ class DailyScheduler:
 
             if run_info:
                 self._execute_run(run_info)
+                last_executed = run_info["name"]
 
     # ── Execution ─────────────────────────────────────────────────────
 
@@ -382,8 +411,8 @@ class DailyScheduler:
                     f"\U0001f558 *{run_name}* run starting \u2014 {now_str} UTC\n"
                     f"Tickers: {', '.join(tickers)}"
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Telegram session-start notification failed: %s", exc)
 
         log.info("Starting %s: %d tickers, %d workers",
                  run_name, len(tickers), workers)
@@ -411,8 +440,8 @@ class DailyScheduler:
             if self._tg:
                 try:
                     self._send_run_summary(run_name, batch, tickers)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("Telegram run-summary notification failed: %s", exc)
 
             # EOD P&L summary
             if run["eod"]:
@@ -430,8 +459,8 @@ class DailyScheduler:
                         f"\U0001f6a8 *Scheduler error in {run_name}:*\n"
                         f"{str(exc)[:300]}"
                     )
-                except Exception:
-                    pass
+                except Exception as tg_exc:
+                    log.warning("Telegram error notification failed: %s", tg_exc)
 
     def _send_run_summary(self, run_name: str, batch: dict,
                           tickers: list[str]) -> None:
@@ -445,7 +474,7 @@ class DailyScheduler:
             conf = r.get("confidence", 0)
             ticker = r.get("ticker", "?")
             signals.append(f"  {ticker}: {sig} ({conf:.0%})")
-            if r.get("execution", {}).get("trade_id"):
+            if (r.get("execution") or {}).get("trade_id"):
                 trades += 1
 
         lines = [
@@ -459,7 +488,8 @@ class DailyScheduler:
             lines.append("")
             lines.extend(signals[:12])
 
-        self._tg._send("\n".join(lines))
+        if self._tg:
+            self._tg._send("\n".join(lines))
 
 
 # ── EOD summary (shared by daemon + track.py --eod) ──────────────────
@@ -479,7 +509,7 @@ def send_eod_summary(tg, batch: dict, tickers: list[str]) -> None:
     # Count trades
     trades_executed = sum(
         1 for r in results
-        if r and r.get("execution", {}).get("trade_id")
+        if r and (r.get("execution") or {}).get("trade_id")
     )
     trades_failed = batch.get("fail_count", 0)
 

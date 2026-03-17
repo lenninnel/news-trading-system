@@ -463,9 +463,12 @@ class Coordinator:
         # --- Risk sizing ---
         if verbose:
             print(f"\n[3/3] Risk sizing for {ticker}...")
-        # Prefer live market price; fall back to technical close price
-        price = (sentiment.get("market") or {}).get("price") \
-            or technical["indicators"].get("price")
+        # Prefer live market price; fall back to technical close price for analysis only
+        market_info = sentiment.get("market") or {}
+        price = market_info.get("price") or technical["indicators"].get("price")
+        price_is_live = bool(market_info.get("price")) and not market_info.get("degraded")
+        if not price_is_live and verbose:
+            print(f"  [WARNING] No live market price for {ticker} — using technical close")
 
         # Pre-compute event risk so we can downgrade signals before sizing
         days_to_earn = get_days_to_earnings(ticker)
@@ -506,14 +509,19 @@ class Coordinator:
         # --- Paper trade execution ---
         execution = None
         if execute and not risk["skipped"]:
-            # Guard: abort if price is invalid
+            # Guard: abort if price is invalid or not live
             if not price or price <= 0:
                 if verbose:
                     print(f"\n  [ABORTED] No valid price for {ticker} — skipping trade")
-            # Guard: abort if stop_loss or take_profit missing
-            elif not risk.get("stop_loss") or not risk.get("take_profit"):
+            elif not price_is_live:
                 if verbose:
-                    print(f"\n  [ABORTED] Missing stop_loss/take_profit for {ticker}")
+                    print(f"\n  [ABORTED] No live market price for {ticker} — refusing to trade on stale data")
+            # Guard: abort if stop_loss or take_profit missing/zero
+            elif not risk.get("stop_loss") or risk["stop_loss"] <= 0 \
+                    or not risk.get("take_profit") or risk["take_profit"] <= 0:
+                if verbose:
+                    print(f"\n  [ABORTED] Missing/invalid stop_loss/take_profit for {ticker}"
+                          f" (SL={risk.get('stop_loss')}, TP={risk.get('take_profit')})")
             # Guard: skip if position already open (duplicate trade prevention)
             elif risk["direction"] == "BUY" and self.db.get_portfolio_position(ticker):
                 if verbose:
@@ -705,6 +713,7 @@ class Coordinator:
         # --- Risk sizing ---
         price = (market or {}).get("price") or \
             technical["indicators"].get("price")
+        price_is_live = bool((market or {}).get("price")) and not (market or {}).get("degraded")
 
         days_to_earn = get_days_to_earnings(ticker)
         if days_to_earn is not None and days_to_earn <= 2:
@@ -737,17 +746,19 @@ class Coordinator:
             # Guard: abort if price is invalid
             if not price or price <= 0:
                 pass  # skip — no valid price
-            # Guard: abort if stop_loss or take_profit missing
-            elif not risk.get("stop_loss") or not risk.get("take_profit"):
-                pass  # skip — missing protective levels
-            # Guard: skip if position already open (duplicate trade prevention)
-            elif risk["direction"] == "BUY":
+            # Guard: abort if price is not live (stale/fallback data)
+            elif not price_is_live:
+                log.warning("[%s] No live market price — refusing to trade on stale data", ticker)
+            # Guard: abort if stop_loss or take_profit missing/zero
+            elif not risk.get("stop_loss") or risk["stop_loss"] <= 0 \
+                    or not risk.get("take_profit") or risk["take_profit"] <= 0:
+                pass  # skip — missing or invalid protective levels
+            else:
+                # Atomic check-then-execute under a single lock acquisition
                 async with db_lock:
-                    existing = self.db.get_portfolio_position(ticker)
-                if existing:
-                    pass  # skip — position already open
-                else:
-                    async with db_lock:
+                    if risk["direction"] == "BUY" and self.db.get_portfolio_position(ticker):
+                        pass  # skip — position already open
+                    else:
                         execution = self.paper_trader.track_trade(
                             ticker=ticker,
                             action=risk["direction"],
@@ -756,16 +767,6 @@ class Coordinator:
                             stop_loss=risk["stop_loss"],
                             take_profit=risk["take_profit"],
                         )
-            else:
-                async with db_lock:
-                    execution = self.paper_trader.track_trade(
-                        ticker=ticker,
-                        action=risk["direction"],
-                        shares=risk["shares"],
-                        price=price,
-                        stop_loss=risk["stop_loss"],
-                        take_profit=risk["take_profit"],
-                    )
 
         elapsed = _time.monotonic() - t0
 

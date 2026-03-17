@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 import yaml
 from dotenv import load_dotenv
@@ -87,10 +90,10 @@ def _send_notifications(
                 ticker=r["ticker"],
                 signal=signal,
                 confidence=r.get("confidence", 0) * 100,
-                reasoning=r.get("sentiment", {}).get("signal", ""),
+                reasoning=r.get("sentiment", {}).get("signal", signal),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Telegram signal notification failed for %s: %s", r["ticker"], exc)
 
     # Trade execution alerts
     for r in results:
@@ -101,16 +104,20 @@ def _send_notifications(
             continue
         try:
             risk = r.get("risk", {})
+            price = (
+                r.get("technical", {}).get("indicators", {}).get("price")
+                or risk.get("current_price", 0)
+            )
             tg.send_trade_executed(
                 ticker=r["ticker"],
                 action=risk.get("direction", "BUY"),
                 shares=risk.get("shares", 0),
-                price=risk.get("current_price", 0),
+                price=price,
                 stop_loss=risk.get("stop_loss", 0),
                 take_profit=risk.get("take_profit", 0),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Telegram trade notification failed for %s: %s", r["ticker"], exc)
 
     # Daily summary
     try:
@@ -124,7 +131,7 @@ def _send_notifications(
                 "ticker": r["ticker"],
                 "signal": r.get("combined_signal", "?"),
                 "conf": r.get("confidence", 0),
-                "traded": bool(r.get("execution", {}).get("trade_id")),
+                "traded": bool((r.get("execution") or {}).get("trade_id")),
             })
 
         portfolio_value = sum(
@@ -140,7 +147,7 @@ def _send_notifications(
 
         trades_count = sum(
             1 for r in results
-            if r and r.get("execution", {}).get("trade_id")
+            if r and (r.get("execution") or {}).get("trade_id")
         )
         status = (
             "success" if batch["fail_count"] == 0
@@ -156,8 +163,8 @@ def _send_notifications(
             errors=errors,
             status=status,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Telegram daily summary notification failed: %s", exc)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -171,7 +178,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Send results via Telegram (requires TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID).",
     )
     parser.add_argument(
-        "--watchlist",
+        "--watchlist", "--tickers",
         type=str,
         default=None,
         help="Comma-separated list of tickers (default: built-in 20 stocks).",
@@ -234,6 +241,18 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Execute:  {execute}")
     print(f"  Notify:   {'Telegram' if tg else 'off'}")
     print(f"{'=' * 50}\n")
+
+    # Send a startup notification so we know the pipeline is alive
+    if tg:
+        try:
+            tg._send(
+                "\U0001f680 *Pipeline started*\n"
+                f"Tickers: {', '.join(tickers[:10])}"
+                f"{'… +' + str(len(tickers) - 10) if len(tickers) > 10 else ''}\n"
+                f"Workers: {args.workers} | Execute: {execute}"
+            )
+        except Exception as exc:
+            log.warning("Telegram startup notification failed: %s", exc)
 
     batch = asyncio.run(
         run_batch(
