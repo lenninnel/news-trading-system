@@ -335,31 +335,39 @@ class DailyScheduler:
         print(f"[scheduler] Daemon started — full watchlist: "
               f"{', '.join(self._full_watchlist)}", flush=True)
 
-        # Startup sanity: purge positions with obviously wrong prices
+        # Startup sanity: purge ghost positions AND trades with stale prices.
+        # The $200 threshold catches test-fixture prices ($150) while leaving
+        # all real trades intact (cheapest watchlist stock is well above $200).
         try:
-            _startup_db = Database()
-            ghost_pos = _startup_db.get_portfolio()
-            bad = [p for p in ghost_pos if p.get("avg_price", 99999) < 50]
-            if bad:
-                for p in bad:
-                    log.warning(
-                        "[startup] Removing ghost position: %s @ $%.2f",
-                        p["ticker"], p["avg_price"],
-                    )
-                    _startup_db.delete_portfolio_position(p["ticker"])
-                print(f"[scheduler] Startup cleanup: removed {len(bad)} ghost position(s)",
-                      flush=True)
+            from scripts.clean_ghost_trades import clean_ghost_data, _resolve_db_path
+            db_path = _resolve_db_path()
+            result = clean_ghost_data(db_path, apply=True)
+            n_pos = result["deleted_positions"]
+            n_trades = result["deleted_trades"]
+            if n_pos or n_trades:
+                log.warning(
+                    "[startup] Ghost cleanup: deleted %d positions, %d trades (price < $200)",
+                    n_pos, n_trades,
+                )
+                print(f"[scheduler] Startup cleanup: removed {n_pos} ghost positions, "
+                      f"{n_trades} ghost trades", flush=True)
                 if self._tg:
                     try:
+                        details = ", ".join(
+                            f"{p['ticker']} @${p['avg_price']:.2f}"
+                            for p in result["ghost_positions"]
+                        )
                         self._tg._send(
-                            f"\u26a0\ufe0f *Startup cleanup:* removed {len(bad)} ghost position(s) "
-                            f"with price < $50: "
-                            + ", ".join(f"{p['ticker']} @${p['avg_price']:.2f}" for p in bad)
+                            f"\u26a0\ufe0f *Startup ghost cleanup*\n"
+                            f"Deleted {n_pos} positions, {n_trades} trades (price < $200)\n"
+                            f"Positions: {details or 'none'}"
                         )
                     except Exception:
                         pass
+            else:
+                log.info("[startup] Ghost cleanup: database clean")
         except Exception as exc:
-            log.warning("Startup position sanity check failed: %s", exc)
+            log.warning("Startup ghost cleanup failed: %s", exc)
 
         # Startup notification so we know the daemon is alive
         if self._tg:
