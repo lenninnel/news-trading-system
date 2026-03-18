@@ -9,7 +9,11 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
-RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
+# alpaca-trade-api declares websockets<11 but only uses REST; yfinance needs >=13.
+# Two-step install: everything first (sets websockets>=13), then alpaca --no-deps.
+RUN grep -v '^alpaca-trade-api' requirements.txt > /tmp/req_no_alpaca.txt \
+    && pip install --prefix=/install --no-cache-dir -r /tmp/req_no_alpaca.txt \
+    && pip install --prefix=/install --no-cache-dir --no-deps alpaca-trade-api==3.2.0
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
