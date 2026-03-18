@@ -265,8 +265,8 @@ class TestPaperTrader(IntegrationTestBase):
         from storage.database import Database
         pt = PaperTrader(db=Database(self.db_path))
 
-        trade = pt.track_trade("AAPL", "BUY", 5, 150.0,
-                                stop_loss=147.0, take_profit=156.0)
+        trade = pt.track_trade("AAPL", "BUY", 5, 243.0,
+                                stop_loss=238.0, take_profit=253.0)
         self.assertIsInstance(trade["trade_id"], int)
 
         portfolio = pt.get_portfolio()
@@ -274,7 +274,7 @@ class TestPaperTrader(IntegrationTestBase):
         self.assertEqual(portfolio[0]["ticker"], "AAPL")
         self.assertEqual(portfolio[0]["shares"], 5)
 
-        sell = pt.track_trade("AAPL", "SELL", 5, 156.0)
+        sell = pt.track_trade("AAPL", "SELL", 5, 253.0)
         self.assertIsInstance(sell["trade_id"], int)
 
         portfolio = pt.get_portfolio()
@@ -291,7 +291,7 @@ class TestPaperTrader(IntegrationTestBase):
         try:
             pt = PaperTrader(db=Database(self.db_path))
             with self.assertRaises(RuntimeError, msg="Kill switch should block trade"):
-                pt.track_trade("AAPL", "BUY", 1, 150.0)
+                pt.track_trade("AAPL", "BUY", 1, 243.0)
         finally:
             flag.unlink(missing_ok=True)
 
@@ -299,18 +299,18 @@ class TestPaperTrader(IntegrationTestBase):
         from execution.paper_trader import PaperTrader
         from storage.database import Database
         pt = PaperTrader(db=Database(self.db_path))
-        pt.track_trade("AAPL", "BUY", 4, 100.0, stop_loss=95.0, take_profit=110.0)
-        pt.track_trade("AAPL", "BUY", 4, 120.0, stop_loss=114.0, take_profit=132.0)
+        pt.track_trade("AAPL", "BUY", 4, 240.0, stop_loss=235.0, take_profit=250.0)
+        pt.track_trade("AAPL", "BUY", 4, 260.0, stop_loss=254.0, take_profit=272.0)
         p = pt.get_portfolio()[0]
         self.assertEqual(p["shares"], 8)
-        self.assertAlmostEqual(p["avg_price"], 110.0, places=2)
+        self.assertAlmostEqual(p["avg_price"], 250.0, places=2)
 
     def test_pnl_on_sell(self):
         from execution.paper_trader import PaperTrader
         from storage.database import Database
         pt = PaperTrader(db=Database(self.db_path))
-        pt.track_trade("AAPL", "BUY", 10, 100.0, stop_loss=95.0, take_profit=110.0)
-        pt.track_trade("AAPL", "SELL", 10, 110.0)
+        pt.track_trade("AAPL", "BUY", 10, 240.0, stop_loss=235.0, take_profit=250.0)
+        pt.track_trade("AAPL", "SELL", 10, 250.0)
         history = pt.get_trade_history()
         sell = [t for t in history if t["action"] == "SELL"][0]
         self.assertAlmostEqual(sell["pnl"], 100.0, places=2)  # 10 shares × $10 gain

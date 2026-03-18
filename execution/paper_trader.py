@@ -29,8 +29,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 from emergency_stop import KillSwitch
 from storage.database import Database
+
+log = logging.getLogger(__name__)
+
+# Known test-fixture prices that must NEVER appear in production trades.
+# These come from tests/test_broker.py mock objects.
+_KNOWN_TEST_PRICES = frozenset({150.25, 149.99, 155.00, 150.0})
 
 
 class PaperTrader:
@@ -114,6 +122,17 @@ class PaperTrader:
             raise ValueError(
                 f"Price ${price:.2f} for {ticker} outside valid range [$50, $10,000] "
                 f"— ghost price detected, trade aborted"
+            )
+        # Block known test-fixture prices from ever reaching production
+        if price in _KNOWN_TEST_PRICES:
+            log.critical(
+                "BLOCKED TEST-FIXTURE PRICE: %s %s %d shares @ $%.2f "
+                "— this price comes from test mocks, not real market data",
+                action, ticker, shares, price,
+            )
+            raise ValueError(
+                f"Test-fixture price ${price:.2f} detected for {ticker} — "
+                f"trade blocked. This indicates test code is executing in production."
             )
         if action == "BUY" and (not stop_loss or stop_loss <= 0
                                 or not take_profit or take_profit <= 0):

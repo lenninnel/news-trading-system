@@ -34,6 +34,9 @@ _POLL_INTERVAL = 1
 # exchanges).  Execution is silently skipped for these — no error, no Telegram.
 UNSUPPORTED_ALPACA: set[str] = {"SAP.XETRA", "SIE.XETRA"}
 
+# Known test-fixture prices that must NEVER appear in production trades.
+_KNOWN_TEST_PRICES = frozenset({150.25, 149.99, 155.00, 150.0})
+
 
 class AlpacaTrader:
     """
@@ -118,6 +121,16 @@ class AlpacaTrader:
                 "skipped": True,
                 "skip_reason": f"{ticker} not supported on Alpaca",
             }
+
+        # Block known test-fixture prices from ever reaching production
+        if price in _KNOWN_TEST_PRICES:
+            log.critical(
+                "BLOCKED TEST-FIXTURE PRICE: %s %s %d shares @ $%.2f",
+                action, ticker, shares, price,
+            )
+            raise ValueError(
+                f"Test-fixture price ${price:.2f} detected for {ticker} — trade blocked"
+            )
 
         if action not in ("BUY", "SELL"):
             raise ValueError(f"action must be BUY or SELL, got '{action}'")
