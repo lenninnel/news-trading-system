@@ -30,6 +30,10 @@ _LIVE_URL = "https://api.alpaca.markets"
 _FILL_TIMEOUT = 30
 _POLL_INTERVAL = 1
 
+# Tickers that generate signals but cannot be traded on Alpaca (e.g. European
+# exchanges).  Execution is silently skipped for these — no error, no Telegram.
+UNSUPPORTED_ALPACA: set[str] = {"SAP.XETRA", "SIE.XETRA"}
+
 
 class AlpacaTrader:
     """
@@ -97,6 +101,24 @@ class AlpacaTrader:
         """
         ticker = ticker.upper()
         action = action.upper()
+
+        # Skip unsupported tickers gracefully (e.g. European exchanges)
+        if ticker in UNSUPPORTED_ALPACA:
+            log.info("Skipping execution for %s — not supported on Alpaca", ticker)
+            return {
+                "trade_id": None,
+                "ticker": ticker,
+                "action": action,
+                "shares": shares,
+                "price": price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "pnl": 0.0,
+                "total_value": 0.0,
+                "skipped": True,
+                "skip_reason": f"{ticker} not supported on Alpaca",
+            }
+
         if action not in ("BUY", "SELL"):
             raise ValueError(f"action must be BUY or SELL, got '{action}'")
         if shares < 1:
