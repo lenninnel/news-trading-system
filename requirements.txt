@@ -38,7 +38,5 @@ fastapi
 uvicorn[standard]
 
 # ── Testing ───────────────────────────────────────────────────────────────────
-pytest
-pytest-cov
-pytest-mock
-responses>=0.25
+# Test deps moved to requirements-test.txt — NEVER install in production.
+# pip install -r requirements-test.txt
