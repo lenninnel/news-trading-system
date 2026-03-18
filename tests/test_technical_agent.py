@@ -1222,3 +1222,116 @@ class TestEdgeCases:
         assert ind1["sma_200"] == ind2["sma_200"]
         assert ind1["adx"] == ind2["adx"]
         assert ind1["golden_cross_recent"] == ind2["golden_cross_recent"]
+
+
+# ===========================================================================
+# 12. Signal quality — known bullish setup produces BUY
+# ===========================================================================
+
+def _bullish_indicators():
+    """
+    Return a canonical bullish indicator dict.
+
+    Score breakdown:
+      RSI 55   → neutral (45–60), 0 pts (not penalised under new threshold)
+      MACD hist positive → +1.0
+      price > SMA20 > SMA50 → +1.0
+      Total = +2.0 ≥ 1.5 → BUY
+    """
+    return {
+        "rsi": 55.0,
+        "macd_bull_cross": False,
+        "macd_bear_cross": False,
+        "macd_hist": 0.10,
+        "price": 160.0,
+        "bb_lower": 148.0,
+        "bb_upper": 172.0,
+        "sma_20": 158.0,
+        "sma_50": 154.0,
+        "golden_cross_recent": False,
+        "death_cross_recent": False,
+    }
+
+
+class TestSignalQuality:
+    """
+    Validate that realistic market setups produce the expected signal direction.
+
+    All tests use _apply_signal_rules directly (no network I/O).
+    """
+
+    def test_clear_bullish_setup_produces_buy(self):
+        """
+        A healthy uptrend — price > SMA20 > SMA50, positive MACD histogram,
+        RSI in neutral zone (55) — must produce a BUY signal.
+
+        Score: SMA alignment (+1.0) + positive MACD hist (+1.0) = 2.0 ≥ 1.5 → BUY.
+        RSI 55 must NOT contribute a negative penalty (threshold raised to 60).
+
+        This is the canonical regression test for the signal scoring pipeline.
+        """
+        ind = _bullish_indicators()
+        signal, reasoning = TechnicalAgent._apply_signal_rules(ind)
+        assert signal == "BUY", (
+            f"Expected BUY for canonical bullish indicator set, got {signal}. "
+            f"RSI={ind['rsi']}, MACD_hist={ind['macd_hist']}, "
+            f"price={ind['price']} > SMA20={ind['sma_20']} > SMA50={ind['sma_50']}. "
+            f"Scoring reasons: {reasoning}"
+        )
+
+    def test_rsi_neutral_zone_does_not_penalise_uptrend(self):
+        """
+        RSI in the 45–60 neutral zone must not contribute a negative score.
+        In a trending stock, RSI 45–60 is healthy and common — penalising it
+        causes false HOLDs.
+        """
+        # Inject indicators with RSI=55 (was penalised before fix, now neutral)
+        ind = {
+            "rsi": 55.0,
+            "macd_bull_cross": False,
+            "macd_bear_cross": False,
+            "macd_hist": 0.10,
+            "price": 160.0,
+            "bb_lower": 150.0,
+            "bb_upper": 170.0,
+            "sma_20": 158.0,
+            "sma_50": 155.0,
+            "golden_cross_recent": False,
+            "death_cross_recent": False,
+        }
+        signal, reasons = TechnicalAgent._apply_signal_rules(ind)
+        # SMA alignment (+1) + positive MACD hist (+1) = 2.0 → BUY
+        # RSI 55 must NOT add a negative penalty
+        assert signal == "BUY", (
+            f"RSI 55 should not penalise a bullish setup; got signal={signal}, reasons={reasons}"
+        )
+        assert not any("> 55" in r for r in reasons), (
+            "RSI 55 should no longer be flagged as mildly overbought (threshold is now 60)"
+        )
+
+    def test_rsi_just_above_new_threshold_applies_mild_penalty(self):
+        """
+        RSI 61 is just above the new 60 threshold and should apply the -0.5
+        mildly-overbought penalty.
+        """
+        ind = {
+            "rsi": 61.0,
+            "macd_bull_cross": False,
+            "macd_bear_cross": False,
+            "macd_hist": 0.0,
+            "price": 160.0,
+            "bb_lower": 150.0,
+            "bb_upper": 170.0,
+            "sma_20": 158.0,
+            "sma_50": 155.0,
+            "golden_cross_recent": False,
+            "death_cross_recent": False,
+        }
+        signal, reasons = TechnicalAgent._apply_signal_rules(ind)
+        # Score: RSI 61 (-0.5) + SMA alignment (+1.0) + MACD hist=0 (0) = 0.5 → HOLD
+        assert signal == "HOLD", (
+            f"RSI 61 should apply mild penalty making score 0.5 → HOLD; got {signal}"
+        )
+        assert any("> 60" in r for r in reasons), (
+            "RSI 61 should be flagged as mildly overbought (> 60)"
+        )
