@@ -24,7 +24,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from backtest.engine import run_backtest
 
@@ -103,12 +102,20 @@ class WalkForwardOptimizer:
         """
         # Download OHLCV once — include 90-day warm-up before start
         warmup = self.start - timedelta(days=120)
-        df = yf.download(
-            self.ticker,
-            start=warmup.strftime("%Y-%m-%d"),
-            end=self.end.strftime("%Y-%m-%d"),
-            progress=False,
-        )
+        start_str = warmup.strftime("%Y-%m-%d")
+        end_str = self.end.strftime("%Y-%m-%d")
+        try:
+            from data.alpaca_data import AlpacaDataClient
+            alpaca = AlpacaDataClient()
+            df = alpaca.get_bars(
+                self.ticker, "1Day", limit=500,
+                start=start_str, end=end_str,
+            )
+        except Exception:
+            import yfinance as yf
+            df = yf.download(
+                self.ticker, start=start_str, end=end_str, progress=False,
+            )
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 

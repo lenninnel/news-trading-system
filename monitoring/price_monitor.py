@@ -55,8 +55,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yfinance as yf
-
 # ── Path setup (allow running as __main__ from project root) ──────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -422,7 +420,7 @@ class PriceMonitor:
 
     def _fetch_quote(self, ticker: str) -> dict:
         """
-        Fetch current price and volume for *ticker* via yfinance.
+        Fetch current price and volume for *ticker* via Alpaca Data API.
 
         Returns a dict with keys:
             price        (float | None)
@@ -430,7 +428,7 @@ class PriceMonitor:
             today_volume (float)   current day's volume
             avg_volume   (float)   20-day average daily volume
 
-        Cached for CACHE_TTL seconds.  Falls back to last close on failure.
+        Cached for CACHE_TTL seconds.  Falls back gracefully on failure.
         """
         now    = time.time()
         cached = _QUOTE_CACHE.get(ticker)
@@ -439,24 +437,26 @@ class PriceMonitor:
 
         quote: dict = {}
         try:
-            obj  = yf.Ticker(ticker)
-            fast = obj.fast_info
+            from data.alpaca_data import AlpacaDataClient
+            alpaca = AlpacaDataClient()
 
-            price      = _safe_float(getattr(fast, "last_price",      None))
-            prev_close = _safe_float(getattr(fast, "previous_close",  None))
+            # Get snapshot for price + prev_close
+            snap = alpaca.get_snapshot(ticker)
+            price      = _safe_float(snap.get("price"))
+            prev_close = _safe_float(snap.get("prev_close"))
 
-            # Intraday fallback: use previous_close if last_price unavailable
-            if price is None:
-                price = prev_close
-
-            # Volume: download last 25 trading days
-            hist = obj.history(period="25d", interval="1d", auto_adjust=True)
-            if not hist.empty:
-                today_vol = float(hist["Volume"].iloc[-1])
-                avg_vol   = float(hist["Volume"].iloc[:-1].mean()) if len(hist) > 1 else today_vol
-            else:
-                today_vol = 0.0
-                avg_vol   = 0.0
+            # Volume: use Alpaca bars for 25-day history
+            try:
+                bars = alpaca.get_bars(ticker, "1Day", limit=25)
+                if not bars.empty and "Volume" in bars.columns:
+                    today_vol = float(bars["Volume"].iloc[-1])
+                    avg_vol = float(bars["Volume"].iloc[:-1].mean()) if len(bars) > 1 else today_vol
+                else:
+                    today_vol = float(snap.get("volume", 0))
+                    avg_vol = today_vol
+            except Exception:
+                today_vol = float(snap.get("volume", 0))
+                avg_vol = today_vol
 
             quote = {
                 "price":        price,
@@ -465,7 +465,7 @@ class PriceMonitor:
                 "avg_volume":   avg_vol,
             }
         except Exception as exc:
-            log.warning("Quote fetch failed for %s: %s", ticker, exc)
+            log.warning("Alpaca quote fetch failed for %s: %s", ticker, exc)
 
         _QUOTE_CACHE[ticker] = (now, quote)
         return quote

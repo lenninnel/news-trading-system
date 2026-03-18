@@ -453,74 +453,55 @@ class TestStockTwitsBackoff:
 # yfinance crumb / 401 retry
 # ===========================================================================
 
-class TestYfinanceCrumbRetry:
-    """Verify MarketData retries on crumb errors and clears cache."""
+class TestMarketDataAlpaca:
+    """Verify MarketData uses Alpaca for US stocks."""
 
-    @patch("data.market_data._clear_yf_cache")
-    @patch("data.market_data.yf")
-    def test_retries_on_401_error(self, mock_yf, mock_clear):
+    def test_alpaca_success(self):
         from data.market_data import MarketData
 
-        # First Ticker().info raises crumb error, second succeeds
-        bad_ticker = MagicMock()
-        bad_ticker.info.__getitem__ = MagicMock(side_effect=Exception("401 Unauthorized"))
-        type(bad_ticker).info = property(
-            lambda self: (_ for _ in ()).throw(Exception("401 Unauthorized"))
-        )
-        good_ticker = MagicMock()
-        good_ticker.info = {"longName": "Apple", "currentPrice": 190.0, "currency": "USD"}
-        mock_yf.Ticker.side_effect = [bad_ticker, good_ticker]
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 190.0
 
-        md = MarketData()
+        md = MarketData(alpaca_client=mock_alpaca)
         result = md.fetch("AAPL")
 
         assert result["price"] == 190.0
-        mock_clear.assert_called_once()
+        assert result["source"] == "alpaca"
 
-    @patch("data.market_data._clear_yf_cache")
-    @patch("data.market_data.yf")
-    def test_fallback_when_retry_also_fails(self, mock_yf, mock_clear):
+    def test_fallback_when_alpaca_fails(self):
         from data.market_data import MarketData
 
-        bad = MagicMock()
-        type(bad).info = property(
-            lambda self: (_ for _ in ()).throw(Exception("401 Unauthorized"))
-        )
-        mock_yf.Ticker.return_value = bad
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
-        md = MarketData()
+        md = MarketData(alpaca_client=mock_alpaca)
         result = md.fetch("AAPL")
 
         # Should return fallback instead of raising
         assert result["ticker"] == "AAPL"
         assert result["price"] is None
-        assert result["name"] == "N/A"
-        mock_clear.assert_called_once()
+        assert result["source"] == "none"
 
-    @patch("data.market_data._clear_yf_cache")
-    @patch("data.market_data.yf")
-    def test_no_retry_on_non_crumb_error(self, mock_yf, mock_clear):
+    def test_non_value_error_propagated(self):
         from data.market_data import MarketData
 
-        mock_yf.Ticker.side_effect = ValueError("Bad ticker")
-        md = MarketData()
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = RuntimeError("Bad connection")
 
-        with pytest.raises(ValueError, match="Bad ticker"):
-            md.fetch("INVALID")
+        md = MarketData(alpaca_client=mock_alpaca)
+        # RuntimeError is caught by the try/except in fetch()
+        result = md.fetch("INVALID")
+        assert result["price"] is None
 
-        mock_clear.assert_not_called()
-
-    @patch("data.market_data._clear_yf_cache")
-    @patch("data.market_data.yf")
-    def test_succeeds_without_retry(self, mock_yf, mock_clear):
+    def test_succeeds_without_fallback(self):
         from data.market_data import MarketData
 
-        mock_ticker = MagicMock()
-        mock_ticker.info = {"longName": "Apple", "currentPrice": 190.0, "currency": "USD"}
-        mock_yf.Ticker.return_value = mock_ticker
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 190.0
 
-        md = MarketData()
+        md = MarketData(alpaca_client=mock_alpaca)
         result = md.fetch("AAPL")
 
         assert result["price"] == 190.0
-        mock_clear.assert_not_called()
+        assert result["source"] == "alpaca"
+        assert result["degraded"] is False

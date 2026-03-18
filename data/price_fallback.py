@@ -3,10 +3,13 @@ Multi-source price data with 4-level fallback chain.
 
 Fallback chain
 --------------
-Level 0 — yfinance            Primary (yf.Ticker.info)
+Level 0 — Alpaca Data API     Primary (latest trade / quote)
 Level 1 — Alpha Vantage       Requires ALPHA_VANTAGE_KEY env var
 Level 2 — Yahoo Finance JSON  Direct Yahoo Finance chart API (no auth)
 Level 3 — Last known price    From ResponseCache or DB; is_estimated=True
+
+For XETRA/DE tickers, Level 0 falls back to yfinance since Alpaca does
+not cover European exchanges.
 
 For critical operations pass ``require_fresh=True`` to raise
 ``FreshDataRequired`` when only Level 3 (estimated) data is available.
@@ -35,7 +38,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-import yfinance as yf
 
 from utils.api_recovery import APIRecovery, CircuitOpenError
 from utils.network_recovery import get_cache
@@ -67,7 +69,7 @@ class PriceResult:
     """Price data with provenance metadata."""
     ticker:       str
     price:        "float | None"
-    source:       str       # "yfinance" | "alpha_vantage" | "yahoo_json" | "cache" | "none"
+    source:       str       # "alpaca" | "yfinance" | "alpha_vantage" | "yahoo_json" | "cache" | "none"
     level:        int       # 0-3
     is_fresh:     bool      # False when using cached/estimated data
     is_estimated: bool      # True when no live source succeeded
@@ -120,7 +122,7 @@ class PriceFallback:
         ticker = ticker.upper()
 
         for level, (name, fn) in enumerate([
-            ("yfinance",      lambda t: self._level0_yfinance(t)),
+            ("alpaca",        lambda t: self._level0_alpaca(t)),
             ("alpha_vantage", lambda t: self._level1_alpha_vantage(t)),
             ("yahoo_json",    lambda t: self._level2_yahoo_json(t)),
             ("cache",         lambda t: self._level3_cache(t)),
@@ -163,35 +165,53 @@ class PriceFallback:
             is_fresh=False, is_estimated=True, degraded=True,
         )
 
-    # -- Level 0: yfinance ---------------------------------------------------
+    # -- Level 0: Alpaca Data API (yfinance fallback for XETRA) ---------------
 
-    def _level0_yfinance(self, ticker: str) -> PriceResult:
-        """Primary: yfinance Ticker.info — current/regular market price."""
-        def _fetch():
-            info  = yf.Ticker(ticker).info
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if price is None:
-                raise ValueError(f"yfinance returned no price for {ticker}")
-            return {
-                "price":      float(price),
-                "currency":   info.get("currency", "USD"),
-                "name":       info.get("longName", ""),
-                "market_cap": info.get("marketCap"),
-                "change_pct": info.get("regularMarketChangePercent"),
-            }
+    def _level0_alpaca(self, ticker: str) -> PriceResult:
+        """Primary: Alpaca latest trade/quote for US stocks.
 
-        data = APIRecovery.call("yfinance", _fetch, ticker=ticker)
+        For XETRA/DE tickers, falls back to yfinance since Alpaca does not
+        cover European exchanges.
+        """
+        from config.settings import is_german_ticker
+        if is_german_ticker(ticker):
+            return self._level0_yfinance_xetra(ticker)
+
+        from data.alpaca_data import AlpacaDataClient
+        client = AlpacaDataClient()
+        price = client.get_current_price(ticker)
         return PriceResult(
             ticker=ticker,
-            price=data["price"],
+            price=price,
+            source="alpaca",
+            level=0,
+            is_fresh=True,
+            is_estimated=False,
+            currency="USD",
+        )
+
+    def _level0_yfinance_xetra(self, ticker: str) -> PriceResult:
+        """Fallback for XETRA/DE tickers — uses yfinance."""
+        import yfinance as yf
+        yf_ticker = ticker
+        if ticker.endswith(".XETRA"):
+            yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+        log.info("Using yfinance for XETRA/DE ticker %s", yf_ticker)
+        info = yf.Ticker(yf_ticker).info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if price is None:
+            raise ValueError(f"yfinance returned no price for {ticker}")
+        return PriceResult(
+            ticker=ticker,
+            price=float(price),
             source="yfinance",
             level=0,
             is_fresh=True,
             is_estimated=False,
-            currency=data["currency"],
-            name=data["name"],
-            market_cap=data["market_cap"],
-            change_pct=data["change_pct"],
+            currency=info.get("currency", "EUR"),
+            name=info.get("longName", ""),
+            market_cap=info.get("marketCap"),
+            change_pct=info.get("regularMarketChangePercent"),
         )
 
     # -- Level 1: Alpha Vantage ----------------------------------------------

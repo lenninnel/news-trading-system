@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import yfinance as yf
 
 # Path bootstrap (needed when a strategy file is run directly)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from agents.base_agent import BaseAgent
+from data.alpaca_data import AlpacaDataClient
 from storage.database import Database
 
 log = logging.getLogger(__name__)
@@ -72,11 +72,13 @@ class StrategyAgent(BaseAgent):
         run()            — accept ticker + optional kwargs, return StrategySignal
     """
 
-    # Override in subclasses to control yfinance download window
+    # Override in subclasses to control bar limit (roughly maps to period)
     _DOWNLOAD_PERIOD: str = "6mo"
+    _BAR_LIMIT: int = 126  # ~6 months of trading days
 
     def __init__(self, db: Database | None = None) -> None:
         self._db = db or Database()
+        self._alpaca = AlpacaDataClient()
 
     @abstractmethod
     def run(self, ticker: str, **kwargs: Any) -> StrategySignal:  # type: ignore[override]
@@ -88,14 +90,31 @@ class StrategyAgent(BaseAgent):
 
     def _fetch_history(self, ticker: str, period: str | None = None) -> pd.DataFrame:
         """
-        Download daily OHLCV data and return a clean DataFrame.
+        Download daily OHLCV data via Alpaca and return a clean DataFrame.
 
-        Uses self._DOWNLOAD_PERIOD unless *period* is supplied explicitly.
-        Flattens any MultiIndex columns produced by yfinance batch downloads.
+        Uses self._BAR_LIMIT unless overridden.  Falls back to yfinance for
+        XETRA/DE tickers since Alpaca does not cover European exchanges.
 
         Raises:
-            ValueError: If yfinance returns an empty DataFrame.
+            ValueError: If no data can be fetched.
         """
+        from config.settings import is_german_ticker
+        if is_german_ticker(ticker):
+            return self._fetch_history_yfinance(ticker, period)
+
+        try:
+            raw = self._alpaca.get_bars(ticker, "1Day", limit=self._BAR_LIMIT)
+            if raw.empty:
+                raise ValueError(f"No price data returned for '{ticker}'")
+            return raw
+        except Exception as exc:
+            log.warning("Alpaca bars failed for %s: %s", ticker, exc)
+            raise ValueError(f"No price data returned for '{ticker}'") from exc
+
+    def _fetch_history_yfinance(self, ticker: str, period: str | None = None) -> pd.DataFrame:
+        """yfinance fallback for XETRA/DE tickers only."""
+        import yfinance as yf
+        log.info("Using yfinance fallback for XETRA/DE ticker %s", ticker)
         raw: pd.DataFrame = yf.download(
             ticker,
             period=period or self._DOWNLOAD_PERIOD,

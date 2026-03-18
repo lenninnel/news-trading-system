@@ -72,7 +72,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import ta
-import yfinance as yf
 import yaml
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
@@ -414,14 +413,21 @@ class ParameterTuner:
             f"  Downloading {self.ticker} "
             f"({warmup_start.date()} → {self.end_ts.date()})…"
         )
-        df = yf.download(
-            self.ticker,
-            start=warmup_start.strftime("%Y-%m-%d"),
-            end=(self.end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-        )
+        start_str = warmup_start.strftime("%Y-%m-%d")
+        end_str = (self.end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            from data.alpaca_data import AlpacaDataClient
+            alpaca = AlpacaDataClient()
+            df = alpaca.get_bars(
+                self.ticker, "1Day", limit=500,
+                start=start_str, end=end_str,
+            )
+        except Exception:
+            import yfinance as yf
+            df = yf.download(
+                self.ticker, start=start_str, end=end_str,
+                interval="1d", progress=False, auto_adjust=True,
+            )
         if df.empty:
             raise ValueError(f"No price data returned for {self.ticker}")
         if isinstance(df.columns, pd.MultiIndex):

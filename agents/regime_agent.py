@@ -1,10 +1,13 @@
 """
 Market regime detection agent.
 
-Downloads SPY and VIX data via yfinance and classifies the current market
-environment into one of four regimes.  The result is cached for 4 hours so
-that multiple per-ticker pipeline runs in a session avoid redundant
-downloads.
+Downloads SPY and VIX data via the Alpaca Data API and classifies the
+current market environment into one of four regimes.  The result is cached
+for 4 hours so that multiple per-ticker pipeline runs in a session avoid
+redundant downloads.
+
+For VIX (^VIX), Alpaca does not provide index data, so we fall back to
+yfinance or FRED.
 
 Regimes
 -------
@@ -13,7 +16,7 @@ TRENDING_BULL  SPY SMA-50 > SMA-200 (golden cross territory) and not HIGH_VOL.
 TRENDING_BEAR  SPY SMA-50 < SMA-200 (death cross territory) and not HIGH_VOL.
 RANGING        Everything else.
 
-Requires: yfinance, numpy
+Requires: alpaca-trade-api, numpy
 """
 
 from __future__ import annotations
@@ -36,8 +39,9 @@ class RegimeAgent(BaseAgent):
     Determines the current broad-market regime.
 
     The result is cached in memory for 4 hours.  Pass ``_yf`` to inject a
-    mock yfinance module in tests.  Pass ``_fear_greed_fn`` and/or
-    ``_fred_feed`` to inject mock data sources for Fear & Greed and FRED.
+    mock yfinance module in tests (used for VIX which Alpaca does not cover).
+    Pass ``_fear_greed_fn`` and/or ``_fred_feed`` to inject mock data sources
+    for Fear & Greed and FRED.
     """
 
     def __init__(
@@ -69,7 +73,7 @@ class RegimeAgent(BaseAgent):
                 realised_vol   (float): 20-day annualised realised volatility.
                 sma50          (float): SPY 50-day SMA.
                 sma200         (float): SPY 200-day SMA.
-                fear_greed     (int|None): Crypto Fear & Greed Index (0–100).
+                fear_greed     (int|None): Crypto Fear & Greed Index (0-100).
                 fear_greed_label (str|None): Classification (e.g. "Fear").
                 yield_curve    (float|None): 10Y-2Y spread from FRED.
                 cached         (bool):  True if result came from cache.
@@ -80,7 +84,7 @@ class RegimeAgent(BaseAgent):
 
         yf = self._yf
         if yf is None:
-            import yfinance as yf  # noqa: N811 — lazy import
+            import yfinance as yf  # noqa: N811 — lazy import for VIX only
 
         # Fetch supplementary macro data (never fails the pipeline)
         fear_greed_data: dict | None = None
@@ -118,9 +122,22 @@ class RegimeAgent(BaseAgent):
         fear_greed: dict | None = None,
         fred_data: dict | None = None,
     ) -> dict:
-        """Download data and classify the regime."""
-        # --- SPY data ---
-        spy = yf.download("SPY", period="250d", progress=False)
+        """Download data and classify the regime.
+
+        SPY data is fetched via Alpaca (reliable).  VIX is fetched via
+        yfinance (Alpaca does not cover indices like ^VIX).
+        """
+        import pandas as pd
+
+        # --- SPY data via Alpaca ---
+        try:
+            from data.alpaca_data import AlpacaDataClient
+            alpaca = AlpacaDataClient()
+            spy = alpaca.get_bars("SPY", "1Day", limit=252)
+        except Exception:
+            # Fallback to yfinance if Alpaca fails (e.g. in tests with mock yf)
+            spy = yf.download("SPY", period="250d", progress=False)
+
         close = spy["Close"].squeeze()
 
         sma50 = float(close.rolling(50).mean().iloc[-1])
@@ -130,7 +147,7 @@ class RegimeAgent(BaseAgent):
         returns = close.pct_change().dropna().tail(20)
         realised_vol = float(np.std(returns, ddof=1) * np.sqrt(252))
 
-        # --- VIX ---
+        # --- VIX (Alpaca does not cover ^VIX — use yfinance) ---
         vix: float | None = None
         try:
             vix_data = yf.download("^VIX", period="5d", progress=False)

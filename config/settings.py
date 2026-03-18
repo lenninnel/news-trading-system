@@ -74,6 +74,24 @@ SOURCE_WEIGHTS_NO_REDDIT: dict[str, float] = {
     "apewisdom": 0.4,
 }
 
+# When NewsAPI is unavailable (rate-limited / 429), redistribute its weight
+# to Marketaux and StockTwits so the remaining sources carry similar influence.
+SOURCE_WEIGHTS_NO_NEWSAPI: dict[str, float] = {
+    "marketaux": 1.2,
+    "stocktwits": 1.0,
+    "reddit": 0.7,
+    "adanos": 0.5,
+    "apewisdom": 0.5,
+}
+
+# When both Reddit and NewsAPI are unavailable.
+SOURCE_WEIGHTS_NO_REDDIT_NO_NEWSAPI: dict[str, float] = {
+    "marketaux": 1.3,
+    "stocktwits": 1.1,
+    "adanos": 0.5,
+    "apewisdom": 0.5,
+}
+
 # Known crypto tickers (used to route to Binance instead of yfinance)
 CRYPTO_TICKERS: set[str] = {
     "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVAX",

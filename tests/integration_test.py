@@ -389,17 +389,18 @@ class TestCoordinatorFusion(IntegrationTestBase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestTechnicalAgentIntegration(IntegrationTestBase):
-    """Run TechnicalAgent with mocked yfinance; verify DB persistence."""
+    """Run TechnicalAgent with mocked Alpaca data; verify DB persistence."""
 
-    @patch("yfinance.Ticker")
-    def test_technical_signal_persisted(self, mock_yf):
-        mock_yf.return_value = _make_yfinance_ticker_mock(price=155.0)
-
+    def test_technical_signal_persisted(self):
         from storage.database import Database
         from agents.technical_agent import TechnicalAgent
+        from data.alpaca_data import AlpacaDataClient
+
+        mock_alpaca = MagicMock(spec=AlpacaDataClient)
+        mock_alpaca.get_bars.return_value = _make_ohlcv()
 
         db    = Database(self.db_path)
-        agent = TechnicalAgent(db=db)
+        agent = TechnicalAgent(db=db, alpaca_client=mock_alpaca)
         result = agent.run("AAPL")
 
         self.assertIn(result["signal"], ("BUY", "SELL", "HOLD"))
@@ -533,13 +534,23 @@ class TestStrategyCoordinatorE2E(IntegrationTestBase):
         mock_client.messages.create.side_effect = _create
         return mock_client
 
+    @patch("data.alpaca_data.AlpacaDataClient")
     @patch("yfinance.Ticker")
     @patch("yfinance.download")
     @patch("anthropic.Anthropic")
-    def test_full_strategy_pipeline(self, mock_anthropic, mock_yf_dl, mock_yf):
+    def test_full_strategy_pipeline(self, mock_anthropic, mock_yf_dl, mock_yf, mock_alpaca_cls):
         mock_yf.return_value        = _make_yfinance_ticker_mock(price=155.0)
         mock_yf_dl.return_value     = _make_ohlcv()
         mock_anthropic.return_value = self._make_claude_mock()
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_bars.return_value = _make_ohlcv()
+        mock_alpaca.get_current_price.return_value = 155.0
+        mock_alpaca.get_snapshot.return_value = {
+            "ticker": "AAPL", "price": 155.0, "volume": 50_000_000,
+            "prev_close": 154.0, "change_pct": 0.65, "currency": "USD",
+            "name": "", "market_cap": None,
+        }
+        mock_alpaca_cls.return_value = mock_alpaca
 
         from storage.database import Database
         from orchestrator.strategy_coordinator import StrategyCoordinator
@@ -567,13 +578,23 @@ class TestStrategyCoordinatorE2E(IntegrationTestBase):
         self.assertGreater(len(rows), 0, "strategy_performance should have a row")
         self.assertEqual(rows[-1]["ticker"], "AAPL")
 
+    @patch("data.alpaca_data.AlpacaDataClient")
     @patch("yfinance.Ticker")
     @patch("yfinance.download")
     @patch("anthropic.Anthropic")
-    def test_pipeline_persists_risk_calculation(self, mock_anthropic, mock_yf_dl, mock_yf):
+    def test_pipeline_persists_risk_calculation(self, mock_anthropic, mock_yf_dl, mock_yf, mock_alpaca_cls):
         mock_yf.return_value        = _make_yfinance_ticker_mock(price=155.0)
         mock_yf_dl.return_value     = _make_ohlcv()
         mock_anthropic.return_value = self._make_claude_mock()
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_bars.return_value = _make_ohlcv()
+        mock_alpaca.get_current_price.return_value = 155.0
+        mock_alpaca.get_snapshot.return_value = {
+            "ticker": "AAPL", "price": 155.0, "volume": 50_000_000,
+            "prev_close": 154.0, "change_pct": 0.65, "currency": "USD",
+            "name": "", "market_cap": None,
+        }
+        mock_alpaca_cls.return_value = mock_alpaca
 
         from storage.database import Database
         from orchestrator.strategy_coordinator import StrategyCoordinator
