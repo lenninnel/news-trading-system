@@ -133,7 +133,30 @@ class TechnicalAgent(BaseAgent):
         # -- 5. Volume confirmation -----------------------------------------
         volume_confirmed = self._check_volume_confirmation(signal, indicators)
 
-        # -- 6. Intraday supplement (optional) ------------------------------
+        # -- 6. Multi-timeframe confirmation (optional) ---------------------
+        mtf = self._fetch_multi_timeframe(ticker, signal)
+        indicators["rsi_1h"] = mtf["rsi_1h"]
+        indicators["macd_15m_hist"] = mtf["macd_15m_hist"]
+        indicators["timeframe_alignment"] = mtf["timeframe_alignment"]
+        indicators["intraday_available"] = mtf["intraday_available"]
+
+        # Apply confidence adjustment from timeframe alignment
+        alignment = mtf["timeframe_alignment"]
+        if alignment == 1.0:
+            adjusted_confidence = min(1.0, adjusted_confidence + 0.15)
+            reasoning.append(
+                f"Multi-timeframe alignment 1.0 (all agree) — confidence boosted +0.15"
+            )
+        elif alignment == 0.0:
+            adjusted_confidence = max(0.0, adjusted_confidence - 0.10)
+            reasoning.append(
+                f"Multi-timeframe alignment 0.0 (conflicting) — confidence penalised -0.10"
+            )
+        # alignment == 0.5 → no change (partial confirmation or intraday unavailable)
+
+        adjusted_confidence = round(adjusted_confidence, 2)
+
+        # -- 6b. Intraday supplement (optional) -----------------------------
         intraday_note = self._intraday_supplement(ticker)
         if intraday_note:
             reasoning.append(intraday_note)
@@ -239,6 +262,101 @@ class TechnicalAgent(BaseAgent):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
+
+    def _fetch_multi_timeframe(self, ticker: str, daily_signal: str) -> dict:
+        """Fetch 1-hour and 15-minute intraday bars and compute alignment.
+
+        Returns a dict with keys:
+            rsi_1h              (float | None)
+            macd_15m_hist       (float | None)
+            timeframe_alignment (float) — 0.0, 0.5, or 1.0
+            intraday_available  (bool)
+        """
+        default = {
+            "rsi_1h": None,
+            "macd_15m_hist": None,
+            "timeframe_alignment": 0.5,
+            "intraday_available": False,
+        }
+
+        # Skip for non-Alpaca tickers (crypto, XETRA/DE)
+        if ticker.upper() in CRYPTO_TICKERS or is_german_ticker(ticker):
+            return default
+
+        rsi_1h: float | None = None
+        macd_15m_hist: float | None = None
+
+        # --- 1-hour bars → RSI-14 ---
+        try:
+            df_1h = self._alpaca.get_bars(ticker, "1Hour", limit=100)
+            if df_1h is not None and len(df_1h) >= 20:
+                close_1h = df_1h["Close"].squeeze()
+                rsi_series = ta.momentum.RSIIndicator(close=close_1h, window=14).rsi()
+                rsi_clean = rsi_series.dropna()
+                if not rsi_clean.empty:
+                    rsi_1h = float(rsi_clean.iloc[-1])
+        except Exception as exc:
+            logger.debug("1h bars failed for %s: %s", ticker, exc)
+
+        # --- 15-minute bars → MACD histogram ---
+        try:
+            df_15m = self._alpaca.get_bars(ticker, "15Min", limit=100)
+            if df_15m is not None and len(df_15m) >= 30:
+                close_15m = df_15m["Close"].squeeze()
+                macd_obj = ta.trend.MACD(
+                    close=close_15m, window_fast=12, window_slow=26, window_sign=9,
+                )
+                hist_series = macd_obj.macd_diff()
+                hist_clean = hist_series.dropna()
+                if not hist_clean.empty:
+                    macd_15m_hist = float(hist_clean.iloc[-1])
+        except Exception as exc:
+            logger.debug("15m bars failed for %s: %s", ticker, exc)
+
+        # If neither intraday indicator is available, return neutral
+        if rsi_1h is None and macd_15m_hist is None:
+            return default
+
+        intraday_available = True
+
+        # --- Compute directional signals for alignment ---
+        # Daily signal direction: BUY → bullish (+1), SELL → bearish (-1), HOLD → neutral (0)
+        daily_dir = 1 if daily_signal == "BUY" else (-1 if daily_signal == "SELL" else 0)
+
+        # 1h RSI direction: < 50 → bearish, > 50 → bullish, None → neutral
+        if rsi_1h is not None:
+            rsi_1h_dir = 1 if rsi_1h > 50 else -1
+        else:
+            rsi_1h_dir = 0
+
+        # 15m MACD histogram direction: positive → bullish, negative → bearish
+        if macd_15m_hist is not None:
+            macd_15m_dir = 1 if macd_15m_hist > 0 else -1
+        else:
+            macd_15m_dir = 0
+
+        # Count how many of the three agree with the daily direction
+        # (only count when daily has a direction)
+        if daily_dir == 0:
+            # HOLD — no strong direction to confirm
+            alignment = 0.5
+        else:
+            directions = [daily_dir, rsi_1h_dir, macd_15m_dir]
+            # Count non-zero values agreeing with daily_dir
+            agree_count = sum(1 for d in directions if d == daily_dir)
+            if agree_count == 3:
+                alignment = 1.0
+            elif agree_count >= 2:
+                alignment = 0.5
+            else:
+                alignment = 0.0
+
+        return {
+            "rsi_1h": rsi_1h,
+            "macd_15m_hist": macd_15m_hist,
+            "timeframe_alignment": alignment,
+            "intraday_available": intraday_available,
+        }
 
     def _intraday_supplement(self, ticker: str) -> str | None:
         """Compute short-term RSI/MACD on 5min bars as supplementary signal."""

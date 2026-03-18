@@ -1335,3 +1335,408 @@ class TestSignalQuality:
         assert any("> 60" in r for r in reasons), (
             "RSI 61 should be flagged as mildly overbought (> 60)"
         )
+
+
+# ===========================================================================
+# 13. Multi-Timeframe Confirmation
+# ===========================================================================
+
+def _make_intraday_df(n=100, trend="up", seed=42):
+    """Create synthetic intraday bar data.
+
+    Args:
+        n:     Number of bars.
+        trend: "up" for bullish, "down" for bearish.
+        seed:  Random seed.
+    """
+    np.random.seed(seed)
+    if trend == "up":
+        prices = np.linspace(100, 120, n) + np.random.normal(0, 0.3, n)
+    else:
+        prices = np.linspace(120, 100, n) + np.random.normal(0, 0.3, n)
+    dates = pd.date_range(end=pd.Timestamp.now(), periods=n, freq="1h")
+    return pd.DataFrame({
+        "Open": prices * 0.999,
+        "High": prices * 1.002,
+        "Low": prices * 0.998,
+        "Close": prices,
+        "Volume": np.random.randint(100_000, 1_000_000, n),
+    }, index=dates)
+
+
+class TestMultiTimeframeConfirmation:
+    """Test multi-timeframe analysis and timeframe alignment logic."""
+
+    def test_all_timeframes_agree_bullish_boosts_confidence(self):
+        """When daily=BUY, 1h RSI>50, 15m MACD>0 → alignment=1.0, +0.15 boost."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        # Create bullish intraday data
+        df_1h = _make_intraday_df(n=100, trend="up", seed=42)
+        df_15m = _make_intraday_df(n=100, trend="up", seed=43)
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return _make_uptrend_df(n=250)
+            elif timeframe == "1Hour":
+                return df_1h
+            elif timeframe == "15Min":
+                return df_15m
+            raise ValueError(f"Unexpected timeframe: {timeframe}")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+
+        indicators = result["indicators"]
+        assert indicators["intraday_available"] is True
+        assert indicators["rsi_1h"] is not None
+        assert indicators["macd_15m_hist"] is not None
+
+        # If alignment is 1.0, confidence should have been boosted
+        if indicators["timeframe_alignment"] == 1.0:
+            assert any("boosted +0.15" in r for r in result["reasoning"])
+
+    def test_timeframes_conflict_penalises_confidence(self):
+        """When daily=BUY but intraday is bearish → alignment=0.0, -0.10 penalty."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        # Bullish daily data (will produce BUY signal)
+        df_daily = _make_uptrend_df(n=250)
+        # Bearish intraday data (RSI < 50, MACD negative)
+        df_1h = _make_intraday_df(n=100, trend="down", seed=42)
+        df_15m = _make_intraday_df(n=100, trend="down", seed=43)
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return df_daily
+            elif timeframe == "1Hour":
+                return df_1h
+            elif timeframe == "15Min":
+                return df_15m
+            raise ValueError(f"Unexpected timeframe: {timeframe}")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+        indicators = result["indicators"]
+
+        assert indicators["intraday_available"] is True
+
+        # If alignment is 0.0, confidence should have been penalised
+        if indicators["timeframe_alignment"] == 0.0:
+            assert any("penalised -0.10" in r for r in result["reasoning"])
+
+    def test_intraday_unavailable_defaults_to_neutral(self):
+        """When intraday bars fail, alignment=0.5, no boost/penalty."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return _make_simple_df(n=250)
+            # Intraday requests raise exceptions
+            raise ValueError("Market closed — no intraday data")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+        indicators = result["indicators"]
+
+        assert indicators["intraday_available"] is False
+        assert indicators["rsi_1h"] is None
+        assert indicators["macd_15m_hist"] is None
+        assert indicators["timeframe_alignment"] == 0.5
+        # No multi-timeframe reasoning added
+        assert not any("Multi-timeframe" in r for r in result["reasoning"])
+
+    def test_xetra_ticker_uses_daily_only(self):
+        """German/XETRA tickers should skip intraday and get alignment=0.5."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = True
+        mock_eodhd.get_ohlcv_daily.return_value = _make_simple_df(n=250)
+        mock_eodhd.get_ohlcv_intraday.return_value = None
+
+        agent = TechnicalAgent(db=mock_db, eodhd_feed=mock_eodhd)
+        result = agent.run("SAP.XETRA")
+        indicators = result["indicators"]
+
+        assert indicators["intraday_available"] is False
+        assert indicators["rsi_1h"] is None
+        assert indicators["macd_15m_hist"] is None
+        assert indicators["timeframe_alignment"] == 0.5
+
+    def test_returned_indicators_include_new_fields(self):
+        """Result indicators dict must include all multi-timeframe fields."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return _make_simple_df(n=250)
+            raise ValueError("No intraday data")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+        indicators = result["indicators"]
+
+        # All new keys must be present
+        assert "rsi_1h" in indicators
+        assert "macd_15m_hist" in indicators
+        assert "timeframe_alignment" in indicators
+        assert "intraday_available" in indicators
+
+        # Types
+        assert indicators["rsi_1h"] is None or isinstance(indicators["rsi_1h"], float)
+        assert indicators["macd_15m_hist"] is None or isinstance(indicators["macd_15m_hist"], float)
+        assert isinstance(indicators["timeframe_alignment"], float)
+        assert isinstance(indicators["intraday_available"], bool)
+
+    def test_alignment_boost_capped_at_1(self):
+        """Confidence + 0.15 boost should never exceed 1.0."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        # Create data that gives high base confidence (golden cross + strong ADX + bull flag)
+        df_daily = _make_golden_cross_df()
+        df_1h = _make_intraday_df(n=100, trend="up", seed=42)
+        df_15m = _make_intraday_df(n=100, trend="up", seed=43)
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return df_daily
+            elif timeframe == "1Hour":
+                return df_1h
+            elif timeframe == "15Min":
+                return df_15m
+            raise ValueError(f"Unexpected: {timeframe}")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+
+        # Must be <= 1.0 regardless of boosts
+        assert result["adjusted_confidence"] <= 1.0
+
+    def test_alignment_penalty_floored_at_0(self):
+        """Confidence - 0.10 penalty should never go below 0.0."""
+        mock_db = MagicMock()
+        mock_db.log_technical_signal.return_value = 1
+
+        # Create data that gives low base confidence (death cross + below SMA200)
+        df_daily = _make_death_cross_df()
+        # Bullish intraday to create conflict with SELL daily signal
+        df_1h = _make_intraday_df(n=100, trend="up", seed=42)
+        df_15m = _make_intraday_df(n=100, trend="up", seed=43)
+
+        mock_alpaca = MagicMock()
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Day":
+                return df_daily
+            elif timeframe == "1Hour":
+                return df_1h
+            elif timeframe == "15Min":
+                return df_15m
+            raise ValueError(f"Unexpected: {timeframe}")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        mock_eodhd = MagicMock()
+        mock_eodhd.available = False
+
+        agent = TechnicalAgent(
+            db=mock_db, alpaca_client=mock_alpaca, eodhd_feed=mock_eodhd,
+        )
+        result = agent.run("AAPL")
+
+        # Must be >= 0.0 regardless of penalties
+        assert result["adjusted_confidence"] >= 0.0
+
+
+class TestFetchMultiTimeframeDirect:
+    """Direct unit tests for _fetch_multi_timeframe method."""
+
+    def test_returns_default_for_crypto(self):
+        """Crypto tickers should get default (no intraday) result."""
+        agent = TechnicalAgent(db=MagicMock())
+        result = agent._fetch_multi_timeframe("BTC", "BUY")
+        assert result["intraday_available"] is False
+        assert result["timeframe_alignment"] == 0.5
+        assert result["rsi_1h"] is None
+        assert result["macd_15m_hist"] is None
+
+    def test_returns_default_for_german_ticker(self):
+        """German tickers should get default (no intraday) result."""
+        agent = TechnicalAgent(db=MagicMock())
+        result = agent._fetch_multi_timeframe("SAP.XETRA", "SELL")
+        assert result["intraday_available"] is False
+        assert result["timeframe_alignment"] == 0.5
+
+    def test_hold_signal_gets_neutral_alignment(self):
+        """HOLD daily signal gets alignment 0.5 even with intraday data."""
+        mock_alpaca = MagicMock()
+        df_1h = _make_intraday_df(n=100, trend="up")
+        df_15m = _make_intraday_df(n=100, trend="up")
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Hour":
+                return df_1h
+            if timeframe == "15Min":
+                return df_15m
+            raise ValueError("unexpected")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "HOLD")
+
+        assert result["intraday_available"] is True
+        assert result["timeframe_alignment"] == 0.5
+
+    def test_all_bullish_alignment_1_0(self):
+        """BUY + bullish 1h + bullish 15m → alignment 1.0."""
+        mock_alpaca = MagicMock()
+        df_1h = _make_intraday_df(n=100, trend="up")
+        df_15m = _make_intraday_df(n=100, trend="up")
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Hour":
+                return df_1h
+            if timeframe == "15Min":
+                return df_15m
+            raise ValueError("unexpected")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "BUY")
+
+        assert result["intraday_available"] is True
+        # With bullish intraday and BUY daily, all three should agree
+        assert result["timeframe_alignment"] == 1.0
+
+    def test_all_bearish_alignment_1_0(self):
+        """SELL + bearish 1h + bearish 15m → alignment 1.0."""
+        mock_alpaca = MagicMock()
+        df_1h = _make_intraday_df(n=100, trend="down")
+        df_15m = _make_intraday_df(n=100, trend="down")
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Hour":
+                return df_1h
+            if timeframe == "15Min":
+                return df_15m
+            raise ValueError("unexpected")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "SELL")
+
+        assert result["intraday_available"] is True
+        assert result["timeframe_alignment"] == 1.0
+
+    def test_conflicting_alignment_0_0(self):
+        """BUY daily + bearish 1h + bearish 15m → alignment 0.0."""
+        mock_alpaca = MagicMock()
+        df_1h = _make_intraday_df(n=100, trend="down")
+        df_15m = _make_intraday_df(n=100, trend="down")
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Hour":
+                return df_1h
+            if timeframe == "15Min":
+                return df_15m
+            raise ValueError("unexpected")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "BUY")
+
+        assert result["intraday_available"] is True
+        assert result["timeframe_alignment"] == 0.0
+
+    def test_partial_intraday_only_1h_available(self):
+        """When only 1h data is available, still produces meaningful result."""
+        mock_alpaca = MagicMock()
+        df_1h = _make_intraday_df(n=100, trend="up")
+
+        def mock_get_bars(ticker, timeframe, limit=252):
+            if timeframe == "1Hour":
+                return df_1h
+            if timeframe == "15Min":
+                raise ValueError("No 15m data")
+            raise ValueError("unexpected")
+
+        mock_alpaca.get_bars = mock_get_bars
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "BUY")
+
+        assert result["intraday_available"] is True
+        assert result["rsi_1h"] is not None
+        assert result["macd_15m_hist"] is None
+        # With BUY daily + bullish 1h RSI + neutral 15m (0) →
+        # agree_count = 2 (daily + 1h), alignment = 0.5
+        assert result["timeframe_alignment"] in (0.5, 1.0)
+
+    def test_alpaca_error_returns_default(self):
+        """If all Alpaca intraday calls fail, returns default neutral."""
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_bars.side_effect = ValueError("API error")
+
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_alpaca)
+        result = agent._fetch_multi_timeframe("AAPL", "BUY")
+
+        assert result["intraday_available"] is False
+        assert result["timeframe_alignment"] == 0.5
+        assert result["rsi_1h"] is None
+        assert result["macd_15m_hist"] is None

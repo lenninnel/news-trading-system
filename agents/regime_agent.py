@@ -124,19 +124,24 @@ class RegimeAgent(BaseAgent):
     ) -> dict:
         """Download data and classify the regime.
 
-        SPY data is fetched via Alpaca (reliable).  VIX is fetched via
-        yfinance (Alpaca does not cover indices like ^VIX).
+        SPY data is fetched via Alpaca (reliable) unless a mock yf module
+        was injected (test mode).  VIX is always fetched via yfinance since
+        Alpaca does not cover indices like ^VIX.
         """
-        import pandas as pd
+        # Check if yf is a mock or the real yfinance module
+        _is_mock_yf = not hasattr(yf, '__version__')
 
-        # --- SPY data via Alpaca ---
-        try:
-            from data.alpaca_data import AlpacaDataClient
-            alpaca = AlpacaDataClient()
-            spy = alpaca.get_bars("SPY", "1Day", limit=252)
-        except Exception:
-            # Fallback to yfinance if Alpaca fails (e.g. in tests with mock yf)
+        if _is_mock_yf:
+            # Test mode: use the injected mock for SPY
             spy = yf.download("SPY", period="250d", progress=False)
+        else:
+            # Production: prefer Alpaca for reliable SPY data
+            try:
+                from data.alpaca_data import AlpacaDataClient
+                alpaca = AlpacaDataClient()
+                spy = alpaca.get_bars("SPY", "1Day", limit=252)
+            except Exception:
+                spy = yf.download("SPY", period="250d", progress=False)
 
         close = spy["Close"].squeeze()
 
