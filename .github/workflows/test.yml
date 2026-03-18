@@ -33,7 +33,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-test.txt
+          # alpaca-trade-api declares websockets<11 but only uses REST;
+          # yfinance needs websockets>=13.  Two-step install to avoid
+          # the pip resolver conflict (same approach as Dockerfile).
+          grep -v '^alpaca-trade-api' requirements.txt > /tmp/req_no_alpaca.txt
+          pip install -r /tmp/req_no_alpaca.txt -r requirements-test.txt
+          pip install --no-deps alpaca-trade-api==3.2.0
 
       - name: Run unit tests
         run: |
@@ -63,7 +68,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # Same two-step install as unit-tests job (see comment there).
+          grep -v '^alpaca-trade-api' requirements.txt > /tmp/req_no_alpaca.txt
+          pip install -r /tmp/req_no_alpaca.txt
+          pip install --no-deps alpaca-trade-api==3.2.0
 
       - name: Verify all tables are created
         run: |
