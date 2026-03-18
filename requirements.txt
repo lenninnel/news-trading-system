@@ -21,6 +21,7 @@ schedule
 # For local SQLite development it is optional.
 psycopg2-binary>=2.9.11
 filelock
+msgpack
 
 # ── Broker / execution ──────────────────────────────────────────────────────
 alpaca-trade-api>=3.2.0
