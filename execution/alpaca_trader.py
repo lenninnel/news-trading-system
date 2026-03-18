@@ -103,12 +103,33 @@ class AlpacaTrader:
             raise ValueError(f"shares must be >= 1, got {shares}")
         if not price or price <= 0:
             raise ValueError(f"Invalid price ${price} for {ticker} — trade aborted")
+        if price < 1.0 or price > 50_000:
+            raise ValueError(
+                f"Price ${price:.2f} for {ticker} outside sanity range [$1, $50,000] "
+                f"— ghost price detected, trade aborted"
+            )
         if action == "BUY" and (not stop_loss or stop_loss <= 0
                                 or not take_profit or take_profit <= 0):
             raise ValueError(
                 f"BUY requires valid stop_loss/take_profit for {ticker} "
                 f"(got SL={stop_loss}, TP={take_profit}) — trade aborted"
             )
+
+        # Belt-and-suspenders: fetch live quote and reject if >15% divergence
+        try:
+            quote = self._api.get_latest_trade(ticker)
+            live_price = float(quote.price)
+            if live_price > 0 and price > 0:
+                divergence = abs(live_price - price) / live_price
+                if divergence > 0.15:
+                    raise ValueError(
+                        f"PRICE DIVERGENCE ABORT: {ticker} signal_price=${price:.2f} "
+                        f"vs live=${live_price:.2f} ({divergence:.0%} divergence)"
+                    )
+        except ValueError:
+            raise  # re-raise our own divergence error
+        except Exception as exc:
+            log.warning("Live price check failed for %s (non-fatal): %s", ticker, exc)
 
         side = "buy" if action == "BUY" else "sell"
 
