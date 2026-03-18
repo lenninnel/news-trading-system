@@ -26,6 +26,12 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
+# Clean ghost positions/trades from previous runs (belt-and-suspenders).
+# The daemon also runs this at startup, but doing it here catches issues
+# even if the daemon import fails.
+echo "[entrypoint] Cleaning ghost trades from DB..."
+python3 scripts/clean_ghost_trades.py --apply 2>&1 || echo "[entrypoint] Ghost cleanup skipped (non-fatal)"
+
 # Start ONLY the daemon scheduler — it handles all runs including
 # an immediate first run if within trading hours.
 # Do NOT also run --now separately — that causes duplicate trades.

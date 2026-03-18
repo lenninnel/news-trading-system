@@ -40,12 +40,12 @@ from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
-from config.settings import BUY_THRESHOLD, SELL_THRESHOLD, SOURCE_WEIGHTS
+from config.settings import BUY_THRESHOLD, SELL_THRESHOLD, SOURCE_WEIGHTS, SOURCE_WEIGHTS_NO_REDDIT
 from data.events_feed import get_days_to_earnings
 from data.market_data import MarketData
 from data.news_feed import NewsFeed
 from data.marketaux_feed import MarketauxFeed
-from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed
+from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
 from storage.database import Database
 
@@ -143,14 +143,26 @@ class Coordinator:
         return sum(s["score"] for s in scored) / len(scored)
 
     @staticmethod
-    def _weighted_aggregate(scored: list[dict]) -> float:
-        """Return a weighted average score using SOURCE_WEIGHTS."""
+    def _active_weights() -> dict[str, float]:
+        """Return the source-weight map appropriate for the current config.
+
+        When Reddit credentials are present, the standard ``SOURCE_WEIGHTS``
+        are used.  Otherwise ``SOURCE_WEIGHTS_NO_REDDIT`` bumps NewsAPI and
+        Marketaux to compensate for the missing Reddit signal.
+        """
+        return SOURCE_WEIGHTS if is_reddit_configured() else SOURCE_WEIGHTS_NO_REDDIT
+
+    @staticmethod
+    def _weighted_aggregate(scored: list[dict], weights: dict[str, float] | None = None) -> float:
+        """Return a weighted average score using *weights* (default: SOURCE_WEIGHTS)."""
         if not scored:
             return 0.0
+        if weights is None:
+            weights = SOURCE_WEIGHTS
         total_weight = 0.0
         weighted_sum = 0.0
         for s in scored:
-            w = SOURCE_WEIGHTS.get(s.get("source", "newsapi"), 1.0)
+            w = weights.get(s.get("source", "newsapi"), 1.0)
             weighted_sum += s["score"] * w
             total_weight += w
         return weighted_sum / total_weight if total_weight else 0.0
@@ -203,44 +215,56 @@ class Coordinator:
         avg_score: float,
         volume_confirmed: bool = False,
         rvol: "float | None" = None,
+        technical_confidence: "float | None" = None,
     ) -> float:
         """
-        Compute a confidence score (0.0–1.0) for the combined signal.
+        Compute a confidence score (0.0-1.0) for the combined signal.
 
-        STRONG signals scale with |avg_score| in the upper half [0.6, 1.0].
-        WEAK signals scale with |avg_score| in the range [0.3, 0.6].
+        The score blends sentiment strength with the technical agent's own
+        confidence so that both agents contribute to the final number.
+
+        STRONG signals start at 0.60 and scale up with a blend of sentiment
+        strength (60%) and technical confidence (40%).  Range [0.60, 1.00].
+
+        WEAK signals start at 0.35 and scale with the same blend.  Range
+        [0.35, 0.60].  A normal trending market with moderate sentiment and
+        a directional technical signal now lands in the 40-60% band.
+
         CONFLICTING is fixed at 0.10 (agents actively disagree).
         HOLD is fixed at 0.25 (no directional conviction).
 
-        The WEAK floor is 0.30 (raised from 0.20) so that a normal trending
-        market with moderate sentiment produces 40–60% confidence rather than
-        23–36%.  The cap stays at 0.60 to keep WEAK strictly below STRONG.
-
         Volume adjustment (applied after base calculation):
             +0.10 when volume_confirmed is True (RVOL > 1.5 + OBV aligns).
-            −0.10 when RVOL < 0.7 (low-conviction move).
 
         Args:
-            combined_signal:  Output of combine_signals().
-            avg_score:        Raw sentiment average (−1.0 to +1.0).
-            volume_confirmed: True when volume supports the signal direction.
-            rvol:             Relative volume (current / 20-day avg).
+            combined_signal:      Output of combine_signals().
+            avg_score:            Raw sentiment average (-1.0 to +1.0).
+            volume_confirmed:     True when volume supports the signal direction.
+            rvol:                 Relative volume (current / 20-day avg).
+            technical_confidence: Technical agent's own confidence (0.0 - 1.0).
+                                  When None the calculation falls back to
+                                  sentiment-only scaling.
 
         Returns:
             Confidence float rounded to two decimal places, clamped to [0, 1].
         """
-        strength = abs(avg_score)  # 0.0 – 1.0
+        sent_strength = abs(avg_score)  # 0.0 - 1.0
+        tech_strength = technical_confidence if technical_confidence is not None else sent_strength
+
+        # Blend: 60% sentiment, 40% technical
+        blended = sent_strength * 0.6 + tech_strength * 0.4
+
         if combined_signal in ("STRONG BUY", "STRONG SELL"):
-            base = min(1.0, 0.6 + strength * 0.4)
+            base = min(1.0, 0.6 + blended * 0.4)
         elif combined_signal in ("WEAK BUY", "WEAK SELL"):
-            base = min(0.6, 0.3 + strength * 0.3)
+            base = min(0.6, 0.35 + blended * 0.25)
         elif combined_signal == "CONFLICTING":
             base = 0.10
         else:
             base = 0.25  # HOLD
 
         # Volume adjustment (only for directional signals)
-        # Note: low-rvol penalty removed — rvol compares partial intraday
+        # Note: low-rvol penalty removed -- rvol compares partial intraday
         # volume to full-day average, making it structurally < 1.0 during
         # market hours and penalising every signal incorrectly.
         if combined_signal not in ("HOLD", "CONFLICTING"):
@@ -352,7 +376,7 @@ class Coordinator:
                     print(f"         [!] Skipped ({exc})")
 
         # Step 4 — weighted aggregate + signal
-        avg_score = self._weighted_aggregate(scored)
+        avg_score = self._weighted_aggregate(scored, self._active_weights())
         signal = self._signal(avg_score)
         breakdown = self._source_breakdown(scored)
 
@@ -451,6 +475,7 @@ class Coordinator:
             sentiment["avg_score"],
             volume_confirmed=technical.get("volume_confirmed", False),
             rvol=technical.get("indicators", {}).get("rvol"),
+            technical_confidence=technical.get("adjusted_confidence"),
         )
 
         # --- Persist combined ---
@@ -681,7 +706,7 @@ class Coordinator:
                 except Exception:
                     pass
 
-        avg_score = self._weighted_aggregate(scored)
+        avg_score = self._weighted_aggregate(scored, self._active_weights())
         sentiment_signal = self._signal(avg_score)
         breakdown = self._source_breakdown(scored)
 
@@ -700,6 +725,7 @@ class Coordinator:
             avg_score,
             volume_confirmed=technical.get("volume_confirmed", False),
             rvol=technical.get("indicators", {}).get("rvol"),
+            technical_confidence=technical.get("adjusted_confidence"),
         )
 
         # ── Phase 4: DB writes + risk sizing ───────────────────────────

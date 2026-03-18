@@ -49,6 +49,8 @@ def _mock_api():
     api.submit_order.return_value = order
     api.get_order.return_value = order
     api.list_positions.return_value = [_make_position()]
+    # Live-price divergence check expects a realistic quote
+    api.get_latest_trade.return_value = SimpleNamespace(price=150.25)
     return api
 
 
