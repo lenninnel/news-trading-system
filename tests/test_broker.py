@@ -234,6 +234,51 @@ class TestAlpacaTrader:
         assert result["price"] == 149.99
 
 
+# ── unsupported ticker tests ────────────────────────────────────────
+
+class TestUnsupportedTickers:
+
+    def _make_trader(self):
+        api = _mock_api()
+        db = Database(db_path=tempfile.mktemp(suffix=".db"))
+        return AlpacaTrader(db=db, api=api), api
+
+    def test_xetra_ticker_skipped_without_error(self):
+        trader, api = self._make_trader()
+        result = trader.track_trade("SAP.XETRA", "BUY", 5, 250.00,
+                                    stop_loss=240.0, take_profit=270.0)
+        assert result["skipped"] is True
+        assert "not supported" in result["skip_reason"]
+        # No order should have been submitted
+        api.submit_order.assert_not_called()
+
+    def test_unsupported_returns_correct_dict_shape(self):
+        trader, _ = self._make_trader()
+        result = trader.track_trade("SIE.XETRA", "BUY", 3, 180.00,
+                                    stop_loss=170.0, take_profit=195.0)
+        assert result["trade_id"] is None
+        assert result["ticker"] == "SIE.XETRA"
+        assert result["action"] == "BUY"
+        assert result["shares"] == 3
+        assert result["pnl"] == 0.0
+        assert result["total_value"] == 0.0
+
+    def test_unsupported_no_telegram_error(self):
+        trader, api = self._make_trader()
+        trader.track_trade("SAP.XETRA", "BUY", 5, 250.00,
+                           stop_loss=240.0, take_profit=270.0)
+        # _notify_trade_failed should not be called
+        # (it's only called on real order submission errors)
+        api.submit_order.assert_not_called()
+
+    def test_supported_ticker_still_executes(self):
+        trader, api = self._make_trader()
+        result = trader.track_trade("AAPL", "BUY", 10, 150.00,
+                                    stop_loss=145.0, take_profit=160.0)
+        assert result.get("skipped") is not True
+        api.submit_order.assert_called_once()
+
+
 # ── get_trading_mode tests ──────────────────────────────────────────
 
 class TestGetTradingMode:
