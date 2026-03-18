@@ -72,19 +72,21 @@ def seed_database(db_path: str, n_rows: int = SEED_ROWS) -> dict[str, int]:
         score   = random.uniform(-1.0, 1.0)
         signal  = random.choice(["BUY", "SELL", "HOLD"])
         ts      = (datetime.now(timezone.utc) - timedelta(hours=i)).isoformat()
-        run_id  = db._insert(
-            "INSERT INTO runs (ticker, headlines_fetched, headlines_analysed,"
-            " avg_score, signal, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (ticker, 10, 8, score, signal, ts),
+        run_id  = db.log_run(
+            ticker=ticker,
+            headlines_fetched=10,
+            headlines_analysed=8,
+            avg_score=score,
+            signal=signal,
         )
         run_ids.append(run_id)
         for j in range(3):
-            db._exec_write(
-                "INSERT INTO headline_scores (run_id, headline, sentiment, score, reason)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (run_id, f"Headline {i}-{j} for {ticker}",
-                 random.choice(["bullish", "bearish", "neutral"]),
-                 random.choice([1, 0, -1]), "Auto-generated"),
+            db.log_headline_score(
+                run_id=run_id,
+                headline=f"Headline {i}-{j} for {ticker}",
+                sentiment=random.choice(["bullish", "bearish", "neutral"]),
+                score=random.choice([1, 0, -1]),
+                reason="Auto-generated",
             )
     counts["runs"]            = n_rows
     counts["headline_scores"] = n_rows * 3
@@ -93,87 +95,77 @@ def seed_database(db_path: str, n_rows: int = SEED_ROWS) -> dict[str, int]:
     ts_ids = []
     for i in range(n_rows):
         ticker = TICKERS[i % len(TICKERS)]
-        ts     = (datetime.now(timezone.utc) - timedelta(hours=i)).isoformat()
-        ts_id  = db._insert(
-            "INSERT INTO technical_signals"
-            " (ticker, signal, rsi, macd, macd_signal, macd_hist,"
-            "  sma_20, sma_50, bb_upper, bb_lower, price, reasoning, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (ticker, random.choice(["BUY", "SELL", "HOLD"]),
-             random.uniform(20, 80), random.uniform(-2, 2), random.uniform(-2, 2),
-             random.uniform(-1, 1), random.uniform(140, 160), random.uniform(135, 155),
-             random.uniform(165, 175), random.uniform(135, 145),
-             random.uniform(140, 170), "RSI oversold; MACD crossover", ts),
+        ts_id  = db.log_technical_signal(
+            ticker=ticker,
+            signal=random.choice(["BUY", "SELL", "HOLD"]),
+            reasoning="RSI oversold; MACD crossover",
+            rsi=random.uniform(20, 80),
+            macd=random.uniform(-2, 2),
+            macd_signal=random.uniform(-2, 2),
+            macd_hist=random.uniform(-1, 1),
+            sma_20=random.uniform(140, 160),
+            sma_50=random.uniform(135, 155),
+            bb_upper=random.uniform(165, 175),
+            bb_lower=random.uniform(135, 145),
+            price=random.uniform(140, 170),
         )
         ts_ids.append(ts_id)
     counts["technical_signals"] = n_rows
 
     # ── combined_signals ──────────────────────────────────────────────────────
     for i in range(n_rows):
-        ts = (datetime.now(timezone.utc) - timedelta(hours=i)).isoformat()
-        db._exec_write(
-            "INSERT INTO combined_signals"
-            " (ticker, combined_signal, sentiment_signal, technical_signal,"
-            "  sentiment_score, confidence, run_id, technical_id, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (TICKERS[i % len(TICKERS)],
-             random.choice(SIGNALS),
-             random.choice(["BUY", "SELL", "HOLD"]),
-             random.choice(["BUY", "SELL", "HOLD"]),
-             random.uniform(-1, 1), random.uniform(0, 1),
-             run_ids[i], ts_ids[i], ts),
+        db.log_combined_signal(
+            ticker=TICKERS[i % len(TICKERS)],
+            combined_signal=random.choice(SIGNALS),
+            sentiment_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            technical_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            sentiment_score=random.uniform(-1, 1),
+            confidence=random.uniform(0, 1),
+            run_id=run_ids[i],
+            technical_id=ts_ids[i],
         )
     counts["combined_signals"] = n_rows
 
     # ── strategy_signals + strategy_performance ───────────────────────────────
     for i in range(n_rows):
-        ts = (datetime.now(timezone.utc) - timedelta(hours=i)).isoformat()
-        db._exec_write(
-            "INSERT INTO strategy_signals"
-            " (ticker, strategy, signal, confidence, timeframe, reasoning,"
-            "  ensemble_confidence, combined_signal, consensus, account_balance, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (TICKERS[i % len(TICKERS)],
-             random.choice(STRATEGIES),
-             random.choice(["BUY", "SELL", "HOLD"]),
-             random.uniform(40, 95),
-             random.choice(["1-3 days", "3-5 days", "1-2 weeks"]),
-             "Volume breakout; RSI momentum",
-             random.uniform(50, 90),
-             random.choice(["BUY", "SELL", "HOLD"]),
-             random.choice(["unanimous", "majority", "conflicting"]),
-             10_000.0, ts),
+        run_at = (datetime.now(timezone.utc) - timedelta(hours=i)).isoformat()
+        db.log_strategy_signal(
+            ticker=TICKERS[i % len(TICKERS)],
+            strategy=random.choice(STRATEGIES),
+            signal=random.choice(["BUY", "SELL", "HOLD"]),
+            confidence=random.uniform(40, 95),
+            timeframe=random.choice(["1-3 days", "3-5 days", "1-2 weeks"]),
         )
 
-        db._exec_write(
-            "INSERT INTO strategy_performance"
-            " (ticker, run_at, momentum_signal, momentum_confidence,"
-            "  mean_reversion_signal, mean_reversion_confidence,"
-            "  swing_signal, swing_confidence,"
-            "  combined_signal, ensemble_confidence, consensus, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (TICKERS[i % len(TICKERS)], ts,
-             random.choice(["BUY", "SELL", "HOLD"]), random.uniform(40, 90),
-             random.choice(["BUY", "SELL", "HOLD"]), random.uniform(40, 90),
-             random.choice(["BUY", "SELL", "HOLD"]), random.uniform(40, 90),
-             random.choice(["BUY", "SELL", "HOLD"]), random.uniform(50, 90),
-             random.choice(["unanimous", "majority", "conflicting"]), ts),
+        db.log_strategy_performance(
+            ticker=TICKERS[i % len(TICKERS)],
+            run_at=run_at,
+            combined_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            ensemble_confidence=random.uniform(50, 90),
+            voting_method=random.choice(["unanimous", "majority", "conflicting"]),
+            momentum_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            momentum_confidence=random.uniform(40, 90),
+            mean_rev_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            mean_rev_confidence=random.uniform(40, 90),
+            swing_signal=random.choice(["BUY", "SELL", "HOLD"]),
+            swing_confidence=random.uniform(40, 90),
         )
     counts["strategy_signals"]     = n_rows
     counts["strategy_performance"] = n_rows
 
     # ── scheduler_logs ────────────────────────────────────────────────────────
-    import json
     for i in range(min(n_rows, 100)):
-        ts = (datetime.now(timezone.utc) - timedelta(days=i)).isoformat()
-        db._exec_write(
-            "INSERT INTO scheduler_logs"
-            " (run_at, tickers, signals_generated, trades_executed,"
-            "  portfolio_value, duration_seconds, errors, status, summary, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (ts, json.dumps(TICKERS), random.randint(3, 10), random.randint(0, 5),
-             random.uniform(8000, 15000), random.uniform(30, 120),
-             "[]", "success", "Daily run summary", ts),
+        run_at = (datetime.now(timezone.utc) - timedelta(days=i)).isoformat()
+        db.log_scheduler_run(
+            run_at=run_at,
+            tickers=TICKERS,
+            success_count=random.randint(3, 10),
+            fail_count=random.randint(0, 2),
+            elapsed_s=random.uniform(30, 120),
+            total_elapsed_s=random.uniform(30, 120),
+            errors=[],
+            status="success",
+            notes="Daily run summary",
         )
     counts["scheduler_logs"] = min(n_rows, 100)
 

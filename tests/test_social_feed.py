@@ -176,7 +176,7 @@ class TestRedditGracefulDegradation:
 
             warning_calls = mock_logger.warning.call_args_list
             assert len(warning_calls) == 1
-            assert "REDDIT_CLIENT_ID" in str(warning_calls[0])
+            assert "Reddit credentials not configured" in str(warning_calls[0])
 
     def test_no_creds_returns_empty_every_time(self):
         """All fetches return [] regardless of how many times called."""

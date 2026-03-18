@@ -82,9 +82,9 @@ class TestConfidence:
         c = conf("STRONG BUY", 0.5)
         assert 0.6 <= c <= 1.0
 
-    # --- WEAK BUY / SELL: range [0.30, 0.60] ---
-    # Floor raised from 0.20 to 0.30 so a normal trending market with
-    # moderate sentiment produces 40–60% confidence (not 23–36%).
+    # --- WEAK BUY / SELL: range [0.35, 0.60] ---
+    # Floor raised from 0.30 to 0.35 and technical confidence blended in so
+    # that a normal trending market produces 40-60% confidence.
 
     def test_weak_buy_full_sentiment_gives_0_6(self):
         assert conf("WEAK BUY", 1.0) == 0.6
@@ -92,13 +92,13 @@ class TestConfidence:
     def test_weak_sell_full_sentiment_gives_0_6(self):
         assert conf("WEAK SELL", -1.0) == 0.6
 
-    def test_weak_buy_zero_sentiment_gives_0_3(self):
-        # Floor raised from 0.20 → 0.30
-        assert conf("WEAK BUY", 0.0) == 0.3
+    def test_weak_buy_zero_sentiment_gives_0_35(self):
+        # Floor raised to 0.35 (sentiment-only fallback)
+        assert conf("WEAK BUY", 0.0) == 0.35
 
-    def test_weak_signal_scales_between_0_3_and_0_6(self):
+    def test_weak_signal_scales_between_0_35_and_0_6(self):
         c = conf("WEAK SELL", 0.3)
-        assert 0.3 <= c <= 0.6
+        assert 0.35 <= c <= 0.6
 
     # --- CONFLICTING: fixed 0.10 ---
 
@@ -193,7 +193,166 @@ class TestConfidenceVolume:
         assert c == 1.0
 
     def test_confidence_floor_with_low_rvol(self):
-        # WEAK BUY with 0.0 sentiment = 0.30 (floor raised; no rvol penalty)
+        # WEAK BUY with 0.0 sentiment = 0.35 (floor raised; no rvol penalty)
         c = conf("WEAK BUY", 0.0, rvol=0.3)
-        assert c == 0.30
+        assert c == 0.35
         assert c >= 0.0
+
+
+# ===========================================================================
+# confidence -- technical confidence blending
+# ===========================================================================
+
+class TestConfidenceTechnicalBlend:
+    """When technical_confidence is provided, it blends with sentiment strength."""
+
+    def test_technical_confidence_boosts_weak_signal(self):
+        """A WEAK BUY with moderate sentiment (0.35) and strong technical (0.5)
+        should produce confidence in the 40-60% range."""
+        # blended = 0.35*0.6 + 0.5*0.4 = 0.21 + 0.20 = 0.41
+        # base = 0.35 + 0.41*0.25 = 0.4525 -> 0.45
+        c = conf("WEAK BUY", 0.35, technical_confidence=0.5)
+        assert 0.40 <= c <= 0.60, f"Expected 40-60% for normal trend, got {c}"
+
+    def test_strong_signal_with_high_technical_confidence(self):
+        """STRONG BUY with moderate sentiment + high technical confidence
+        should produce high confidence."""
+        # blended = 0.4*0.6 + 0.65*0.4 = 0.24 + 0.26 = 0.50
+        # base = 0.6 + 0.50*0.4 = 0.80
+        c = conf("STRONG BUY", 0.4, technical_confidence=0.65)
+        assert 0.75 <= c <= 0.85, f"Expected 75-85%, got {c}"
+
+    def test_technical_confidence_none_falls_back_to_sentiment(self):
+        """When technical_confidence is None, the result should match the
+        sentiment-only calculation (backward compatibility)."""
+        with_none = conf("WEAK BUY", 0.4, technical_confidence=None)
+        without = conf("WEAK BUY", 0.4)
+        assert with_none == without
+
+    def test_weak_buy_moderate_sentiment_strong_technical_hits_target(self):
+        """Core scenario: sentiment avg_score ~0.35 (just above BUY_THRESHOLD),
+        technical agent returned BUY but combined is WEAK BUY (because tech=HOLD
+        for this scenario).  Technical adjusted_confidence = 0.5.
+        The result should be in the 40-60% range."""
+        c = conf("WEAK BUY", 0.35, technical_confidence=0.5)
+        assert 0.40 <= c <= 0.60
+
+    def test_technical_does_not_affect_hold(self):
+        """HOLD confidence is fixed at 0.25 regardless of technical confidence."""
+        c = conf("HOLD", 0.5, technical_confidence=0.8)
+        assert c == 0.25
+
+    def test_technical_does_not_affect_conflicting(self):
+        """CONFLICTING confidence is fixed at 0.10 regardless."""
+        c = conf("CONFLICTING", 0.5, technical_confidence=0.8)
+        assert c == 0.10
+
+    def test_higher_technical_confidence_increases_weak_signal(self):
+        """Monotonicity: higher technical confidence -> higher confidence."""
+        low = conf("WEAK BUY", 0.3, technical_confidence=0.25)
+        high = conf("WEAK BUY", 0.3, technical_confidence=0.60)
+        assert high > low
+
+    def test_higher_technical_confidence_increases_strong_signal(self):
+        """Monotonicity: higher technical confidence -> higher confidence."""
+        low = conf("STRONG BUY", 0.3, technical_confidence=0.25)
+        high = conf("STRONG BUY", 0.3, technical_confidence=0.60)
+        assert high > low
+
+    def test_weak_signal_never_exceeds_0_6_without_volume(self):
+        """WEAK signals are capped at 0.60 before volume adjustment."""
+        c = conf("WEAK BUY", 1.0, technical_confidence=1.0)
+        assert c == 0.60
+
+    def test_weak_signal_with_volume_can_exceed_0_6(self):
+        """Volume boost on top of max WEAK should produce 0.70."""
+        c = conf("WEAK BUY", 1.0, technical_confidence=1.0, volume_confirmed=True)
+        assert c == 0.70
+
+
+# ===========================================================================
+# End-to-end: bullish setup produces BUY with 40-60% confidence
+# ===========================================================================
+
+class TestBullishSetupConfidence:
+    """Verify that a realistic bullish market scenario produces the expected
+    confidence level when sentiment and technical signals are combined."""
+
+    def test_typical_bullish_trend_produces_40_to_60_confidence(self):
+        """
+        Scenario: normal trending market.
+        - Sentiment: avg_score = 0.35 (modestly bullish, above BUY threshold).
+        - Technical: RSI=45 (mildly oversold, +0.5), MACD histogram positive (+1),
+          bullish SMA alignment (+1) -> score 2.5 -> BUY signal.
+          Technical adjusted_confidence = 0.5 (base for BUY).
+
+        Combined: BUY + BUY = STRONG BUY.
+        Confidence = 0.6 + blended*0.4 where blended = 0.35*0.6 + 0.5*0.4 = 0.41.
+        Result = 0.6 + 0.41*0.4 = 0.764 -> ~76%.
+
+        When technical is HOLD (more common in mild trends):
+        Combined: BUY + HOLD = WEAK BUY.
+        Confidence = 0.35 + blended*0.25 = 0.35 + 0.41*0.25 = 0.4525 -> 45%.
+        """
+        # WEAK BUY case (most common: sentiment BUY + technical HOLD)
+        c_weak = conf("WEAK BUY", 0.35, technical_confidence=0.5)
+        assert 0.40 <= c_weak <= 0.60, (
+            f"WEAK BUY with moderate sentiment + technical should be 40-60%, got {c_weak}"
+        )
+
+        # STRONG BUY case (both agree)
+        c_strong = conf("STRONG BUY", 0.35, technical_confidence=0.5)
+        assert c_strong > c_weak, "STRONG BUY should always beat WEAK BUY"
+        assert c_strong >= 0.60, f"STRONG BUY should be at least 60%, got {c_strong}"
+
+    def test_end_to_end_signal_rules_plus_confidence(self):
+        """
+        Full integration: build indicators -> apply signal rules -> compute
+        combined confidence.  Verifies the entire chain from raw indicators
+        to a final 40-60% confidence number.
+        """
+        from agents.technical_agent import TechnicalAgent
+
+        # Known bullish indicators
+        ind = {
+            "rsi": 45.0,                 # mildly oversold -> +0.5
+            "macd_bull_cross": True,      # bullish crossover -> +2
+            "macd_bear_cross": False,
+            "macd_hist": 0.5,            # positive momentum -> +1
+            "price": 160.0,
+            "bb_lower": 148.0,
+            "bb_upper": 172.0,
+            "sma_20": 158.0,             # bullish alignment -> +1
+            "sma_50": 154.0,
+            "golden_cross_recent": False,
+            "death_cross_recent": False,
+        }
+
+        signal, reasons = TechnicalAgent._apply_signal_rules(ind)
+        assert signal == "BUY", f"Expected BUY, got {signal}; reasons: {reasons}"
+
+        # Compute technical confidence
+        tech_conf, _ = TechnicalAgent._apply_confidence_adjustments(signal, {
+            **ind,
+            "adx": None, "sma_200": None, "price": 160.0,
+            "trend_strength": None,
+            "bull_flag_breakout": False,
+            "wedge_type": None, "wedge_breakout": False,
+            "death_cross_recent": False,
+        })
+        assert tech_conf == 0.5, f"Base tech confidence for BUY should be 0.5, got {tech_conf}"
+
+        # Combine: sentiment BUY (avg_score=0.35) + technical BUY -> STRONG BUY
+        combined = combine("BUY", signal)
+        assert combined == "STRONG BUY"
+
+        c = conf(combined, 0.35, technical_confidence=tech_conf)
+        assert c >= 0.60, f"STRONG BUY should be >= 60%, got {c}"
+
+        # More common: sentiment BUY + technical HOLD -> WEAK BUY
+        combined_weak = combine("BUY", "HOLD")
+        c_weak = conf(combined_weak, 0.35, technical_confidence=tech_conf)
+        assert 0.40 <= c_weak <= 0.60, (
+            f"WEAK BUY with moderate sentiment + tech confidence 0.5 "
+            f"should be 40-60%, got {c_weak}"
+        )

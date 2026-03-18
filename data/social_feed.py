@@ -40,6 +40,11 @@ _REDDIT_SUBREDDITS = ["wallstreetbets", "investing"]
 _reddit_warned: dict[str, bool] = {"credentials": False, "praw": False}
 
 
+def is_reddit_configured() -> bool:
+    """Return True if Reddit credentials are present in the environment."""
+    return bool(REDDIT_CLIENT_ID) and bool(REDDIT_CLIENT_SECRET)
+
+
 class RedditFeed:
     """
     Fetches recent posts mentioning a ticker from Reddit.
@@ -80,8 +85,7 @@ class RedditFeed:
         if not self.client_id or not self.client_secret:
             if not _reddit_warned["credentials"]:
                 logger.warning(
-                    "Reddit credentials not set — Reddit feed disabled. "
-                    "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to enable."
+                    "Reddit credentials not configured, skipping Reddit sentiment"
                 )
                 _reddit_warned["credentials"] = True
             return []

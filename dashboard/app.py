@@ -145,24 +145,36 @@ def page_overview() -> None:
         st.subheader(_REGIME_DISPLAY.get(regime, regime))
 
     # --- KPIs ---
-    try:
-        portfolio = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
-    except sqlite3.OperationalError:
-        st.info("No data yet — run the pipeline first.")
-        return
-    try:
-        trades = _query("SELECT * FROM trade_history ORDER BY id DESC")
-    except sqlite3.OperationalError:
-        st.info("No data yet — run the pipeline first.")
-        return
+    # Use Alpaca portfolio if available (source of truth for live/paper)
+    alpaca_val, alpaca_df = _try_alpaca_portfolio()
 
-    # Use Alpaca portfolio value if available (source of truth)
-    alpaca_val, _ = _try_alpaca_portfolio()
-    total_value = alpaca_val if alpaca_val is not None else (
-        portfolio["current_value"].sum() if not portfolio.empty else 0.0
-    )
-    open_count = len(portfolio)
-    total_pnl = trades["pnl"].sum() if not trades.empty else 0.0
+    if alpaca_val is not None:
+        total_value = alpaca_val
+        open_count = len(alpaca_df) if alpaca_df is not None and not alpaca_df.empty else 0
+    else:
+        try:
+            portfolio = _query(
+                "SELECT COALESCE(SUM(current_value), 0) AS total_value, "
+                "COUNT(*) AS cnt FROM portfolio_positions"
+            )
+        except sqlite3.OperationalError:
+            st.info("No data yet — run the pipeline first.")
+            return
+        if not portfolio.empty:
+            total_value = portfolio.iloc[0]["total_value"]
+            open_count = portfolio.iloc[0]["cnt"]
+        else:
+            total_value = 0.0
+            open_count = 0
+
+    try:
+        pnl_row = _query(
+            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl FROM trade_history"
+        )
+    except sqlite3.OperationalError:
+        st.info("No data yet — run the pipeline first.")
+        return
+    total_pnl = pnl_row.iloc[0]["total_pnl"] if not pnl_row.empty else 0.0
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Portfolio Value", f"${total_value:,.2f}")
@@ -358,7 +370,9 @@ def page_portfolio() -> None:
             st.dataframe(alpaca_df, width="stretch", hide_index=True)
         else:
             st.info("No open positions on Alpaca.")
-        st.caption("Data from Alpaca paper trading API")
+        alpaca_mode = os.environ.get("ALPACA_MODE", "paper").lower()
+        mode_label = "live" if alpaca_mode == "live" else "paper"
+        st.caption(f"Data from Alpaca {mode_label} trading API")
         return
 
     # Fallback: local DB
@@ -381,17 +395,23 @@ def page_portfolio() -> None:
     live_prices: dict[str, float | None] = {}
     try:
         data = yf.download(tickers, period="1d", progress=False, threads=True)
-        close = data.get("Close")
-        if close is not None:
-            if isinstance(close, pd.Series):
-                live_prices[tickers[0]] = (
-                    float(close.iloc[-1]) if not close.empty else None
-                )
+        if not data.empty:
+            # Handle both MultiIndex columns (multi-ticker) and flat columns (single ticker)
+            if isinstance(data.columns, pd.MultiIndex):
+                close = data["Close"] if "Close" in data.columns.get_level_values(0) else None
             else:
-                for t in tickers:
-                    if t in close.columns:
-                        val = close[t].dropna()
-                        live_prices[t] = float(val.iloc[-1]) if not val.empty else None
+                close = data[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in data.columns else None
+
+            if close is not None:
+                if isinstance(close, pd.Series):
+                    live_prices[tickers[0]] = (
+                        float(close.iloc[-1]) if not close.empty else None
+                    )
+                else:
+                    for t in tickers:
+                        if t in close.columns:
+                            val = close[t].dropna()
+                            live_prices[t] = float(val.iloc[-1]) if not val.empty else None
     except Exception:
         pass
 
