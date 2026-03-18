@@ -36,9 +36,9 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import yfinance as yf
 
 from config.settings import DB_PATH
+from data.alpaca_data import AlpacaDataClient
 from execution.paper_trader import PaperTrader
 from storage.database import Database
 
@@ -64,10 +64,15 @@ _SECTOR_CACHE: dict[str, str] = {}   # ticker → normalised sector (process-lev
 
 
 def _fetch_sector(ticker: str) -> str:
-    """Fetch the normalised sector for *ticker* from yfinance. Falls back to 'Other'."""
+    """Fetch the normalised sector for *ticker* from yfinance.
+
+    Alpaca does not provide sector data, so yfinance is retained for this
+    metadata lookup.  Falls back to 'Other' on any failure.
+    """
     if ticker in _SECTOR_CACHE:
         return _SECTOR_CACHE[ticker]
     try:
+        import yfinance as yf
         info   = yf.Ticker(ticker).info
         raw    = info.get("sector", "") or ""
         sector = _SECTOR_MAP.get(raw, "Other") if raw else "Other"
@@ -686,30 +691,24 @@ class PortfolioManager:
     @staticmethod
     def _download_returns(tickers: list[str]) -> pd.DataFrame:
         """
-        Download ~30 trading days of adjusted close for *tickers* and return
-        daily percentage returns.  Empty DataFrame on failure.
+        Download ~30 trading days of adjusted close for *tickers* via Alpaca
+        and return daily percentage returns.  Empty DataFrame on failure.
         """
         try:
-            import datetime as _dt
-            end   = _dt.date.today()
-            start = end - _dt.timedelta(days=PortfolioManager.LOOKBACK_DAYS)
-            data  = yf.download(
-                tickers,
-                start   = str(start),
-                end     = str(end),
-                auto_adjust = True,
-                progress    = False,
-            )
-            if data.empty:
+            alpaca = AlpacaDataClient()
+            close_dict: dict[str, pd.Series] = {}
+            for t in tickers:
+                try:
+                    bars = alpaca.get_bars(t, "1Day", limit=PortfolioManager.LOOKBACK_DAYS)
+                    if not bars.empty and "Close" in bars.columns:
+                        close_dict[t] = bars["Close"]
+                except Exception as exc:
+                    log.debug("Alpaca bars failed for %s in correlation check: %s", t, exc)
+
+            if not close_dict:
                 return pd.DataFrame()
 
-            # Multi-ticker download returns MultiIndex columns
-            if isinstance(data.columns, pd.MultiIndex):
-                close = data["Close"]
-            else:
-                # Single ticker — yfinance returns flat columns
-                close = data[["Close"]].rename(columns={"Close": tickers[0]})
-
+            close = pd.DataFrame(close_dict)
             returns = close.pct_change().dropna()
             return returns
         except Exception as exc:

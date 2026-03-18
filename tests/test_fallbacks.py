@@ -207,7 +207,7 @@ class TestNewsAggregatorFallbacks(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestPriceFallbackChain(unittest.TestCase):
-    """4-level fallback for PriceFallback (yfinance / HTTP mocked)."""
+    """4-level fallback for PriceFallback (Alpaca / HTTP mocked)."""
 
     def setUp(self):
         from data.price_fallback import PriceFallback
@@ -217,40 +217,34 @@ class TestPriceFallbackChain(unittest.TestCase):
         self.cache = get_cache()
         self.cache.clear("yfinance_price")
         # Reset circuit breakers so shared state from other test suites doesn't
-        # cause the yfinance / yahoo_json circuits to be open.
+        # cause the yahoo_json circuits to be open.
         APIRecovery.reset_circuit("yfinance")
         APIRecovery.reset_circuit("yahoo_json")
 
     def _make(self, alpha_key=""):
         return self.PF(alpha_key=alpha_key)
 
-    # Level 0 — yfinance success
+    # Level 0 — Alpaca success
     def test_level0_yfinance_success(self):
         pf = self._make()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {
-            "currentPrice": 189.30,
-            "currency": "USD",
-            "longName": "Apple Inc.",
-            "marketCap": 3_000_000_000_000,
-            "regularMarketChangePercent": 1.5,
-        }
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker):
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 189.30
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca):
             result = pf.get_price("AAPL")
 
         self.assertEqual(result.level, 0)
-        self.assertEqual(result.source, "yfinance")
+        self.assertEqual(result.source, "alpaca")
         self.assertAlmostEqual(result.price, 189.30)
         self.assertTrue(result.is_fresh)
         self.assertFalse(result.is_estimated)
         self.assertFalse(result.degraded)
 
-    # yfinance returns no price → ValueError propagates to next level
+    # Alpaca returns no price -> ValueError propagates to next level
     def test_level0_raises_on_no_price(self):
         pf = self._make()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}  # no price fields
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("no L2")):
             result = pf.get_price("AAPL")
         # Should fall through to level 3 (cache) or return None price
@@ -260,8 +254,8 @@ class TestPriceFallbackChain(unittest.TestCase):
     def test_level1_skipped_when_no_alpha_key(self):
         pf = self._make(alpha_key="")
 
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
         av_called = []
 
@@ -270,7 +264,7 @@ class TestPriceFallbackChain(unittest.TestCase):
                 av_called.append(True)
             raise Exception("fail")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=_request_side_effect):
             pf.get_price("AAPL")
 
@@ -280,8 +274,8 @@ class TestPriceFallbackChain(unittest.TestCase):
     def test_level1_alpha_vantage_success(self):
         pf = self._make(alpha_key="test_key_123")
 
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}  # Level 0 fails
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
         av_resp = MagicMock()
         av_resp.raise_for_status = MagicMock()
@@ -297,7 +291,7 @@ class TestPriceFallbackChain(unittest.TestCase):
                 return av_resp
             raise Exception("other fail")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=_request_side_effect):
             result = pf.get_price("AAPL")
 
@@ -311,8 +305,8 @@ class TestPriceFallbackChain(unittest.TestCase):
     def test_level2_yahoo_json_success(self):
         pf = self._make()
 
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
         yf_json_resp = MagicMock()
         yf_json_resp.raise_for_status = MagicMock()
@@ -334,7 +328,7 @@ class TestPriceFallbackChain(unittest.TestCase):
                 return yf_json_resp
             raise Exception("other fail")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=_request_side_effect):
             result = pf.get_price("AAPL")
 
@@ -351,10 +345,10 @@ class TestPriceFallbackChain(unittest.TestCase):
         })
 
         pf = self._make()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("all fail")):
             result = pf.get_price("AAPL")
 
@@ -365,16 +359,16 @@ class TestPriceFallbackChain(unittest.TestCase):
         self.assertTrue(result.is_estimated)
         self.assertTrue(result.degraded)
 
-    # All sources fail → None price, no exception
+    # All sources fail -> None price, no exception
     def test_all_sources_fail_returns_none_price(self):
         from utils.network_recovery import get_cache
         get_cache().clear("yfinance_price")
 
         pf = self._make()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("all fail")):
             result = pf.get_price("TSLA")
 
@@ -389,14 +383,9 @@ class TestPriceFallbackChain(unittest.TestCase):
         cache.clear("yfinance_price")
 
         pf = self._make()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {
-            "currentPrice": 300.0,
-            "currency": "USD",
-            "longName": "NVDA",
-            "marketCap": 1_000_000_000_000,
-        }
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker):
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 300.0
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca):
             pf.get_price("NVDA")
 
         cached, hit = cache.get("yfinance_price", "NVDA")
@@ -423,10 +412,10 @@ class TestFreshDataRequired(unittest.TestCase):
         get_cache().clear("yfinance_price")
 
         pf = PriceFallback()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("all fail")):
             with self.assertRaises(FreshDataRequired):
                 pf.get_price("BADTICKER", require_fresh=True)
@@ -437,10 +426,10 @@ class TestFreshDataRequired(unittest.TestCase):
         get_cache().clear("yfinance_price")
 
         pf = PriceFallback()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
 
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("all fail")):
             result = pf.get_price("BADTICKER", require_fresh=False)
 
@@ -450,10 +439,10 @@ class TestFreshDataRequired(unittest.TestCase):
     def test_does_not_raise_when_live_source_succeeds(self):
         from data.price_fallback import PriceFallback
         pf = PriceFallback()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {"currentPrice": 100.0, "currency": "USD", "longName": "X"}
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 100.0
         # Also block HTTP so L2 yahoo_json cannot make real calls
-        with patch("data.price_fallback.yf.Ticker", return_value=mock_ticker), \
+        with patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
              patch("data.price_fallback.requests.get", side_effect=Exception("no http")):
             result = pf.get_price("AAPL", require_fresh=True)
         self.assertAlmostEqual(result.price, 100.0)
@@ -659,31 +648,20 @@ class TestMarketDataFallback(unittest.TestCase):
         get_cache().clear("yfinance_price")
 
     def test_fetch_returns_expected_keys(self):
-        md = self.MD()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {
-            "currentPrice": 123.45,
-            "currency": "USD",
-            "longName": "Test Corp",
-            "marketCap": 500_000_000,
-        }
-        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
-            result = md.fetch("TEST")
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 123.45
+        md = self.MD(alpaca_client=mock_alpaca)
+        result = md.fetch("TEST")
 
         for key in ("ticker", "name", "price", "currency", "market_cap",
                     "source", "degraded"):
             self.assertIn(key, result)
 
     def test_fetch_price_value(self):
-        md = self.MD()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {
-            "currentPrice": 250.00,
-            "currency": "USD",
-            "longName": "BigCo",
-        }
-        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
-            result = md.fetch("BIGC")
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 250.00
+        md = self.MD(alpaca_client=mock_alpaca)
+        result = md.fetch("BIGC")
 
         self.assertAlmostEqual(result["price"], 250.00)
         self.assertFalse(result["degraded"])
@@ -692,23 +670,20 @@ class TestMarketDataFallback(unittest.TestCase):
         from utils.network_recovery import get_cache
         get_cache().clear("yfinance_price")
 
-        md = self.MD()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {}
-
-        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
-            result = md.fetch("FAIL")
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.side_effect = ValueError("no data")
+        md = self.MD(alpaca_client=mock_alpaca)
+        result = md.fetch("FAIL")
 
         self.assertIsNone(result["price"])
         self.assertTrue(result["degraded"])
         self.assertEqual(result["source"], "none")
 
     def test_fetch_ticker_uppercased(self):
-        md = self.MD()
-        mock_ticker = MagicMock()
-        mock_ticker.info = {"currentPrice": 10.0, "currency": "USD", "longName": "X"}
-        with patch("data.market_data.yf.Ticker", return_value=mock_ticker):
-            result = md.fetch("aapl")
+        mock_alpaca = MagicMock()
+        mock_alpaca.get_current_price.return_value = 10.0
+        md = self.MD(alpaca_client=mock_alpaca)
+        result = md.fetch("aapl")
         self.assertEqual(result["ticker"], "AAPL")
 
 

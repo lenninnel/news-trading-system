@@ -388,30 +388,18 @@ def page_portfolio() -> None:
         st.info("No open positions.")
         return
 
-    # Fetch live prices via yfinance
-    import yfinance as yf
+    # Fetch live prices via Alpaca
+    from data.alpaca_data import AlpacaDataClient
 
     tickers = positions["ticker"].tolist()
     live_prices: dict[str, float | None] = {}
     try:
-        data = yf.download(tickers, period="1d", progress=False, threads=True)
-        if not data.empty:
-            # Handle both MultiIndex columns (multi-ticker) and flat columns (single ticker)
-            if isinstance(data.columns, pd.MultiIndex):
-                close = data["Close"] if "Close" in data.columns.get_level_values(0) else None
-            else:
-                close = data[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in data.columns else None
-
-            if close is not None:
-                if isinstance(close, pd.Series):
-                    live_prices[tickers[0]] = (
-                        float(close.iloc[-1]) if not close.empty else None
-                    )
-                else:
-                    for t in tickers:
-                        if t in close.columns:
-                            val = close[t].dropna()
-                            live_prices[t] = float(val.iloc[-1]) if not val.empty else None
+        alpaca = AlpacaDataClient()
+        for t in tickers:
+            try:
+                live_prices[t] = alpaca.get_current_price(t)
+            except Exception:
+                live_prices[t] = None
     except Exception:
         pass
 

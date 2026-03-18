@@ -297,8 +297,8 @@ class TestRunPipeline:
         from agents.screener_agent import ScreenerAgent
 
         ohlcv = _make_ohlcv(days=60)
-        with patch("agents.screener_agent.yf.download", return_value=ohlcv), \
-             patch("agents.screener_agent.yf.Ticker") as mock_t:
+        with patch("yfinance.download", return_value=ohlcv), \
+             patch("yfinance.Ticker") as mock_t:
             mock_t.return_value.fast_info = MagicMock(market_cap=1_000_000_000)
             agent  = ScreenerAgent(db=tmp_db)
             result = agent.run(markets=["DE"], focus_market="DE", top=5)
@@ -311,8 +311,8 @@ class TestRunPipeline:
         from agents.screener_agent import ScreenerAgent
 
         ohlcv = _make_ohlcv(days=60)
-        with patch("agents.screener_agent.yf.download", return_value=ohlcv), \
-             patch("agents.screener_agent.yf.Ticker"):
+        with patch("yfinance.download", return_value=ohlcv), \
+             patch("yfinance.Ticker"):
             agent  = ScreenerAgent(db=tmp_db)
             result = agent.run(markets=["DE"], focus_market=None, top=5)
 
@@ -322,7 +322,7 @@ class TestRunPipeline:
         from agents.screener_agent import ScreenerAgent
 
         empty_df = pd.DataFrame()
-        with patch("agents.screener_agent.yf.download", return_value=empty_df):
+        with patch("yfinance.download", return_value=empty_df):
             agent  = ScreenerAgent(db=tmp_db)
             result = agent.run(markets=["DE"], focus_market=None, top=5)
 
@@ -346,8 +346,8 @@ class TestRunPipeline:
         multi_df = pd.DataFrame(data, index=idx)
         multi_df.columns = pd.MultiIndex.from_tuples(multi_df.columns, names=["Ticker", "Price"])
 
-        with patch("agents.screener_agent.yf.download", return_value=multi_df), \
-             patch("agents.screener_agent.yf.Ticker") as mock_t:
+        with patch("yfinance.download", return_value=multi_df), \
+             patch("yfinance.Ticker") as mock_t:
             mock_t.return_value.fast_info = MagicMock(market_cap=None)
             agent  = ScreenerAgent(db=tmp_db)
             result = agent.run(markets=["DE"], focus_market="DE", top=3)
@@ -358,8 +358,8 @@ class TestRunPipeline:
         from agents.screener_agent import ScreenerAgent
 
         ohlcv = _make_ohlcv(days=60)
-        with patch("agents.screener_agent.yf.download", return_value=ohlcv), \
-             patch("agents.screener_agent.yf.Ticker") as mock_t:
+        with patch("yfinance.download", return_value=ohlcv), \
+             patch("yfinance.Ticker") as mock_t:
             mock_t.return_value.fast_info = MagicMock(market_cap=None)
             agent  = ScreenerAgent(db=tmp_db)
             result = agent.run(markets=["DE"], focus_market=None, top=5)

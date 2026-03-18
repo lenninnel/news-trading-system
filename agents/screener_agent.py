@@ -55,7 +55,6 @@ from typing import Any
 
 import pandas as pd
 import ta  # type: ignore
-import yfinance as yf
 
 # ── Path bootstrap (needed when run as __main__) ───────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -64,13 +63,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from agents.base_agent import BaseAgent
 from config.settings import is_german_ticker
+from data.alpaca_data import AlpacaDataClient
 from data.eodhd_feed import EODHDFeed
 from storage.database import Database
 
 log = logging.getLogger(__name__)
 
-# Suppress yfinance's ERROR-level noise for delisted / invalid tickers.
-# Those failures are handled gracefully — we don't need the stack traces.
+# Suppress yfinance's ERROR-level noise when used as XETRA fallback.
 for _yf_logger_name in ("yfinance", "yfinance.base", "yfinance.utils",
                          "yfinance.scrapers.history", "peewee"):
     logging.getLogger(_yf_logger_name).setLevel(logging.CRITICAL)
@@ -245,8 +244,9 @@ class ScreenerAgent(BaseAgent):
 
     _PRICE_CACHE_TTL  = 300    # seconds — price data stale after 5 min
     _LIST_CACHE_TTL   = 86_400 # seconds — constituent lists stale after 24 h
-    _BATCH_SIZE       = 50     # tickers per yfinance batch download
+    _BATCH_SIZE       = 50     # tickers per Alpaca/yfinance batch download
     _HISTORY_PERIOD   = "1mo"  # enough for 20-day volume average + RSI-14
+    _BAR_LIMIT        = 30     # ~1 month of trading days for Alpaca bars
     _RSI_WINDOW       = 14
     _VOL_AVG_WINDOW   = 20
     _HOTNESS_SCALE    = 10.0   # multiply normalised score → 0–10 display range
@@ -255,9 +255,15 @@ class ScreenerAgent(BaseAgent):
     _VOL_RATIO_CAP    = 5.0    # volume ratios beyond 5× capped at 1.0
     _PRICE_CHG_CAP    = 10.0   # price moves beyond 10% capped at 1.0
 
-    def __init__(self, db: Database | None = None, eodhd_feed: EODHDFeed | None = None) -> None:
+    def __init__(
+        self,
+        db: Database | None = None,
+        eodhd_feed: EODHDFeed | None = None,
+        alpaca_client: AlpacaDataClient | None = None,
+    ) -> None:
         self._db          = db or Database()
         self._eodhd       = eodhd_feed or EODHDFeed()
+        self._alpaca      = alpaca_client or AlpacaDataClient()
         self._price_cache: dict[str, tuple[pd.DataFrame, float]] = {}
         self._list_cache:  dict[str, tuple[list[str], float]]    = {}
 
@@ -444,10 +450,21 @@ class ScreenerAgent(BaseAgent):
     # Data fetching
     # ------------------------------------------------------------------
 
-    def _download_with_retry(
+    def _download_alpaca_bars(self, ticker: str) -> pd.DataFrame | None:
+        """Download OHLCV for a single US ticker via Alpaca."""
+        try:
+            df = self._alpaca.get_bars(ticker, "1Day", limit=self._BAR_LIMIT)
+            if not df.empty:
+                return df
+        except Exception as exc:
+            log.debug("Alpaca bars failed for %s: %s", ticker, exc)
+        return None
+
+    def _download_yfinance_batch(
         self, chunk: list[str], max_retries: int = 2
     ) -> pd.DataFrame:
-        """Download OHLCV for *chunk* with exponential-backoff retries."""
+        """Download OHLCV batch via yfinance (used only for XETRA/DE tickers)."""
+        import yfinance as yf
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(max_retries + 1):
             try:
@@ -462,9 +479,9 @@ class ScreenerAgent(BaseAgent):
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries:
-                    wait = 2 ** attempt          # 1 s, 2 s …
+                    wait = 2 ** attempt
                     log.debug(
-                        "Download attempt %d/%d failed (%s) — retrying in %ds",
+                        "yfinance download attempt %d/%d failed (%s) — retrying in %ds",
                         attempt + 1, max_retries + 1, exc, wait,
                     )
                     time.sleep(wait)
@@ -472,15 +489,15 @@ class ScreenerAgent(BaseAgent):
 
     def _fetch_batch_history(self, tickers: list[str]) -> dict[str, pd.DataFrame]:
         """
-        Batch-download 1-month daily OHLCV for all tickers using the 5-min cache.
+        Fetch 1-month daily OHLCV for all tickers using the 5-min cache.
 
-        German/EU tickers are fetched individually from EODHD.
-        All others are batch-downloaded via yfinance in chunks of ``_BATCH_SIZE``.
+        German/EU tickers are fetched from EODHD (fallback: yfinance).
+        US tickers are fetched individually from Alpaca.
         Returns {ticker: DataFrame}.
         """
         now_ts = time.monotonic()
         result: dict[str, pd.DataFrame] = {}
-        to_fetch_yf: list[str] = []
+        xetra_fallback: list[str] = []  # XETRA tickers that need yfinance
 
         for t in tickers:
             cached = self._price_cache.get(t)
@@ -498,35 +515,48 @@ class ScreenerAgent(BaseAgent):
                         continue
                 except Exception as exc:
                     log.debug("EODHD fetch failed for %s: %s — will try yfinance", t, exc)
-                # Convert .XETRA → .DE for yfinance fallback
+                # Convert .XETRA -> .DE for yfinance fallback
                 yf_t = t.rsplit(".", 1)[0] + ".DE" if t.upper().endswith(".XETRA") else t
-                to_fetch_yf.append(yf_t)
-            else:
-                to_fetch_yf.append(t)
+                xetra_fallback.append(yf_t)
+                continue
+            elif is_german_ticker(t):
+                # No EODHD available, use yfinance
+                yf_t = t.rsplit(".", 1)[0] + ".DE" if t.upper().endswith(".XETRA") else t
+                xetra_fallback.append(yf_t)
+                continue
 
-        total_chunks = math.ceil(len(to_fetch_yf) / self._BATCH_SIZE) or 1
-        for i in range(0, len(to_fetch_yf), self._BATCH_SIZE):
-            chunk     = to_fetch_yf[i : i + self._BATCH_SIZE]
-            chunk_idx = i // self._BATCH_SIZE + 1
-            log.info("Scanning chunk %d/%d (%d tickers)…", chunk_idx, total_chunks, len(chunk))
-            try:
-                raw = self._download_with_retry(chunk)
-                if raw.empty:
-                    continue
+            # US / non-German tickers: use Alpaca
+            df = self._download_alpaca_bars(t)
+            if df is not None and not df.empty:
+                self._price_cache[t] = (df, time.monotonic())
+                result[t] = df
 
-                fetched = self._split_multiindex(raw, chunk)
-                for t, df in fetched.items():
-                    if not df.empty:
-                        self._price_cache[t] = (df, time.monotonic())
-                        result[t] = df
-
-            except Exception as exc:
-                log.warning("Batch download failed (chunk %d/%d): %s",
-                            chunk_idx, total_chunks, exc)
-
-            # Brief pause between chunks to avoid hammering the API
-            if i + self._BATCH_SIZE < len(to_fetch_yf):
-                time.sleep(0.1)
+        # Batch-fetch XETRA/DE tickers via yfinance
+        if xetra_fallback:
+            total_chunks = math.ceil(len(xetra_fallback) / self._BATCH_SIZE) or 1
+            for i in range(0, len(xetra_fallback), self._BATCH_SIZE):
+                chunk = xetra_fallback[i : i + self._BATCH_SIZE]
+                chunk_idx = i // self._BATCH_SIZE + 1
+                log.info(
+                    "Scanning XETRA chunk %d/%d (%d tickers via yfinance)...",
+                    chunk_idx, total_chunks, len(chunk),
+                )
+                try:
+                    raw = self._download_yfinance_batch(chunk)
+                    if raw.empty:
+                        continue
+                    fetched = self._split_multiindex(raw, chunk)
+                    for t, df in fetched.items():
+                        if not df.empty:
+                            self._price_cache[t] = (df, time.monotonic())
+                            result[t] = df
+                except Exception as exc:
+                    log.warning(
+                        "yfinance batch download failed (chunk %d/%d): %s",
+                        chunk_idx, total_chunks, exc,
+                    )
+                if i + self._BATCH_SIZE < len(xetra_fallback):
+                    time.sleep(0.1)
 
         return result
 
@@ -575,7 +605,11 @@ class ScreenerAgent(BaseAgent):
         return out
 
     def _get_market_cap(self, ticker: str) -> float | None:
-        """Fetch market cap from yfinance fast_info (used only for finalists)."""
+        """Fetch market cap from yfinance fast_info (used only for finalists).
+
+        Alpaca does not provide market cap data, so yfinance is kept for this.
+        """
+        import yfinance as yf
         yf_ticker = ticker
         if ticker.upper().endswith(".XETRA"):
             yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"

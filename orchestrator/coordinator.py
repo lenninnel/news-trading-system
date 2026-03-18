@@ -40,7 +40,14 @@ from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
-from config.settings import BUY_THRESHOLD, SELL_THRESHOLD, SOURCE_WEIGHTS, SOURCE_WEIGHTS_NO_REDDIT
+from config.settings import (
+    BUY_THRESHOLD,
+    SELL_THRESHOLD,
+    SOURCE_WEIGHTS,
+    SOURCE_WEIGHTS_NO_NEWSAPI,
+    SOURCE_WEIGHTS_NO_REDDIT,
+    SOURCE_WEIGHTS_NO_REDDIT_NO_NEWSAPI,
+)
 from data.events_feed import get_days_to_earnings
 from data.market_data import MarketData
 from data.news_feed import NewsFeed
@@ -146,11 +153,24 @@ class Coordinator:
     def _active_weights() -> dict[str, float]:
         """Return the source-weight map appropriate for the current config.
 
-        When Reddit credentials are present, the standard ``SOURCE_WEIGHTS``
-        are used.  Otherwise ``SOURCE_WEIGHTS_NO_REDDIT`` bumps NewsAPI and
-        Marketaux to compensate for the missing Reddit signal.
+        Considers both Reddit availability and NewsAPI rate-limit status.
+        When Reddit credentials are present and NewsAPI is within budget,
+        the standard ``SOURCE_WEIGHTS`` are used.  Otherwise an appropriate
+        fallback weight map compensates for the missing source(s).
         """
-        return SOURCE_WEIGHTS if is_reddit_configured() else SOURCE_WEIGHTS_NO_REDDIT
+        from data.news_feed import is_newsapi_limit_reached
+
+        reddit_ok = is_reddit_configured()
+        newsapi_ok = not is_newsapi_limit_reached()
+
+        if reddit_ok and newsapi_ok:
+            return SOURCE_WEIGHTS
+        elif reddit_ok and not newsapi_ok:
+            return SOURCE_WEIGHTS_NO_NEWSAPI
+        elif not reddit_ok and newsapi_ok:
+            return SOURCE_WEIGHTS_NO_REDDIT
+        else:
+            return SOURCE_WEIGHTS_NO_REDDIT_NO_NEWSAPI
 
     @staticmethod
     def _weighted_aggregate(scored: list[dict], weights: dict[str, float] | None = None) -> float:
@@ -284,6 +304,8 @@ class Coordinator:
         Collects headlines from NewsAPI, StockTwits, and Reddit, scores each
         via Claude, and computes a weighted average using SOURCE_WEIGHTS.
 
+        Logs current NewsAPI usage at each invocation to track rate limits.
+
         Args:
             ticker:  Stock ticker symbol (e.g. "AAPL").
             verbose: When True, print step-by-step progress to stdout.
@@ -293,6 +315,9 @@ class Coordinator:
                             avg_score, signal, run_id, source_breakdown
         """
         ticker = ticker.upper()
+
+        # Log NewsAPI usage at session start
+        self.news_feed.log_usage()
 
         # Step 1 — market context
         market: dict = {}

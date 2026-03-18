@@ -275,9 +275,10 @@ class FallbackCoordinator:
                 r = requests.get("https://newsapi.org", timeout=5)
                 return r.status_code < 500
             if service == "price":
-                import yfinance as yf
-                info = yf.Ticker("SPY").fast_info
-                return bool(info)
+                from data.alpaca_data import AlpacaDataClient
+                client = AlpacaDataClient()
+                price = client.get_current_price("SPY")
+                return price is not None and price > 0
             if service == "anthropic":
                 import os
                 return bool(os.environ.get("ANTHROPIC_API_KEY"))

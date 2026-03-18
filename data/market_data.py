@@ -4,24 +4,20 @@ Market data source.
 MarketData fetches current price and basic fundamental information for a
 ticker symbol.  Data sources are routed by ticker type:
 
-  - Crypto (BTC, ETH, …) → Binance
-  - German / EU (.XETRA, .DE) → EODHD (fallback: yfinance)
-  - Everything else → yfinance
-
-On a 401 "Invalid Crumb" error the yfinance JSON cache is cleared and the
-request is retried once with a fresh Ticker object.  If the retry also
-fails, a fallback dict with ``price=None`` is returned instead of raising.
+  - Crypto (BTC, ETH, ...) -> Binance
+  - German / EU (.XETRA, .DE) -> EODHD (fallback: yfinance)
+  - Everything else -> Alpaca Data API (primary), yfinance (fallback only for XETRA)
 
 Requires:
-    pip install yfinance
+    pip install alpaca-trade-api yfinance
 """
 
 import logging
 
 import pandas as pd
-import yfinance as yf
 
 from config.settings import CRYPTO_TICKERS, is_german_ticker
+from data.alpaca_data import AlpacaDataClient
 from data.binance_feed import BinanceFeed
 from data.eodhd_feed import EODHDFeed
 
@@ -33,46 +29,14 @@ def _is_no_price(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "no price" in str(exc).lower()
 
 
-def _is_crumb_error(exc: Exception) -> bool:
-    """Return True if *exc* looks like a yfinance crumb / auth error."""
-    msg = str(exc).lower()
-    return "401" in msg or "invalid crumb" in msg
-
-
-def _clear_yf_cache() -> None:
-    """Best-effort cache clear across yfinance versions."""
-    # Preferred: functools.lru_cache on get_json (yfinance ≥ 0.2.31)
-    utils = getattr(yf, "utils", None)
-    if utils is not None:
-        get_json = getattr(utils, "get_json", None)
-        if get_json is not None and hasattr(get_json, "cache_clear"):
-            try:
-                get_json.cache_clear()
-            except Exception:
-                pass
-
-    # Fallback: clear session cookies on known internal locations
-    for submod_name in ("data", "utils", "shared"):
-        submod = getattr(yf, submod_name, None)
-        if submod is None:
-            continue
-        for attr in ("_session", "session", "_REQUESTS_SESSION"):
-            sess = getattr(submod, attr, None)
-            if sess is not None and hasattr(sess, "cookies"):
-                try:
-                    sess.cookies.clear()
-                except Exception:
-                    pass
-
-
 class MarketData:
     """
     Fetches current market data for a given ticker.
 
     Routing:
-      - Crypto tickers (BTC, ETH, …) → Binance API
-      - German/EU tickers (.XETRA, .DE) → EODHD API (fallback: yfinance)
-      - All others → yfinance
+      - Crypto tickers (BTC, ETH, ...) -> Binance API
+      - German/EU tickers (.XETRA, .DE) -> EODHD API (fallback: yfinance)
+      - All others -> Alpaca Data API
 
     Example::
 
@@ -86,9 +50,11 @@ class MarketData:
         *,
         binance_feed: BinanceFeed | None = None,
         eodhd_feed: EODHDFeed | None = None,
+        alpaca_client: AlpacaDataClient | None = None,
     ) -> None:
         self._binance = binance_feed or BinanceFeed()
         self._eodhd = eodhd_feed or EODHDFeed()
+        self._alpaca = alpaca_client or AlpacaDataClient()
 
     def fetch(self, ticker: str) -> dict:
         """
@@ -109,43 +75,36 @@ class MarketData:
         if is_german_ticker(ticker_upper):
             return self._fetch_german(ticker_upper)
 
+        # US stocks: use Alpaca
         try:
-            result = self._fetch_once(ticker_upper)
-            result["ticker"] = ticker_upper
-            result.setdefault("source", "yfinance")
-            result.setdefault("degraded", False)
-            return result
+            price = self._alpaca.get_current_price(ticker_upper)
+            if price is not None and price > 0:
+                return {
+                    "ticker": ticker_upper,
+                    "name": "",
+                    "price": price,
+                    "currency": "USD",
+                    "market_cap": None,
+                    "source": "alpaca",
+                    "degraded": False,
+                }
         except Exception as exc:
-            if not _is_crumb_error(exc) and not _is_no_price(exc):
-                raise
-
-            if _is_crumb_error(exc):
-                logger.warning(
-                    "yfinance crumb error for %s — clearing cache and retrying",
-                    ticker_upper,
-                )
-                _clear_yf_cache()
-                try:
-                    result = self._fetch_once(ticker_upper)
-                    result["ticker"] = ticker_upper
-                    result.setdefault("source", "yfinance")
-                    result.setdefault("degraded", False)
-                    return result
-                except Exception:
-                    pass
-
             logger.warning(
-                "yfinance failed for %s — returning fallback", ticker_upper,
+                "Alpaca price fetch failed for %s: %s", ticker_upper, exc,
             )
-            return {
-                "ticker": ticker_upper,
-                "name": "N/A",
-                "price": None,
-                "currency": "USD",
-                "market_cap": None,
-                "source": "none",
-                "degraded": True,
-            }
+
+        logger.warning(
+            "Alpaca failed for %s — returning fallback", ticker_upper,
+        )
+        return {
+            "ticker": ticker_upper,
+            "name": "N/A",
+            "price": None,
+            "currency": "USD",
+            "market_cap": None,
+            "source": "none",
+            "degraded": True,
+        }
 
     def get_intraday(
         self, ticker: str, interval: str = "5m"
@@ -157,7 +116,7 @@ class MarketData:
 
         Args:
             ticker:   Ticker symbol.
-            interval: Bar interval — "1m", "5m", or "1h".
+            interval: Bar interval -- "1m", "5m", or "1h".
 
         Returns:
             DataFrame with OHLCV columns, or None.
@@ -200,7 +159,7 @@ class MarketData:
             yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
 
         try:
-            return self._fetch_once(yf_ticker)
+            return self._fetch_yfinance(yf_ticker)
         except Exception:
             logger.warning(
                 "yfinance fallback also failed for %s — returning fallback",
@@ -226,7 +185,10 @@ class MarketData:
         }
 
     @staticmethod
-    def _fetch_once(ticker: str) -> dict:
+    def _fetch_yfinance(ticker: str) -> dict:
+        """Fallback for XETRA/DE tickers only — uses yfinance."""
+        import yfinance as yf
+        logger.info("Using yfinance fallback for XETRA/DE ticker %s", ticker)
         info = yf.Ticker(ticker).info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if price is None:
@@ -235,6 +197,6 @@ class MarketData:
             "ticker": ticker,
             "name": info.get("longName", "N/A"),
             "price": price,
-            "currency": info.get("currency", "USD"),
+            "currency": info.get("currency", "EUR"),
             "market_cap": info.get("marketCap"),
         }

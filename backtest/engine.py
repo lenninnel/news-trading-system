@@ -327,28 +327,57 @@ _CRYPTO_SYMBOLS = {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVA
 
 
 def _download_ohlcv(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Download OHLCV with yfinance; fall back to Binance for crypto."""
+    """Download OHLCV via Alpaca (US stocks), Binance (crypto), or yfinance (XETRA)."""
     warmup_start = pd.Timestamp(start_date) - pd.Timedelta(days=300)
 
-    # Crypto tickers → Binance klines (yfinance crypto is unreliable)
+    # Crypto tickers -> Binance klines
     if ticker.upper() in _CRYPTO_SYMBOLS:
         return _download_binance(ticker.upper(), warmup_start, pd.Timestamp(end_date))
 
-    # German tickers: convert .XETRA → .DE for yfinance
-    yf_ticker = ticker
-    if ticker.upper().endswith(".XETRA"):
-        yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+    # German tickers: use yfinance as Alpaca does not cover XETRA
+    from config.settings import is_german_ticker
+    if is_german_ticker(ticker):
+        yf_ticker = ticker
+        if ticker.upper().endswith(".XETRA"):
+            yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
+        import yfinance as yf
+        df = yf.download(
+            yf_ticker,
+            start=warmup_start.strftime("%Y-%m-%d"),
+            end=end_date,
+            progress=False,
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
 
-    import yfinance as yf
-    df = yf.download(
-        yf_ticker,
-        start=warmup_start.strftime("%Y-%m-%d"),
-        end=end_date,
-        progress=False,
-    )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+    # US stocks: use Alpaca
+    try:
+        from data.alpaca_data import AlpacaDataClient
+        alpaca = AlpacaDataClient()
+        df = alpaca.get_bars(
+            ticker,
+            "1Day",
+            limit=500,
+            start=warmup_start.strftime("%Y-%m-%d"),
+            end=end_date,
+        )
+        return df
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Alpaca backtest download failed for %s: %s — falling back to yfinance", ticker, exc
+        )
+        import yfinance as yf
+        df = yf.download(
+            ticker,
+            start=warmup_start.strftime("%Y-%m-%d"),
+            end=end_date,
+            progress=False,
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
 
 
 def _download_binance(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:

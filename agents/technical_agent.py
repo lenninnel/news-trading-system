@@ -7,19 +7,19 @@ SMA-20, SMA-50, Bollinger Bands, and volume/momentum indicators via the
 BUY / SELL / HOLD.
 
 Data source routing:
-    - Crypto tickers → Binance
-    - German/EU tickers (.XETRA, .DE) → EODHD (fallback: yfinance)
-    - All others → yfinance
+    - Crypto tickers -> Binance
+    - German/EU tickers (.XETRA, .DE) -> EODHD (fallback: yfinance)
+    - All others -> Alpaca Data API
 
-Signal rules (weighted scoring system — score >= +2 → BUY, <= -2 → SELL):
-    RSI           — graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
+Signal rules (weighted scoring system -- score >= +2 -> BUY, <= -2 -> SELL):
+    RSI           -- graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
                      >70 (-2), >65 (-1.5), >60 (-0.5)
-    MACD crossover — bullish (+2), bearish (-2)
-    MACD histogram — positive (+1), negative (-1)
-    Bollinger Band — below lower (+1.5), above upper (-1.5)
-    SMA alignment  — price > SMA20 > SMA50 (+1), price < SMA20 < SMA50 (-1)
-    Golden/Death X — golden cross (+1), death cross (-1)
-    HOLD           — net score between -2 and +2
+    MACD crossover -- bullish (+2), bearish (-2)
+    MACD histogram -- positive (+1), negative (-1)
+    Bollinger Band -- below lower (+1.5), above upper (-1.5)
+    SMA alignment  -- price > SMA20 > SMA50 (+1), price < SMA20 < SMA50 (-1)
+    Golden/Death X -- golden cross (+1), death cross (-1)
+    HOLD           -- net score between -2 and +2
 
 Volume confirmation (adjusts confidence, does not change signal):
     RVOL (Relative Volume) = current volume / 20-day average volume
@@ -29,7 +29,7 @@ Volume confirmation (adjusts confidence, does not change signal):
 Results are persisted to the ``technical_signals`` table.
 
 Requires:
-    pip install yfinance ta
+    pip install alpaca-trade-api ta
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import ta
-import yfinance as yf
 
 from agents.base_agent import BaseAgent
 from config.settings import CRYPTO_TICKERS, is_german_ticker
+from data.alpaca_data import AlpacaDataClient
 from data.binance_feed import BinanceFeed
 from data.eodhd_feed import EODHDFeed
 from storage.database import Database
@@ -79,10 +79,12 @@ class TechnicalAgent(BaseAgent):
         db: Database | None = None,
         binance_feed: BinanceFeed | None = None,
         eodhd_feed: EODHDFeed | None = None,
+        alpaca_client: AlpacaDataClient | None = None,
     ) -> None:
         self._db = db or Database()
         self._binance = binance_feed or BinanceFeed()
         self._eodhd = eodhd_feed or EODHDFeed()
+        self._alpaca = alpaca_client or AlpacaDataClient()
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -181,7 +183,7 @@ class TechnicalAgent(BaseAgent):
         """Download OHLCV data and validate the result.
 
         Crypto tickers are routed to Binance.  German/EU tickers are
-        routed to EODHD with yfinance fallback.  All others use yfinance.
+        routed to EODHD with yfinance fallback.  All others use Alpaca.
         """
         if ticker.upper() in CRYPTO_TICKERS:
             df = self._binance.get_ohlcv(ticker)
@@ -192,19 +194,16 @@ class TechnicalAgent(BaseAgent):
         if is_german_ticker(ticker):
             return self._fetch_german_history(ticker)
 
-        df = self._download_once(ticker)
-        if df.empty:
-            logger.warning(
-                "yfinance returned empty data for %s — "
-                "resetting session cache and retrying",
-                ticker,
-            )
-            from data.market_data import _clear_yf_cache
-            _clear_yf_cache()
-            df = self._download_once(ticker)
-            if df.empty:
-                raise ValueError(f"No price data returned for ticker '{ticker}'")
-        return df
+        # US stocks: use Alpaca bars
+        try:
+            df = self._alpaca.get_bars(ticker, "1Day", limit=252)
+            if not df.empty:
+                logger.debug("Alpaca returned %d bars for %s", len(df), ticker)
+                return df
+        except Exception as exc:
+            logger.warning("Alpaca bars failed for %s: %s", ticker, exc)
+
+        raise ValueError(f"No price data returned for ticker '{ticker}'")
 
     def _fetch_german_history(self, ticker: str) -> pd.DataFrame:
         """Fetch OHLCV for a German ticker via EODHD, falling back to yfinance."""
@@ -215,21 +214,24 @@ class TechnicalAgent(BaseAgent):
                 return df
             logger.warning("EODHD returned no data for %s — falling back to yfinance", ticker)
 
-        # Fallback: convert .XETRA → .DE for yfinance
+        # Fallback: convert .XETRA -> .DE for yfinance
         yf_ticker = ticker
         if ticker.upper().endswith(".XETRA"):
             yf_ticker = ticker.rsplit(".", 1)[0] + ".DE"
 
-        df = self._download_once(yf_ticker)
+        df = self._download_yfinance(yf_ticker)
         if df.empty:
             raise ValueError(f"No price data for German ticker '{ticker}' (tried EODHD + yfinance)")
         return df
 
-    def _download_once(self, ticker: str) -> pd.DataFrame:
-        """Single yfinance download attempt."""
+    @staticmethod
+    def _download_yfinance(ticker: str) -> pd.DataFrame:
+        """yfinance download — used ONLY for XETRA/DE tickers as fallback."""
+        import yfinance as yf
+        logger.info("Using yfinance fallback for XETRA/DE ticker %s", ticker)
         df: pd.DataFrame = yf.download(
             ticker,
-            period=self._DOWNLOAD_PERIOD,
+            period="1y",
             interval="1d",
             progress=False,
             auto_adjust=True,

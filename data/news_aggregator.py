@@ -41,6 +41,15 @@ from typing import Any
 import requests
 
 from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL
+from data.news_feed import (
+    _newsapi_cache,
+    _increment_counter,
+    _max_out_counter,
+    _is_429_error,
+    is_newsapi_limit_reached,
+    newsapi_requests_today,
+    NEWSAPI_DAILY_LIMIT,
+)
 from utils.api_recovery import APIRecovery, CircuitOpenError
 from utils.network_recovery import NetworkMonitor, get_cache
 
@@ -131,6 +140,24 @@ class NewsAggregator:
         ticker = ticker.upper()
         NetworkMonitor.check_and_update()
 
+        # Check 24h cache before attempting any live call
+        cache_key_24h = f"headlines:{ticker}"
+        cached_24h, hit_24h = _newsapi_cache.get("newsapi", cache_key_24h)
+        if hit_24h and cached_24h:
+            log.debug(
+                "NewsAPI 24h cache hit for %s (%d headlines) — skipping live call",
+                ticker, len(cached_24h),
+            )
+            headlines = list(cached_24h)[:self.max_headlines]
+            self._register(ticker, 0, "newsapi")
+            return NewsResult(
+                headlines=headlines,
+                source="newsapi",
+                level=0,
+                ticker=ticker,
+                degraded=False,
+            )
+
         # Ordered fallback chain
         for level, (name, fn) in enumerate([
             ("newsapi",      lambda t: self._level0_newsapi(t)),
@@ -142,12 +169,24 @@ class NewsAggregator:
                 log.info("Network degraded — skipping NewsAPI for %s", ticker)
                 continue
 
+            # Skip NewsAPI when daily limit is reached
+            if level == 0 and is_newsapi_limit_reached():
+                log.warning(
+                    "NewsAPI daily limit approaching (%d/%d), skipping for today",
+                    newsapi_requests_today(), NEWSAPI_DAILY_LIMIT + 20,
+                )
+                continue
+
             try:
                 headlines = fn(ticker)
                 if headlines:
                     # Cache the result for Level 3 reuse
                     cache_key = f"headlines:{ticker}"
                     get_cache().set(_CACHE_SERVICE, cache_key, headlines)
+
+                    # Also populate the 24h cache for NewsAPI results
+                    if level == 0:
+                        _newsapi_cache.set("newsapi", cache_key, headlines)
 
                     degraded = level > 0
                     if degraded:
@@ -164,9 +203,18 @@ class NewsAggregator:
                         degraded=degraded,
                     )
             except Exception as exc:
-                log.warning(
-                    "News source '%s' failed for %s: %s", name, ticker, exc
-                )
+                # Detect 429 and max out counter to prevent further calls
+                if level == 0 and _is_429_error(exc):
+                    log.error(
+                        "NewsAPI returned 429 Too Many Requests for %s — "
+                        "disabling NewsAPI for the rest of today",
+                        ticker,
+                    )
+                    _max_out_counter()
+                else:
+                    log.warning(
+                        "News source '%s' failed for %s: %s", name, ticker, exc
+                    )
 
         # All sources failed and no cache → empty result
         log.error("All news sources exhausted for %s — returning empty list", ticker)
@@ -175,7 +223,7 @@ class NewsAggregator:
     # -- Level 0: NewsAPI -----------------------------------------------------
 
     def _level0_newsapi(self, ticker: str) -> list[str]:
-        """Primary: NewsAPI REST endpoint."""
+        """Primary: NewsAPI REST endpoint (with daily counter tracking)."""
         def _call() -> list[str]:
             params = {
                 "q":        ticker,
@@ -189,7 +237,14 @@ class NewsAggregator:
             articles = resp.json().get("articles", [])
             return [a["title"] for a in articles if a.get("title")]
 
-        return APIRecovery.call("newsapi", _call, ticker=ticker)
+        result = APIRecovery.call("newsapi", _call, ticker=ticker)
+        # Track the successful request
+        count = _increment_counter()
+        log.info(
+            "NewsAPI request successful for %s (request %d/%d today)",
+            ticker, count, NEWSAPI_DAILY_LIMIT + 20,
+        )
+        return result
 
     # -- Level 1: RSS feeds ---------------------------------------------------
 

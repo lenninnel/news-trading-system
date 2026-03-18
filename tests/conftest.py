@@ -153,10 +153,12 @@ def mock_yfinance():
     """
     Patch yfinance.Ticker and yfinance.download with synthetic data.
 
-    yf.Ticker(ticker).info         → dict with currentPrice=150.0
-    yf.Ticker(ticker).history()    → 60-row OHLCV DataFrame
-    yf.download(tickers, ...)      → per-ticker OHLCV dict (single) or
-                                     MultiIndex DataFrame (multiple)
+    Also patches AlpacaDataClient so US stock fetches work in tests.
+
+    yf.Ticker(ticker).info         -> dict with currentPrice=150.0
+    yf.Ticker(ticker).history()    -> 60-row OHLCV DataFrame
+    yf.download(tickers, ...)      -> per-ticker OHLCV dict (single) or
+                                      MultiIndex DataFrame (multiple)
 
     Yields the mock Ticker instance.
     """
@@ -174,8 +176,20 @@ def mock_yfinance():
     mock_ticker.fast_info          = MagicMock(market_cap=2_000_000_000)
     mock_ticker.history.return_value = ohlcv
 
+    # Build a mock AlpacaDataClient
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_current_price.return_value = 150.0
+    mock_alpaca.get_bars.return_value = ohlcv
+    mock_alpaca.get_snapshot.return_value = {
+        "ticker": "AAPL", "price": 150.0, "volume": 50_000_000,
+        "prev_close": 149.0, "change_pct": 0.67, "currency": "USD",
+        "name": "Test Corp", "market_cap": None,
+    }
+
     with patch("yfinance.Ticker",   return_value=mock_ticker), \
-         patch("yfinance.download", return_value=ohlcv):
+         patch("yfinance.download", return_value=ohlcv), \
+         patch("data.alpaca_data.AlpacaDataClient", return_value=mock_alpaca), \
+         patch("data.alpaca_data._default_client", mock_alpaca):
         yield mock_ticker
 
 
@@ -201,10 +215,13 @@ def reset_shared_state():
     • APIRecovery circuit breakers
     • FallbackCoordinator registry
     • NetworkMonitor degraded-mode flag
+    • NewsAPI daily request counter
+    • NewsAPI 24h cache
     """
     from utils.api_recovery import APIRecovery
     from data.fallback_coordinator import FallbackCoordinator
     from utils.network_recovery import NetworkMonitor
+    from data.news_feed import reset_newsapi_counter, _newsapi_cache
 
     APIRecovery._circuits.clear()
     APIRecovery._db = None
@@ -212,9 +229,13 @@ def reset_shared_state():
     NetworkMonitor._degraded      = False
     NetworkMonitor._offline_since = None
     NetworkMonitor._last_check_at = None
+    reset_newsapi_counter()
+    _newsapi_cache.clear()
 
     yield
 
     # teardown
     APIRecovery._circuits.clear()
     FallbackCoordinator.reset()
+    reset_newsapi_counter()
+    _newsapi_cache.clear()
