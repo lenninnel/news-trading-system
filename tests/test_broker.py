@@ -23,7 +23,7 @@ from storage.database import Database
 
 # ── helpers ──────────────────────────────────────────────────────────
 
-def _make_order(status="filled", filled_avg_price="150.25"):
+def _make_order(status="filled", filled_avg_price="243.75"):
     """Return a mock Alpaca order object."""
     return SimpleNamespace(
         id="order-abc-123",
@@ -32,8 +32,8 @@ def _make_order(status="filled", filled_avg_price="150.25"):
     )
 
 
-def _make_position(symbol="AAPL", qty="10", avg_entry_price="148.50",
-                   market_value="1502.50"):
+def _make_position(symbol="AAPL", qty="10", avg_entry_price="241.50",
+                   market_value="2437.50"):
     return SimpleNamespace(
         symbol=symbol,
         qty=qty,
@@ -50,7 +50,7 @@ def _mock_api():
     api.get_order.return_value = order
     api.list_positions.return_value = [_make_position()]
     # Live-price divergence check expects a realistic quote
-    api.get_latest_trade.return_value = SimpleNamespace(price=150.25)
+    api.get_latest_trade.return_value = SimpleNamespace(price=243.75)
     return api
 
 
@@ -139,55 +139,55 @@ class TestAlpacaTrader:
     def test_buy_order_placement(self):
         trader = self._make_trader()
         result = trader.track_trade(
-            "AAPL", "BUY", 10, 150.00,
-            stop_loss=145.00, take_profit=160.00,
+            "AAPL", "BUY", 10, 243.00,
+            stop_loss=238.00, take_profit=253.00,
         )
 
         assert result["ticker"] == "AAPL"
         assert result["action"] == "BUY"
         assert result["shares"] == 10
-        assert result["price"] == 150.25  # filled price from mock
+        assert result["price"] == 243.75  # filled price from mock
         assert result["pnl"] == 0.0
-        assert result["total_value"] == round(10 * 150.25, 2)
+        assert result["total_value"] == round(10 * 243.75, 2)
 
         # Verify bracket order was submitted
         api = trader._api
         call_kwargs = api.submit_order.call_args
         assert call_kwargs[1]["order_class"] == "bracket"
-        assert call_kwargs[1]["stop_loss"] == {"stop_price": "145.0"}
-        assert call_kwargs[1]["take_profit"] == {"limit_price": "160.0"}
+        assert call_kwargs[1]["stop_loss"] == {"stop_price": "238.0"}
+        assert call_kwargs[1]["take_profit"] == {"limit_price": "253.0"}
 
     def test_sell_order_with_pnl(self):
         trader = self._make_trader()
-        # Buy at filled price 150.25
-        trader.track_trade("AAPL", "BUY", 10, 150.00,
-                           stop_loss=145.0, take_profit=160.0)
+        # Buy at filled price 243.75
+        trader.track_trade("AAPL", "BUY", 10, 243.00,
+                           stop_loss=238.0, take_profit=253.0)
 
         # Change mock fill price for the sell
-        sell_order = _make_order(filled_avg_price="155.00")
+        sell_order = _make_order(filled_avg_price="248.50")
         trader._api.submit_order.return_value = sell_order
         trader._api.get_order.return_value = sell_order
 
-        result = trader.track_trade("AAPL", "SELL", 10, 155.00)
+        result = trader.track_trade("AAPL", "SELL", 10, 248.50)
         assert result["action"] == "SELL"
-        # PnL = (155.00 - 150.25) * 10 = 47.50
+        # PnL = (248.50 - 243.75) * 10 = 47.50
         assert result["pnl"] == 47.50
 
     def test_market_order_without_bracket(self):
         """BUY without stop_loss/take_profit is now rejected."""
         trader = self._make_trader()
         with pytest.raises(ValueError, match="requires valid stop_loss"):
-            trader.track_trade("AAPL", "BUY", 5, 150.00)
+            trader.track_trade("AAPL", "BUY", 5, 243.00)
 
     def test_invalid_action_raises(self):
         trader = self._make_trader()
         with pytest.raises(ValueError, match="action must be BUY or SELL"):
-            trader.track_trade("AAPL", "HOLD", 10, 150.00)
+            trader.track_trade("AAPL", "HOLD", 10, 243.00)
 
     def test_invalid_shares_raises(self):
         trader = self._make_trader()
         with pytest.raises(ValueError, match="shares must be >= 1"):
-            trader.track_trade("AAPL", "BUY", 0, 150.00)
+            trader.track_trade("AAPL", "BUY", 0, 243.00)
 
     def test_get_portfolio_syncs_from_alpaca(self):
         trader = self._make_trader()
@@ -196,12 +196,12 @@ class TestAlpacaTrader:
         assert len(positions) == 1
         assert positions[0]["ticker"] == "AAPL"
         assert positions[0]["shares"] == 10
-        assert positions[0]["avg_price"] == 148.50
+        assert positions[0]["avg_price"] == 241.50
 
     def test_get_trade_history_delegates_to_db(self):
         trader = self._make_trader()
-        trader.track_trade("AAPL", "BUY", 5, 150.00,
-                           stop_loss=145.0, take_profit=160.0)
+        trader.track_trade("AAPL", "BUY", 5, 243.00,
+                           stop_loss=238.0, take_profit=253.0)
         history = trader.get_trade_history(ticker="AAPL")
         assert len(history) >= 1
         assert history[0]["ticker"] == "AAPL"
@@ -216,10 +216,10 @@ class TestAlpacaTrader:
         trader = AlpacaTrader(db=db, api=api)
 
         with patch("execution.alpaca_trader._FILL_TIMEOUT", 0):
-            result = trader.track_trade("AAPL", "BUY", 5, 149.99,
-                                        stop_loss=145.0, take_profit=160.0)
+            result = trader.track_trade("AAPL", "BUY", 5, 242.99,
+                                        stop_loss=238.0, take_profit=253.0)
 
-        assert result["price"] == 149.99
+        assert result["price"] == 242.99
 
     def test_rejected_order_uses_fallback_price(self):
         """When the order is rejected, fall back to the quoted price."""
@@ -229,9 +229,9 @@ class TestAlpacaTrader:
         )
         db = Database(db_path=tempfile.mktemp(suffix=".db"))
         trader = AlpacaTrader(db=db, api=api)
-        result = trader.track_trade("AAPL", "BUY", 5, 149.99,
-                                    stop_loss=145.0, take_profit=160.0)
-        assert result["price"] == 149.99
+        result = trader.track_trade("AAPL", "BUY", 5, 242.99,
+                                    stop_loss=238.0, take_profit=253.0)
+        assert result["price"] == 242.99
 
 
 # ── unsupported ticker tests ────────────────────────────────────────
@@ -273,8 +273,8 @@ class TestUnsupportedTickers:
 
     def test_supported_ticker_still_executes(self):
         trader, api = self._make_trader()
-        result = trader.track_trade("AAPL", "BUY", 10, 150.00,
-                                    stop_loss=145.0, take_profit=160.0)
+        result = trader.track_trade("AAPL", "BUY", 10, 243.00,
+                                    stop_loss=238.0, take_profit=253.0)
         assert result.get("skipped") is not True
         api.submit_order.assert_called_once()
 

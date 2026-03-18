@@ -201,6 +201,113 @@ class AlpacaDataClient:
                 f"Alpaca bar fetch failed for {ticker}: {exc}"
             ) from exc
 
+    def get_intraday_bars(
+        self,
+        ticker: str,
+        timeframe: str = "5Min",
+        limit: int = 100,
+    ) -> pd.DataFrame | None:
+        """
+        Fetch intraday OHLCV bars for *ticker*.
+
+        Args:
+            ticker:    US stock ticker symbol.
+            timeframe: Bar timeframe — "5Min", "15Min", or "1Hour".
+            limit:     Maximum number of bars to return (default 100).
+
+        Returns:
+            DataFrame with columns Open, High, Low, Close, Volume
+            indexed by timestamp, or None if data is unavailable.
+        """
+        ticker = ticker.upper()
+
+        # XETRA tickers are not available on Alpaca
+        if ".XETRA" in ticker or ticker.endswith(".DE"):
+            log.warning("Intraday bars not available for XETRA ticker %s", ticker)
+            return None
+
+        valid_timeframes = {"5Min", "15Min", "1Hour"}
+        if timeframe not in valid_timeframes:
+            log.warning(
+                "Invalid intraday timeframe '%s'; expected one of %s",
+                timeframe,
+                valid_timeframes,
+            )
+            return None
+
+        try:
+            bars = self.api.get_bars(ticker, timeframe, limit=limit)
+            df = bars.df if hasattr(bars, "df") else pd.DataFrame(bars)
+
+            if df is None or df.empty:
+                log.warning(
+                    "Alpaca returned no intraday bars for %s (%s)", ticker, timeframe,
+                )
+                return None
+
+            # Normalise column names to title-case (match existing get_bars format)
+            col_map = {
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+                "trade_count": "TradeCount",
+                "vwap": "VWAP",
+            }
+            df.rename(columns=col_map, inplace=True)
+
+            # Verify standard OHLCV columns are present
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                if col not in df.columns:
+                    log.warning(
+                        "Alpaca intraday bars for %s missing '%s' column",
+                        ticker,
+                        col,
+                    )
+                    return None
+
+            log.debug(
+                "Alpaca intraday bars for %s: %d rows (%s)",
+                ticker,
+                len(df),
+                timeframe,
+            )
+            return df
+
+        except Exception as exc:
+            log.warning(
+                "Alpaca intraday bar fetch failed for %s (%s): %s",
+                ticker,
+                timeframe,
+                exc,
+            )
+            return None
+
+    def get_multi_timeframe_bars(self, ticker: str) -> dict[str, pd.DataFrame | None]:
+        """
+        Fetch bars at multiple timeframes for *ticker*.
+
+        Returns:
+            dict with keys '5min', '15min', '1hour', '1day', each mapping
+            to a DataFrame or None if data is unavailable.
+        """
+        result: dict[str, pd.DataFrame | None] = {}
+
+        # Intraday timeframes via get_intraday_bars (returns None on failure)
+        result["5min"] = self.get_intraday_bars(ticker, timeframe="5Min", limit=100)
+        result["15min"] = self.get_intraday_bars(ticker, timeframe="15Min", limit=100)
+        result["1hour"] = self.get_intraday_bars(ticker, timeframe="1Hour", limit=50)
+
+        # Daily bars via existing get_bars (raises on failure, so catch)
+        try:
+            result["1day"] = self.get_bars(ticker, timeframe="1Day", limit=100)
+        except (ValueError, Exception) as exc:
+            log.warning("Daily bars unavailable for %s: %s", ticker, exc)
+            result["1day"] = None
+
+        return result
+
     def get_snapshot(self, ticker: str) -> dict:
         """
         Fetch the latest snapshot for *ticker* (price, volume, daily bar).

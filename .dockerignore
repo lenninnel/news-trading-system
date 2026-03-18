@@ -43,6 +43,12 @@ logs/
 *.swp
 *.swo
 
+# Tests — NEVER ship to production.
+# test_broker.py contains mock prices ($150.25) that caused ghost trades.
+tests/
+pytest.ini
+requirements-test.txt
+
 # Test coverage
 .coverage
 htmlcov/
