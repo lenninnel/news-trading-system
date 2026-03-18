@@ -358,30 +358,45 @@ class DailyScheduler:
                 last_executed = startup_run["name"]
 
         while True:
-            nrt = self.next_run_time()
-            wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
-            run_info = self._run_for_time(nrt)
-            run_name = run_info["name"] if run_info else "UNKNOWN"
+            try:
+                nrt = self.next_run_time()
+                wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
+                run_info = self._run_for_time(nrt)
+                run_name = run_info["name"] if run_info else "UNKNOWN"
 
-            # Skip if this is the same session we just ran at startup
-            if run_info and run_info["name"] == last_executed and wait_s == 0:
-                log.info("Skipping %s — already executed at startup", run_name)
-                print(f"[scheduler] Skipping {run_name} — already ran at startup",
+                # Skip if this is the same session we just ran at startup
+                if run_info and run_info["name"] == last_executed and wait_s == 0:
+                    log.info("Skipping %s — already executed at startup", run_name)
+                    print(f"[scheduler] Skipping {run_name} — already ran at startup",
+                          flush=True)
+                    last_executed = None  # only skip once
+                    continue
+
+                print(f"[scheduler] Next: {run_name} at "
+                      f"{nrt.strftime('%Y-%m-%d %H:%M')} UTC ({wait_s}s away)",
                       flush=True)
-                last_executed = None  # only skip once
-                continue
+                log.info("Sleeping %ds until %s at %s", wait_s, run_name,
+                         nrt.strftime("%H:%M"))
 
-            print(f"[scheduler] Next: {run_name} at "
-                  f"{nrt.strftime('%Y-%m-%d %H:%M')} UTC ({wait_s}s away)",
-                  flush=True)
-            log.info("Sleeping %ds until %s at %s", wait_s, run_name,
-                     nrt.strftime("%H:%M"))
+                time.sleep(wait_s)
 
-            time.sleep(wait_s)
+                if run_info:
+                    self._execute_run(run_info)
+                    last_executed = run_info["name"]
 
-            if run_info:
-                self._execute_run(run_info)
-                last_executed = run_info["name"]
+            except Exception as exc:
+                log.error("Unhandled exception in scheduler loop: %s", exc,
+                          exc_info=True)
+                print(f"[scheduler] LOOP ERROR (restarting in 60s): {exc}", flush=True)
+                if self._tg:
+                    try:
+                        self._tg._send(
+                            f"\U0001f6a8 *Scheduler loop crashed:*\n"
+                            f"{str(exc)[:300]}\nRestarting in 60s\u2026"
+                        )
+                    except Exception:
+                        pass
+                time.sleep(60)
 
     # ── Execution ─────────────────────────────────────────────────────
 
