@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from data.social_feed import RedditFeed, StockTwitsFeed
+from data.social_feed import RedditFeed, StockTwitsFeed, _reddit_warned
 from orchestrator.coordinator import Coordinator
 
 
@@ -119,6 +119,11 @@ class TestStockTwitsParsing:
 class TestRedditFallback:
     """RedditFeed should never crash — returns [] when creds are missing."""
 
+    def setup_method(self):
+        """Reset the module-level warn-once flags before each test."""
+        _reddit_warned["credentials"] = False
+        _reddit_warned["praw"] = False
+
     def test_no_client_id_returns_empty(self):
         feed = RedditFeed(client_id="", client_secret="secret")
         results = feed.fetch("AAPL")
@@ -140,6 +145,111 @@ class TestRedditFallback:
         feed = RedditFeed(client_id="id", client_secret="secret")
         results = feed.fetch("AAPL")
         assert results == []
+
+
+# ===========================================================================
+# Reddit graceful degradation — warn-once, then silence
+# ===========================================================================
+
+class TestRedditGracefulDegradation:
+    """
+    Verify that missing Reddit credentials degrade gracefully:
+      - Returns [] on every call
+      - Logs exactly ONE warning at the first call
+      - Subsequent calls are completely silent (no warnings, no errors)
+      - Exceptions from praw are caught and silenced
+    """
+
+    def setup_method(self):
+        """Reset the module-level warn-once flags before each test."""
+        _reddit_warned["credentials"] = False
+        _reddit_warned["praw"] = False
+
+    def test_no_creds_logs_warning_exactly_once(self):
+        """First call emits one WARNING; subsequent calls are silent."""
+        feed = RedditFeed(client_id="", client_secret="")
+
+        with patch("data.social_feed.logger") as mock_logger:
+            feed.fetch("AAPL")
+            feed.fetch("TSLA")
+            feed.fetch("NVDA")
+
+            warning_calls = mock_logger.warning.call_args_list
+            assert len(warning_calls) == 1
+            assert "REDDIT_CLIENT_ID" in str(warning_calls[0])
+
+    def test_no_creds_returns_empty_every_time(self):
+        """All fetches return [] regardless of how many times called."""
+        feed = RedditFeed(client_id="", client_secret="")
+        for ticker in ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"]:
+            assert feed.fetch(ticker) == []
+
+    def test_no_creds_no_info_logs(self):
+        """No info-level logs should be emitted for missing credentials."""
+        feed = RedditFeed(client_id="", client_secret="")
+
+        with patch("data.social_feed.logger") as mock_logger:
+            feed.fetch("AAPL")
+            feed.fetch("TSLA")
+            # Reset warning so next calls are 'already warned'
+            _reddit_warned["credentials"] = True
+            feed.fetch("NVDA")
+            feed.fetch("MSFT")
+
+            # After the first warning, zero further calls of any kind
+            info_calls = mock_logger.info.call_args_list
+            assert info_calls == []
+
+    @patch.dict("sys.modules", {"praw": None})
+    def test_praw_missing_logs_warning_exactly_once(self):
+        """praw ImportError emits one WARNING at first call, then silent."""
+        feed = RedditFeed(client_id="id", client_secret="secret")
+
+        with patch("data.social_feed.logger") as mock_logger:
+            feed.fetch("AAPL")
+            feed.fetch("TSLA")
+            feed.fetch("NVDA")
+
+            warning_calls = mock_logger.warning.call_args_list
+            assert len(warning_calls) == 1
+            assert "praw" in str(warning_calls[0]).lower()
+
+    @patch.dict("sys.modules", {"praw": None})
+    def test_praw_missing_returns_empty_every_time(self):
+        """All fetches return [] when praw is not installed."""
+        feed = RedditFeed(client_id="id", client_secret="secret")
+        for ticker in ["AAPL", "TSLA"]:
+            assert feed.fetch(ticker) == []
+
+    def test_praw_exception_silenced_returns_empty(self):
+        """Any exception thrown by praw is caught and silenced."""
+        mock_praw = MagicMock()
+        mock_reddit = MagicMock()
+        mock_praw.Reddit.return_value = mock_reddit
+        mock_reddit.subreddit.side_effect = RuntimeError("praw internal error")
+
+        with patch.dict("sys.modules", {"praw": mock_praw}):
+            feed = RedditFeed(client_id="id", client_secret="secret")
+
+            with patch("data.social_feed.logger") as mock_logger:
+                result = feed.fetch("AAPL")
+
+            assert result == []
+            # No warnings or errors logged for fetch exceptions
+            mock_logger.warning.assert_not_called()
+            mock_logger.error.assert_not_called()
+
+    def test_warned_flag_prevents_repeated_warnings(self):
+        """Once the flag is set, repeated missing-cred fetches are silent."""
+        _reddit_warned["credentials"] = True  # simulate already warned
+        feed = RedditFeed(client_id="", client_secret="")
+
+        with patch("data.social_feed.logger") as mock_logger:
+            for _ in range(10):
+                feed.fetch("AAPL")
+
+            mock_logger.warning.assert_not_called()
+            mock_logger.info.assert_not_called()
 
 
 # ===========================================================================

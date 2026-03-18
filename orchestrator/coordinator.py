@@ -208,9 +208,13 @@ class Coordinator:
         Compute a confidence score (0.0–1.0) for the combined signal.
 
         STRONG signals scale with |avg_score| in the upper half [0.6, 1.0].
-        WEAK signals scale with |avg_score| in the lower half [0.0, 0.6].
+        WEAK signals scale with |avg_score| in the range [0.3, 0.6].
         CONFLICTING is fixed at 0.10 (agents actively disagree).
         HOLD is fixed at 0.25 (no directional conviction).
+
+        The WEAK floor is 0.30 (raised from 0.20) so that a normal trending
+        market with moderate sentiment produces 40–60% confidence rather than
+        23–36%.  The cap stays at 0.60 to keep WEAK strictly below STRONG.
 
         Volume adjustment (applied after base calculation):
             +0.10 when volume_confirmed is True (RVOL > 1.5 + OBV aligns).
@@ -229,7 +233,7 @@ class Coordinator:
         if combined_signal in ("STRONG BUY", "STRONG SELL"):
             base = min(1.0, 0.6 + strength * 0.4)
         elif combined_signal in ("WEAK BUY", "WEAK SELL"):
-            base = min(0.6, 0.2 + strength * 0.4)
+            base = min(0.6, 0.3 + strength * 0.3)
         elif combined_signal == "CONFLICTING":
             base = 0.10
         else:
@@ -472,15 +476,17 @@ class Coordinator:
         price_is_live = bool(market_price) and not market_info.get("degraded")
         if not price_is_live and verbose:
             print(f"  [WARNING] No live market price for {ticker} — using technical close")
-        # Cross-validate: if both prices exist but diverge >20%, flag as suspicious
+        # Cross-validate: if both prices exist but diverge >20%, abort loudly
         if market_price and tech_price and tech_price > 0:
             divergence = abs(market_price - tech_price) / tech_price
             if divergence > 0.20:
-                log.error(
-                    "[%s] PRICE MISMATCH: market=$%.2f vs technical=$%.2f (%.0f%% divergence) — aborting trade",
-                    ticker, market_price, tech_price, divergence * 100,
+                msg = (
+                    f"[{ticker}] PRICE MISMATCH ABORT: "
+                    f"market=${market_price:.2f} vs technical=${tech_price:.2f} "
+                    f"({divergence * 100:.0f}% divergence) — possible ghost/stale price"
                 )
-                price_is_live = False  # block trade on suspicious data
+                log.critical(msg)
+                raise RuntimeError(msg)
 
         # Pre-compute event risk so we can downgrade signals before sizing
         days_to_earn = get_days_to_earnings(ticker)
@@ -732,15 +738,17 @@ class Coordinator:
         tech_price = technical["indicators"].get("price")
         price = market_price or tech_price
         price_is_live = bool(market_price) and not (market or {}).get("degraded")
-        # Cross-validate: if both prices exist but diverge >20%, flag as suspicious
+        # Cross-validate: if both prices exist but diverge >20%, abort loudly
         if market_price and tech_price and tech_price > 0:
             divergence = abs(market_price - tech_price) / tech_price
             if divergence > 0.20:
-                log.error(
-                    "[%s] PRICE MISMATCH: market=$%.2f vs technical=$%.2f (%.0f%% divergence) — aborting trade",
-                    ticker, market_price, tech_price, divergence * 100,
+                msg = (
+                    f"[{ticker}] PRICE MISMATCH ABORT: "
+                    f"market=${market_price:.2f} vs technical=${tech_price:.2f} "
+                    f"({divergence * 100:.0f}% divergence) — possible ghost/stale price"
                 )
-                price_is_live = False
+                log.critical(msg)
+                raise RuntimeError(msg)
 
         days_to_earn = get_days_to_earnings(ticker)
         if days_to_earn is not None and days_to_earn <= 2:

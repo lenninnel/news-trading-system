@@ -110,6 +110,11 @@ class PaperTrader:
             raise ValueError(f"shares must be ≥ 1, got {shares}")
         if not price or price <= 0:
             raise ValueError(f"Invalid price ${price} for {ticker} — trade aborted")
+        if price < 50 or price > 10_000:
+            raise ValueError(
+                f"Price ${price:.2f} for {ticker} outside valid range [$50, $10,000] "
+                f"— ghost price detected, trade aborted"
+            )
         if action == "BUY" and (not stop_loss or stop_loss <= 0
                                 or not take_profit or take_profit <= 0):
             raise ValueError(

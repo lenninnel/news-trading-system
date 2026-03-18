@@ -13,7 +13,7 @@ Data source routing:
 
 Signal rules (weighted scoring system — score >= +2 → BUY, <= -2 → SELL):
     RSI           — graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
-                     >70 (-2), >65 (-1.5), >55 (-0.5)
+                     >70 (-2), >65 (-1.5), >60 (-0.5)
     MACD crossover — bullish (+2), bearish (-2)
     MACD histogram — positive (+1), negative (-1)
     Bollinger Band — below lower (+1.5), above upper (-1.5)
@@ -486,6 +486,10 @@ class TechnicalAgent(BaseAgent):
 
         Scoring weights:
             RSI           — up to +/- 2 points (strong oversold/overbought)
+                            Graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
+                            >70 (-2), >65 (-1.5), >60 (-0.5).
+                            RSI 45-60 is neutral (0 points) — a healthy trending
+                            stock with RSI 55-60 is NOT penalised.
             MACD crossover — 2 points (exact crossover bar)
             MACD histogram — 1 point  (sustained momentum direction)
             Bollinger Band — 1.5 points (price outside band)
@@ -531,9 +535,9 @@ class TechnicalAgent(BaseAgent):
             elif rsi > 65:
                 score -= 1.5
                 reasons.append(f"RSI {rsi:.1f} > 65 (overbought, -1.5)")
-            elif rsi > 55:
+            elif rsi > 60:
                 score -= 0.5
-                reasons.append(f"RSI {rsi:.1f} > 55 (mildly overbought, -0.5)")
+                reasons.append(f"RSI {rsi:.1f} > 60 (mildly overbought, -0.5)")
 
         # --- MACD crossover (exact bar — strong signal) ---
         if ind.get("macd_bull_cross"):

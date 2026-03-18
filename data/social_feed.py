@@ -34,6 +34,11 @@ _STOCKTWITS_URL = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json
 
 _REDDIT_SUBREDDITS = ["wallstreetbets", "investing"]
 
+# _REDDIT_WARNED tracks whether the one-time startup warning has already been
+# emitted.  It is a module-level dict so it survives across RedditFeed
+# instances but is still patchable in tests.
+_reddit_warned: dict[str, bool] = {"credentials": False, "praw": False}
+
 
 class RedditFeed:
     """
@@ -41,6 +46,12 @@ class RedditFeed:
 
     Returns a list of dicts with keys: text, source.
     Returns an empty list if PRAW is not installed or credentials are missing.
+
+    Graceful-degradation behaviour
+    --------------------------------
+    * Missing credentials: logs ONE warning at first call, then stays silent.
+    * praw not installed:  logs ONE warning at first call, then stays silent.
+    * Any exception from praw: caught and silenced (returns empty list).
     """
 
     def __init__(
@@ -67,13 +78,23 @@ class RedditFeed:
             Empty list if PRAW is unavailable or credentials are missing.
         """
         if not self.client_id or not self.client_secret:
-            logger.info("Reddit credentials not set — skipping Reddit feed")
+            if not _reddit_warned["credentials"]:
+                logger.warning(
+                    "Reddit credentials not set — Reddit feed disabled. "
+                    "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to enable."
+                )
+                _reddit_warned["credentials"] = True
             return []
 
         try:
             import praw  # noqa: F811
         except ImportError:
-            logger.info("praw not installed — skipping Reddit feed")
+            if not _reddit_warned["praw"]:
+                logger.warning(
+                    "praw not installed — Reddit feed disabled. "
+                    "Install with: pip install praw"
+                )
+                _reddit_warned["praw"] = True
             return []
 
         try:
@@ -94,8 +115,7 @@ class RedditFeed:
                         text = f"{text} — {preview}"
                     results.append({"text": text, "source": "reddit"})
             return results[: self.max_posts]
-        except Exception as exc:
-            logger.warning("Reddit fetch failed: %s", exc)
+        except Exception:
             return []
 
 

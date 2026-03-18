@@ -82,7 +82,9 @@ class TestConfidence:
         c = conf("STRONG BUY", 0.5)
         assert 0.6 <= c <= 1.0
 
-    # --- WEAK BUY / SELL: range [0.20, 0.60] ---
+    # --- WEAK BUY / SELL: range [0.30, 0.60] ---
+    # Floor raised from 0.20 to 0.30 so a normal trending market with
+    # moderate sentiment produces 40–60% confidence (not 23–36%).
 
     def test_weak_buy_full_sentiment_gives_0_6(self):
         assert conf("WEAK BUY", 1.0) == 0.6
@@ -90,12 +92,13 @@ class TestConfidence:
     def test_weak_sell_full_sentiment_gives_0_6(self):
         assert conf("WEAK SELL", -1.0) == 0.6
 
-    def test_weak_buy_zero_sentiment_gives_0_2(self):
-        assert conf("WEAK BUY", 0.0) == 0.2
+    def test_weak_buy_zero_sentiment_gives_0_3(self):
+        # Floor raised from 0.20 → 0.30
+        assert conf("WEAK BUY", 0.0) == 0.3
 
-    def test_weak_signal_scales_between_0_2_and_0_6(self):
+    def test_weak_signal_scales_between_0_3_and_0_6(self):
         c = conf("WEAK SELL", 0.3)
-        assert 0.2 <= c <= 0.6
+        assert 0.3 <= c <= 0.6
 
     # --- CONFLICTING: fixed 0.10 ---
 
@@ -190,7 +193,7 @@ class TestConfidenceVolume:
         assert c == 1.0
 
     def test_confidence_floor_with_low_rvol(self):
-        # WEAK BUY with 0.0 sentiment = 0.20 (no rvol penalty)
+        # WEAK BUY with 0.0 sentiment = 0.30 (floor raised; no rvol penalty)
         c = conf("WEAK BUY", 0.0, rvol=0.3)
-        assert c == 0.20
+        assert c == 0.30
         assert c >= 0.0

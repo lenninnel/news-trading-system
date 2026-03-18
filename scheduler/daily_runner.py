@@ -42,6 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from orchestrator.coordinator import Coordinator
+from storage.database import Database
 
 log = logging.getLogger(__name__)
 
@@ -333,6 +334,32 @@ class DailyScheduler:
                  len(self._full_watchlist))
         print(f"[scheduler] Daemon started — full watchlist: "
               f"{', '.join(self._full_watchlist)}", flush=True)
+
+        # Startup sanity: purge positions with obviously wrong prices
+        try:
+            _startup_db = Database()
+            ghost_pos = _startup_db.get_portfolio()
+            bad = [p for p in ghost_pos if p.get("avg_price", 99999) < 50]
+            if bad:
+                for p in bad:
+                    log.warning(
+                        "[startup] Removing ghost position: %s @ $%.2f",
+                        p["ticker"], p["avg_price"],
+                    )
+                    _startup_db.delete_portfolio_position(p["ticker"])
+                print(f"[scheduler] Startup cleanup: removed {len(bad)} ghost position(s)",
+                      flush=True)
+                if self._tg:
+                    try:
+                        self._tg._send(
+                            f"\u26a0\ufe0f *Startup cleanup:* removed {len(bad)} ghost position(s) "
+                            f"with price < $50: "
+                            + ", ".join(f"{p['ticker']} @${p['avg_price']:.2f}" for p in bad)
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            log.warning("Startup position sanity check failed: %s", exc)
 
         # Startup notification so we know the daemon is alive
         if self._tg:
