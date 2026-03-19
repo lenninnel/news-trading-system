@@ -32,7 +32,6 @@ import textwrap
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any
 
 log = logging.getLogger(__name__)
 

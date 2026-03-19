@@ -35,11 +35,9 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
-
 import requests
 
-from utils.api_recovery import APIRecovery, CircuitOpenError
+from utils.api_recovery import APIRecovery
 from utils.network_recovery import get_cache
 
 log = logging.getLogger(__name__)

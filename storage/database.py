@@ -177,7 +177,14 @@ def _resolve_db_path(default: str = DB_PATH) -> str:
 
 
 class Database:
-    """Thin wrapper around a SQLite database for logging trading analysis."""
+    """Thin wrapper around a SQLite database for logging trading analysis.
+
+    SQLite is used intentionally — it is the right fit for a single-process
+    trading system that runs one daemon per host.  On Railway the DB file
+    lives on a persistent volume (/data).  PostgreSQL is NOT required;
+    DATABASE_URL is only used by the legacy migration script and the
+    docker-compose Postgres service (neither is used in production).
+    """
 
     _write_lock = threading.Lock()
 
