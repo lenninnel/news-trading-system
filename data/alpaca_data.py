@@ -146,7 +146,7 @@ class AlpacaDataClient:
             ticker:    US stock ticker symbol.
             timeframe: Bar timeframe — "1Min", "5Min", "15Min", "1Hour", "1Day".
             limit:     Maximum number of bars to return (default 252 ~ 1 year).
-            start:     ISO-8601 start date (optional).
+            start:     ISO-8601 start date (optional, auto-computed from limit if omitted).
             end:       ISO-8601 end date (optional).
 
         Returns:
@@ -158,9 +158,25 @@ class AlpacaDataClient:
         """
         ticker = ticker.upper()
         try:
-            kwargs: dict[str, Any] = {"limit": limit}
-            if start:
-                kwargs["start"] = start
+            # Alpaca free-tier ignores `limit` without a `start` date and
+            # returns only today's bar.  Always compute a start date so we
+            # get the full history we need.
+            if not start:
+                from datetime import datetime, timedelta, timezone
+
+                _PERIOD_MAP = {
+                    "1Day": limit * 2,       # trading days → calendar days
+                    "1Hour": max(limit // 6, 30),
+                    "15Min": max(limit // 26, 10),
+                    "5Min": max(limit // 78, 5),
+                    "1Min": max(limit // 390, 3),
+                }
+                lookback_days = _PERIOD_MAP.get(timeframe, limit * 2)
+                start = (
+                    datetime.now(timezone.utc) - timedelta(days=lookback_days)
+                ).strftime("%Y-%m-%d")
+
+            kwargs: dict[str, Any] = {"limit": limit, "start": start}
             if end:
                 kwargs["end"] = end
 
