@@ -78,6 +78,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils import safe_column
+
 from storage.database import Database  # noqa: E402
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -483,10 +485,10 @@ class ParameterTuner:
         self._common_ind). For swing, MACD periods may differ, so a fresh
         MACD is computed when needed.
         """
-        close  = price_df["Close"].squeeze()
-        high   = price_df["High"].squeeze()
-        low    = price_df["Low"].squeeze()
-        volume = price_df["Volume"].squeeze()
+        close  = safe_column(price_df, "Close")
+        high   = safe_column(price_df, "High")
+        low    = safe_column(price_df, "Low")
+        volume = safe_column(price_df, "Volume")
 
         # Build common indicators cache (strategy-agnostic)
         if self._common_ind is None:

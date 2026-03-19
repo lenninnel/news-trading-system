@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from agents.base_agent import BaseAgent
+from utils import safe_column
 
 _CACHE_TTL = 4 * 3600  # 4 hours in seconds
 
@@ -143,7 +144,7 @@ class RegimeAgent(BaseAgent):
             except Exception:
                 spy = yf.download("SPY", period="250d", progress=False)
 
-        close = spy["Close"].squeeze()
+        close = safe_column(spy, "Close")
 
         sma50 = float(close.rolling(50).mean().iloc[-1])
         sma200 = float(close.rolling(200).mean().iloc[-1])
@@ -156,7 +157,7 @@ class RegimeAgent(BaseAgent):
         vix: float | None = None
         try:
             vix_data = yf.download("^VIX", period="5d", progress=False)
-            vix_close = vix_data["Close"].squeeze()
+            vix_close = safe_column(vix_data, "Close")
             if len(vix_close) > 0:
                 vix = float(vix_close.iloc[-1])
         except Exception:

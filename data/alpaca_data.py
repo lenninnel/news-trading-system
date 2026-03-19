@@ -189,6 +189,11 @@ class AlpacaDataClient:
                         f"Alpaca bars for {ticker} missing '{col}' column"
                     )
 
+            if len(df) < 20:
+                raise ValueError(
+                    f"Alpaca returned only {len(df)} bars for {ticker} (need >= 20)"
+                )
+
             log.debug(
                 "Alpaca bars for %s: %d rows (%s)", ticker, len(df), timeframe,
             )

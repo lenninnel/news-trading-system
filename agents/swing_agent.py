@@ -46,6 +46,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from agents.strategy_base import StrategyAgent, StrategySignal
 from storage.database import Database
+from utils import safe_column
 
 log = logging.getLogger(__name__)
 
@@ -101,9 +102,9 @@ class SwingAgent(StrategyAgent):
     # ------------------------------------------------------------------
 
     def _calculate_indicators(self, df) -> dict:
-        close  = df["Close"].squeeze()
-        high   = df["High"].squeeze()
-        low    = df["Low"].squeeze()
+        close  = safe_column(df, "Close")
+        high   = safe_column(df, "High")
+        low    = safe_column(df, "Low")
 
         # SMA 20, 50, 200
         sma20  = ta.trend.SMAIndicator(close=close, window=20).sma_indicator()

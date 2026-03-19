@@ -41,6 +41,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from agents.strategy_base import StrategyAgent, StrategySignal
 from storage.database import Database
+from utils import safe_column
 
 log = logging.getLogger(__name__)
 
@@ -96,9 +97,9 @@ class MeanReversionAgent(StrategyAgent):
     # ------------------------------------------------------------------
 
     def _calculate_indicators(self, df) -> dict:
-        close  = df["Close"].squeeze()
-        high   = df["High"].squeeze()
-        low    = df["Low"].squeeze()
+        close  = safe_column(df, "Close")
+        high   = safe_column(df, "High")
+        low    = safe_column(df, "Low")
 
         # RSI-14
         rsi = ta.momentum.RSIIndicator(close=close, window=14).rsi()
