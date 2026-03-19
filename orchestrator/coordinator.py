@@ -34,7 +34,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time as _time
+
+log = logging.getLogger(__name__)
 
 from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent

@@ -32,10 +32,9 @@ Pipeline
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from agents.momentum_agent import MomentumAgent
 from agents.mean_reversion_agent import MeanReversionAgent

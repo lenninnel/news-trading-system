@@ -281,7 +281,7 @@ class TestPriceFallbackChain(unittest.TestCase):
         av_resp.raise_for_status = MagicMock()
         av_resp.json.return_value = {
             "Global Quote": {
-                "05. price": "155.00",
+                "05. price": "243.75",
                 "10. change percent": "0.50%",
             }
         }
@@ -297,7 +297,7 @@ class TestPriceFallbackChain(unittest.TestCase):
 
         self.assertEqual(result.level, 1)
         self.assertEqual(result.source, "alpha_vantage")
-        self.assertAlmostEqual(result.price, 155.00)
+        self.assertAlmostEqual(result.price, 243.75)
         self.assertTrue(result.is_fresh)
         self.assertTrue(result.degraded)
 

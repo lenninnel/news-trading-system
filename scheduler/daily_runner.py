@@ -31,7 +31,6 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,7 +41,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from orchestrator.coordinator import Coordinator
-from storage.database import Database
 
 log = logging.getLogger(__name__)
 

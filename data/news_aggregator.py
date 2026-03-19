@@ -50,7 +50,7 @@ from data.news_feed import (
     newsapi_requests_today,
     NEWSAPI_DAILY_LIMIT,
 )
-from utils.api_recovery import APIRecovery, CircuitOpenError
+from utils.api_recovery import APIRecovery
 from utils.network_recovery import NetworkMonitor, get_cache
 
 log = logging.getLogger(__name__)
