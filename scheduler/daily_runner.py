@@ -350,8 +350,15 @@ class DailyScheduler:
 
     # ── Main loop ─────────────────────────────────────────────────────
 
+    # Minimum uptime (seconds) before the daemon is allowed to execute
+    # trades.  Any scheduled run that fires before this threshold uses
+    # force_no_execute=True.  This prevents ghost trades when a deploy
+    # restarts the container shortly before a scheduled run.
+    _BOOT_COOLDOWN_S = 1800  # 30 minutes
+
     def run_forever(self) -> None:
         """Sleep-loop daemon: find next run, sleep, execute, repeat."""
+        boot_time = datetime.now(timezone.utc)
         log.info("DailyScheduler daemon started — %d tickers in full watchlist",
                  len(self._full_watchlist))
         print(f"[scheduler] Daemon started — full watchlist: "
@@ -441,7 +448,23 @@ class DailyScheduler:
                 time.sleep(wait_s)
 
                 if run_info:
-                    self._execute_run(run_info)
+                    # Suppress trade execution if the daemon just booted.
+                    # This catches the case where a deploy restarts the
+                    # container shortly before a scheduled run, which would
+                    # otherwise fire trades on every Railway deploy.
+                    uptime_s = (datetime.now(timezone.utc) - boot_time).total_seconds()
+                    boot_cooldown = uptime_s < self._BOOT_COOLDOWN_S
+                    if boot_cooldown:
+                        log.info(
+                            "Boot cooldown active (%.0fs < %ds) — %s will be analysis only",
+                            uptime_s, self._BOOT_COOLDOWN_S, run_info["name"],
+                        )
+                        print(
+                            f"[scheduler] Boot cooldown: {run_info['name']} analysis only "
+                            f"(uptime {uptime_s:.0f}s < {self._BOOT_COOLDOWN_S}s)",
+                            flush=True,
+                        )
+                    self._execute_run(run_info, force_no_execute=boot_cooldown)
                     last_executed = run_info["name"]
 
             except Exception as exc:
