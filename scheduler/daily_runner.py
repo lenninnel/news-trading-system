@@ -74,7 +74,8 @@ class _ProgressTracker:
             sig = result.get("combined_signal", "?")
             conf = result.get("confidence", 0)
             elapsed = result.get("elapsed_s", 0)
-            line = f"[{idx}/{self._total}] {ticker} \u2713 {sig} ({conf:.0%}) — {elapsed:.1f}s"
+            sn = result.get("strategy_name", "generic")
+            line = f"[{idx}/{self._total}] {ticker} \u2713 {sig} ({conf:.0%}) [{sn}] — {elapsed:.1f}s"
         print(line, flush=True)
         async with self._lock:
             self._results.append(line)
@@ -553,7 +554,8 @@ class DailyScheduler:
             sig = r.get("combined_signal", "HOLD")
             conf = r.get("confidence", 0)
             ticker = r.get("ticker", "?")
-            signals.append(f"  {ticker}: {sig} ({conf:.0%})")
+            sn = r.get("strategy_name", "generic")
+            signals.append(f"  {ticker}: {sig} ({conf:.0%}) [{sn}]")
             if (r.get("execution") or {}).get("trade_id"):
                 trades += 1
 
