@@ -37,6 +37,8 @@ import json
 import logging
 import time as _time
 
+from data.alpaca_data import AlpacaDataClient
+
 log = logging.getLogger(__name__)
 
 from agents.regime_agent import RegimeAgent
@@ -58,6 +60,7 @@ from data.marketaux_feed import MarketauxFeed
 from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
 from storage.database import Database
+from strategies.router import get_strategy, strategy_label
 
 # Maps (sentiment_signal, technical_signal) → combined label
 _FUSION_TABLE: dict[tuple[str, str], str] = {
@@ -484,7 +487,7 @@ class Coordinator:
             print(f"\n[1/3] Sentiment analysis for {ticker}...")
         sentiment = self.run(ticker, verbose=verbose)
 
-        # --- Technical pipeline ---
+        # --- Technical pipeline (always run for DB record) ---
         if verbose:
             print(f"\n[2/3] Technical analysis for {ticker}...")
         technical = self.technical_agent.run(ticker)
@@ -496,15 +499,52 @@ class Coordinator:
             fmt_r = f"{r:.1f}" if r is not None else "N/A"
             print(f"  Price: {fmt_p}  RSI: {fmt_r}  →  {technical['signal']}")
 
+        # --- Strategy override ---
+        strategy = get_strategy(ticker)
+        strat_name = strategy_label(ticker)
+        strategy_result = None
+
+        if strategy is not None:
+            try:
+                bars = AlpacaDataClient().get_bars(ticker, timeframe="1Day", limit=252)
+                strategy_result = strategy.analyze(
+                    ticker, bars, sentiment["signal"],
+                )
+                log.info(
+                    "[%s] Strategy %s → %s (%.0f%%)",
+                    ticker, strat_name,
+                    strategy_result.signal, strategy_result.confidence,
+                )
+                if verbose:
+                    print(f"  Strategy [{strat_name}]: "
+                          f"{strategy_result.signal} ({strategy_result.confidence:.0f}%)")
+            except Exception as exc:
+                log.warning(
+                    "[%s] Strategy %s failed, using generic TA: %s",
+                    ticker, strat_name, exc,
+                )
+
         # --- Fuse ---
-        combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
-        conf = self.confidence(
-            combined_signal,
-            sentiment["avg_score"],
-            volume_confirmed=technical.get("volume_confirmed", False),
-            rvol=technical.get("indicators", {}).get("rvol"),
-            technical_confidence=technical.get("adjusted_confidence"),
-        )
+        if strategy_result is not None:
+            # Map strategy signal → simple BUY/SELL/HOLD for fusion table
+            _ss = strategy_result.signal.upper()
+            if _ss in ("STRONG BUY", "BUY", "WEAK BUY"):
+                tech_for_fusion = "BUY"
+            elif _ss in ("SELL", "STRONG SELL", "WEAK SELL"):
+                tech_for_fusion = "SELL"
+            else:
+                tech_for_fusion = "HOLD"
+            combined_signal = self.combine_signals(sentiment["signal"], tech_for_fusion)
+            conf = strategy_result.confidence / 100.0  # 0-100 → 0.0-1.0
+        else:
+            combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
+            conf = self.confidence(
+                combined_signal,
+                sentiment["avg_score"],
+                volume_confirmed=technical.get("volume_confirmed", False),
+                rvol=technical.get("indicators", {}).get("rvol"),
+                technical_confidence=technical.get("adjusted_confidence"),
+            )
 
         # --- Persist combined ---
         combined_id = self.db.log_combined_signal(
@@ -566,6 +606,14 @@ class Coordinator:
             account_balance=account_balance,
             regime=regime_info.get("regime"),
         )
+
+        # Override SL/TP with strategy-specific values when available
+        if strategy_result is not None and not risk["skipped"]:
+            if strategy_result.stop_loss:
+                risk["stop_loss"] = strategy_result.stop_loss
+            if strategy_result.take_profit:
+                risk["take_profit"] = strategy_result.take_profit
+
         if verbose:
             if risk["skipped"]:
                 print(f"  No position — {risk['skip_reason']}")
@@ -575,6 +623,7 @@ class Coordinator:
                     f"({risk['shares']} shares)  "
                     f"SL: ${risk['stop_loss']:.2f}  "
                     f"TP: ${risk['take_profit']:.2f}"
+                    f"  [{strat_name}]"
                 )
 
         # --- Paper trade execution ---
@@ -628,6 +677,7 @@ class Coordinator:
             "execution": execution,
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
+            "strategy_name": strat_name,
         }
 
     # ------------------------------------------------------------------
@@ -744,17 +794,54 @@ class Coordinator:
                 self.technical_agent.run, ticker,
             )
 
+        # ── Strategy override ────────────────────────────────────────
+        strategy = get_strategy(ticker)
+        strat_name = strategy_label(ticker)
+        strategy_result = None
+
+        if strategy is not None:
+            try:
+                _alpaca = AlpacaDataClient()
+                async with data_semaphore:
+                    bars = await asyncio.to_thread(
+                        _alpaca.get_bars, ticker, "1Day", 252,
+                    )
+                strategy_result = await asyncio.to_thread(
+                    strategy.analyze, ticker, bars, sentiment_signal,
+                )
+                log.info(
+                    "[%s] Strategy %s → %s (%.0f%%)",
+                    ticker, strat_name,
+                    strategy_result.signal, strategy_result.confidence,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] Strategy %s failed, using generic TA: %s",
+                    ticker, strat_name, exc,
+                )
+
         # ── Fuse signals ───────────────────────────────────────────────
-        combined_signal = self.combine_signals(
-            sentiment_signal, technical["signal"],
-        )
-        conf = self.confidence(
-            combined_signal,
-            avg_score,
-            volume_confirmed=technical.get("volume_confirmed", False),
-            rvol=technical.get("indicators", {}).get("rvol"),
-            technical_confidence=technical.get("adjusted_confidence"),
-        )
+        if strategy_result is not None:
+            _ss = strategy_result.signal.upper()
+            if _ss in ("STRONG BUY", "BUY", "WEAK BUY"):
+                tech_for_fusion = "BUY"
+            elif _ss in ("SELL", "STRONG SELL", "WEAK SELL"):
+                tech_for_fusion = "SELL"
+            else:
+                tech_for_fusion = "HOLD"
+            combined_signal = self.combine_signals(sentiment_signal, tech_for_fusion)
+            conf = strategy_result.confidence / 100.0
+        else:
+            combined_signal = self.combine_signals(
+                sentiment_signal, technical["signal"],
+            )
+            conf = self.confidence(
+                combined_signal,
+                avg_score,
+                volume_confirmed=technical.get("volume_confirmed", False),
+                rvol=technical.get("indicators", {}).get("rvol"),
+                technical_confidence=technical.get("adjusted_confidence"),
+            )
 
         # ── Phase 4: DB writes + risk sizing ───────────────────────────
         async with db_lock:
@@ -829,6 +916,13 @@ class Coordinator:
                 regime=regime_info.get("regime"),
             )
 
+        # Override SL/TP with strategy-specific values when available
+        if strategy_result is not None and not risk["skipped"]:
+            if strategy_result.stop_loss:
+                risk["stop_loss"] = strategy_result.stop_loss
+            if strategy_result.take_profit:
+                risk["take_profit"] = strategy_result.take_profit
+
         # --- Execution ---
         execution = None
         if execute and not risk["skipped"]:
@@ -886,5 +980,6 @@ class Coordinator:
             "execution": execution,
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
+            "strategy_name": strat_name,
             "elapsed_s": round(elapsed, 2),
         }

@@ -37,6 +37,9 @@ python3 scripts/clean_ghost_trades.py --apply 2>&1 || echo "[entrypoint] Ghost c
 # Do NOT also run --now separately — that causes duplicate trades.
 echo "[entrypoint] Starting daemon scheduler (4 runs/day, weekdays UTC)..."
 python3 -m scheduler.daily_runner --daemon 2>&1 &
+DAEMON_PID=$!
 
-# Keep container alive — wait for ALL background jobs
-wait
+# Keep container alive — only restart if Streamlit dies.
+# If the daemon crashes, trading stops but the dashboard stays up
+# (prevents restart loops that trigger ghost trades on every boot).
+wait $STREAMLIT_PID
