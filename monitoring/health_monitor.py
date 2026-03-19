@@ -42,7 +42,6 @@ import shutil
 import signal
 import sys
 import threading
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -52,7 +51,6 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import DB_PATH                            # noqa: E402
 from storage.database import Database                          # noqa: E402
 from utils.retry import with_retry                             # noqa: E402
 
