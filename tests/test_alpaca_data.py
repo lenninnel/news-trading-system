@@ -80,13 +80,13 @@ class TestAlpacaDataClient(unittest.TestCase):
 
     def test_get_bars_returns_dataframe(self):
         mock_api = MagicMock()
-        dates = pd.date_range(end="2025-01-15", periods=10, freq="B")
+        dates = pd.date_range(end="2025-01-15", periods=25, freq="B")
         bars_df = pd.DataFrame({
-            "open": [100.0] * 10,
-            "high": [105.0] * 10,
-            "low": [95.0] * 10,
-            "close": [102.0] * 10,
-            "volume": [1_000_000] * 10,
+            "open": [100.0] * 25,
+            "high": [105.0] * 25,
+            "low": [95.0] * 25,
+            "close": [102.0] * 25,
+            "volume": [1_000_000] * 25,
         }, index=dates)
 
         mock_bars = MagicMock()
@@ -94,9 +94,9 @@ class TestAlpacaDataClient(unittest.TestCase):
         mock_api.get_bars.return_value = mock_bars
 
         client = self._make_client(mock_api)
-        df = client.get_bars("AAPL", "1Day", limit=10)
+        df = client.get_bars("AAPL", "1Day", limit=25)
 
-        self.assertEqual(len(df), 10)
+        self.assertEqual(len(df), 25)
         # Column names should be title-case
         self.assertIn("Open", df.columns)
         self.assertIn("Close", df.columns)
@@ -299,7 +299,7 @@ class TestGetMultiTimeframeBars(unittest.TestCase):
             # Let 5Min and 1Day succeed, fail on 15Min and 1Hour
             if timeframe in ("15Min", "1Hour"):
                 raise Exception("no data available")
-            return self._mock_bars_response(10)
+            return self._mock_bars_response(25)
 
         mock_api.get_bars.side_effect = side_effect
         client = self._make_client(mock_api)
@@ -345,7 +345,7 @@ class TestGetMultiTimeframeBars(unittest.TestCase):
     def test_correct_limits_passed(self):
         """Verify that the correct limits are passed for each timeframe."""
         mock_api = MagicMock()
-        mock_api.get_bars.return_value = self._mock_bars_response(10)
+        mock_api.get_bars.return_value = self._mock_bars_response(25)
         client = self._make_client(mock_api)
 
         client.get_multi_timeframe_bars("AAPL")

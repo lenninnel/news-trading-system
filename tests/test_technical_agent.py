@@ -28,6 +28,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agents.technical_agent import TechnicalAgent
+from utils import safe_column
 
 
 # ===========================================================================
@@ -493,21 +494,21 @@ class TestWedgeDetection:
     def test_descending_wedge_detected(self):
         """Series of lower highs AND lower lows converging should detect descending wedge."""
         df = _make_descending_wedge_df(n=250, breakout=False)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         assert wedge_type == "descending"
 
     def test_ascending_wedge_detected(self):
         """Series of higher highs AND higher lows converging should detect ascending wedge."""
         df = _make_ascending_wedge_df(n=250)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         assert wedge_type == "ascending"
 
     def test_no_wedge_in_trending_market(self):
         """Strong trend should not trigger a wedge detection."""
         df = _make_strong_trend_df(n=250)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         # A strong parallel uptrend may or may not be detected as a wedge;
         # the key is it shouldn't be a converging wedge
@@ -518,7 +519,7 @@ class TestWedgeDetection:
     def test_wedge_breakout(self):
         """Price breaking above descending wedge trendline should trigger breakout."""
         df = _make_descending_wedge_df(n=250, breakout=True)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         if wedge_type == "descending":
             assert wedge_breakout == True  # noqa: E712 (numpy bool)
@@ -526,7 +527,7 @@ class TestWedgeDetection:
     def test_no_wedge_with_insufficient_data(self):
         """Short data (< 20 bars) should return None."""
         df = _make_simple_df(n=15, seed=42)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         assert wedge_type is None
         assert wedge_breakout is False
@@ -534,7 +535,7 @@ class TestWedgeDetection:
     def test_wedge_returns_valid_types(self):
         """Wedge type should be None, 'descending', or 'ascending'."""
         df = _make_simple_df(n=250)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, wedge_breakout = TechnicalAgent._detect_wedge(df, close)
         assert wedge_type in (None, "descending", "ascending")
         assert isinstance(wedge_breakout, bool)
@@ -550,7 +551,7 @@ class TestSupportResistance:
     def test_finds_nearest_support(self):
         """Creates data with clear swing lows below the current price."""
         df = _make_support_resistance_df()
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         price = float(close.iloc[-1])
         support, resistance, pct_s, pct_r = TechnicalAgent._find_support_resistance(
             close, price
@@ -562,7 +563,7 @@ class TestSupportResistance:
     def test_finds_nearest_resistance(self):
         """Creates data with clear swing highs above the current price."""
         df = _make_support_resistance_df()
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         price = float(close.iloc[-1])
         support, resistance, pct_s, pct_r = TechnicalAgent._find_support_resistance(
             close, price
@@ -573,7 +574,7 @@ class TestSupportResistance:
     def test_percentage_distances(self):
         """Verify pct_to_support and pct_to_resistance calculations."""
         df = _make_support_resistance_df()
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         price = float(close.iloc[-1])
         support, resistance, pct_s, pct_r = TechnicalAgent._find_support_resistance(
             close, price
@@ -1097,7 +1098,7 @@ class TestDetectBullFlagStatic:
     def test_returns_tuple(self):
         """Should always return a (bool, bool) tuple."""
         df = _make_simple_df(n=250)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         result = TechnicalAgent._detect_bull_flag(df, close)
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -1107,7 +1108,7 @@ class TestDetectBullFlagStatic:
     def test_empty_df(self):
         """Empty DataFrame should return (False, False)."""
         df = pd.DataFrame({"Close": [], "Volume": []})
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         detected, breakout = TechnicalAgent._detect_bull_flag(df, close)
         assert detected is False
         assert breakout is False
@@ -1119,7 +1120,7 @@ class TestDetectWedgeStatic:
     def test_returns_tuple(self):
         """Should always return a (str|None, bool) tuple."""
         df = _make_simple_df(n=250)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         result = TechnicalAgent._detect_wedge(df, close)
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -1134,7 +1135,7 @@ class TestDetectWedgeStatic:
         df = pd.DataFrame({
             "Close": np.linspace(100, 120, n),
         }, index=dates)
-        close = df["Close"].squeeze()
+        close = safe_column(df, "Close")
         wedge_type, breakout = TechnicalAgent._detect_wedge(df, close)
         assert wedge_type is None
         assert breakout is False

@@ -240,6 +240,32 @@ _WINDOW_START = (7, 0)    # 07:00
 _WINDOW_END   = (22, 30)  # 22:30
 
 
+def _is_execution_allowed() -> tuple[bool, str]:
+    """
+    Check whether trade execution is allowed based on environment.
+
+    Returns (allowed, reason).
+
+    Rules:
+      1. EXECUTE_TRADES=false  → blocked (explicit toggle)
+      2. Not on Railway AND EXECUTE_TRADES not explicitly "true"
+         → blocked (prevents accidental local execution)
+      3. Otherwise → allowed
+    """
+    env_val = os.environ.get("EXECUTE_TRADES", "").strip().lower()
+
+    # Explicit disable
+    if env_val == "false":
+        return False, "EXECUTE_TRADES=false"
+
+    # Local safety: block unless explicitly opted-in
+    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+    if not on_railway and env_val != "true":
+        return False, "not running on Railway and EXECUTE_TRADES != true"
+
+    return True, "ok"
+
+
 class DailyScheduler:
     """
     Daemon that sleeps between 4 daily trading runs (weekdays, UTC).
@@ -469,13 +495,19 @@ class DailyScheduler:
         print(f"[scheduler] Running {run_name}: {', '.join(tickers)} "
               f"({workers} workers)", flush=True)
 
+        execute, reason = _is_execution_allowed()
+        if not execute:
+            log.warning("Trade execution DISABLED: %s", reason)
+            print(f"[scheduler] Execution disabled ({reason}) — analysis only",
+                  flush=True)
+
         try:
             batch = asyncio.run(
                 run_batch(
                     tickers,
                     workers=workers,
                     account_balance=10_000.0,
-                    execute=True,
+                    execute=execute,
                 )
             )
 

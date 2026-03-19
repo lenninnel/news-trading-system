@@ -66,6 +66,7 @@ from config.settings import is_german_ticker
 from data.alpaca_data import AlpacaDataClient
 from data.eodhd_feed import EODHDFeed
 from storage.database import Database
+from utils import safe_column
 
 log = logging.getLogger(__name__)
 
@@ -648,8 +649,8 @@ class ScreenerAgent(BaseAgent):
         if not close_col or not volume_col:
             return None
 
-        close  = df[close_col].squeeze().dropna()
-        volume = df[volume_col].squeeze().dropna()
+        close  = safe_column(df, close_col).dropna()
+        volume = safe_column(df, volume_col).dropna()
 
         if len(close) < 2 or len(volume) < 2:
             return None

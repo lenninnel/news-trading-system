@@ -45,6 +45,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from agents.strategy_base import StrategyAgent, StrategySignal
 from storage.database import Database
+from utils import safe_column
 
 log = logging.getLogger(__name__)
 
@@ -99,10 +100,10 @@ class MomentumAgent(StrategyAgent):
     # ------------------------------------------------------------------
 
     def _calculate_indicators(self, df) -> dict:
-        close  = df["Close"].squeeze()
-        high   = df["High"].squeeze()
-        low    = df["Low"].squeeze()
-        volume = df["Volume"].squeeze()
+        close  = safe_column(df, "Close")
+        high   = safe_column(df, "High")
+        low    = safe_column(df, "Low")
+        volume = safe_column(df, "Volume")
 
         # EMA-20 and EMA-50 (trend direction)
         ema20 = ta.trend.EMAIndicator(close=close, window=20).ema_indicator()

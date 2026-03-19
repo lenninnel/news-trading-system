@@ -19,6 +19,7 @@ import os
 import time
 from typing import Any
 
+from emergency_stop import KillSwitch
 from storage.database import Database
 
 log = logging.getLogger(__name__)
@@ -102,6 +103,8 @@ class AlpacaTrader:
 
         Returns the same dict shape as ``PaperTrader.track_trade``.
         """
+        KillSwitch.assert_trading_allowed()
+
         ticker = ticker.upper()
         action = action.upper()
 

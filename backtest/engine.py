@@ -34,6 +34,8 @@ import numpy as np
 import pandas as pd
 import ta
 
+from utils import safe_column
+
 
 # ── Indicator helpers (lifted from TechnicalAgent, no DB/yf deps) ────
 
@@ -50,7 +52,7 @@ def _compute_indicators(df_slice: pd.DataFrame, params: dict | None = None) -> d
     sma_fast = int(params.get("sma_fast", 50))
     sma_slow = int(params.get("sma_slow", 200))
 
-    close: pd.Series = df_slice["Close"].squeeze()
+    close: pd.Series = safe_column(df_slice, "Close")
     if len(close) < 26:
         return {}
 
@@ -82,7 +84,7 @@ def _compute_indicators(df_slice: pd.DataFrame, params: dict | None = None) -> d
     # Volume confirmation: RVOL > 1.5
     volume_confirmed = False
     if "Volume" in df_slice.columns:
-        vol = df_slice["Volume"].squeeze()
+        vol = safe_column(df_slice, "Volume")
         if len(vol) >= 20 and not vol.empty:
             avg_vol = float(vol.iloc[-20:].mean())
             if avg_vol > 0:

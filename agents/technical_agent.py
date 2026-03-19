@@ -47,6 +47,7 @@ from data.alpaca_data import AlpacaDataClient
 from data.binance_feed import BinanceFeed
 from data.eodhd_feed import EODHDFeed
 from storage.database import Database
+from utils import safe_column
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class TechnicalAgent(BaseAgent):
         try:
             df_1h = self._alpaca.get_bars(ticker, "1Hour", limit=100)
             if df_1h is not None and len(df_1h) >= 20:
-                close_1h = df_1h["Close"].squeeze()
+                close_1h = safe_column(df_1h, "Close")
                 rsi_series = ta.momentum.RSIIndicator(close=close_1h, window=14).rsi()
                 rsi_clean = rsi_series.dropna()
                 if not rsi_clean.empty:
@@ -302,7 +303,7 @@ class TechnicalAgent(BaseAgent):
         try:
             df_15m = self._alpaca.get_bars(ticker, "15Min", limit=100)
             if df_15m is not None and len(df_15m) >= 30:
-                close_15m = df_15m["Close"].squeeze()
+                close_15m = safe_column(df_15m, "Close")
                 macd_obj = ta.trend.MACD(
                     close=close_15m, window_fast=12, window_slow=26, window_sign=9,
                 )
@@ -371,7 +372,7 @@ class TechnicalAgent(BaseAgent):
             if df is None or len(df) < 30:
                 return None
 
-            close = df["Close"].squeeze()
+            close = safe_column(df, "Close")
 
             # Short-term RSI-14 on 5min bars
             rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
@@ -447,7 +448,7 @@ class TechnicalAgent(BaseAgent):
         Returns:
             dict of indicator names → latest float values (or None).
         """
-        close: pd.Series = df["Close"].squeeze()
+        close: pd.Series = safe_column(df, "Close")
 
         def latest(series: pd.Series) -> "float | None":
             """Return the last non-NaN value, or None."""
@@ -485,7 +486,7 @@ class TechnicalAgent(BaseAgent):
         bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
 
         # -- Volume & momentum indicators ---------------------------------
-        volume: pd.Series = df["Volume"].squeeze() if "Volume" in df.columns else pd.Series(dtype=float)
+        volume: pd.Series = safe_column(df, "Volume") if "Volume" in df.columns else pd.Series(dtype=float)
 
         # RVOL: current volume / 20-day average volume
         rvol: "float | None" = None
@@ -541,8 +542,8 @@ class TechnicalAgent(BaseAgent):
         adx_val: "float | None" = None
         trend_strength: "str | None" = None
         try:
-            high = df["High"].squeeze()
-            low = df["Low"].squeeze()
+            high = safe_column(df, "High")
+            low = safe_column(df, "Low")
             adx_indicator = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
             adx_series = adx_indicator.adx()
             adx_val = latest(adx_series)
@@ -790,7 +791,7 @@ class TechnicalAgent(BaseAgent):
 
             # Volume declining during consolidation
             if "Volume" in df.columns:
-                vol = df["Volume"].squeeze()
+                vol = safe_column(df, "Volume")
                 if len(vol) >= 20:
                     vol_prior = float(vol.iloc[-20:-10].mean())
                     vol_cons = float(vol.iloc[-10:].mean())
@@ -823,8 +824,8 @@ class TechnicalAgent(BaseAgent):
             n = 20
             if "High" not in df.columns or "Low" not in df.columns:
                 return None, False
-            high = df["High"].squeeze()
-            low = df["Low"].squeeze()
+            high = safe_column(df, "High")
+            low = safe_column(df, "Low")
             if len(high.dropna()) < n or len(low.dropna()) < n or len(close.dropna()) < n:
                 return None, False
 
