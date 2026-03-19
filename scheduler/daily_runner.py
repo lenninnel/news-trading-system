@@ -246,23 +246,20 @@ def _is_execution_allowed() -> tuple[bool, str]:
     Returns (allowed, reason).
 
     Rules:
-      1. EXECUTE_TRADES=false  → blocked (explicit toggle)
-      2. Not on Railway AND EXECUTE_TRADES not explicitly "true"
-         → blocked (prevents accidental local execution)
-      3. Otherwise → allowed
+      1. EXECUTE_TRADES=true   → allowed (explicit opt-in required)
+      2. EXECUTE_TRADES=false  → blocked
+      3. Not set / anything else → blocked (safe default)
+
+    This is intentionally strict: trades only fire when the operator
+    has explicitly set EXECUTE_TRADES=true in Railway Variables.
     """
     env_val = os.environ.get("EXECUTE_TRADES", "").strip().lower()
 
-    # Explicit disable
+    if env_val == "true":
+        return True, "ok"
     if env_val == "false":
         return False, "EXECUTE_TRADES=false"
-
-    # Local safety: block unless explicitly opted-in
-    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT"))
-    if not on_railway and env_val != "true":
-        return False, "not running on Railway and EXECUTE_TRADES != true"
-
-    return True, "ok"
+    return False, "EXECUTE_TRADES not set — defaulting to safe mode"
 
 
 class DailyScheduler:
@@ -406,15 +403,18 @@ class DailyScheduler:
             except Exception as exc:
                 log.warning("Telegram startup notification failed: %s", exc)
 
-        # Run once immediately on startup if within trading hours
+        # Run once immediately on startup if within trading hours.
+        # force_no_execute=True: startup runs are ANALYSIS ONLY — never
+        # execute trades on container restart to prevent ghost trade loops.
         last_executed: str | None = None
         session = self.current_session()
         if session != "CLOSED":
             startup_run = self._run_for_session(session)
             if startup_run:
-                print(f"[scheduler] Immediate startup run: {startup_run['name']}",
+                print(f"[scheduler] Immediate startup run: {startup_run['name']} "
+                      f"(analysis only — no execution on restart)",
                       flush=True)
-                self._execute_run(startup_run)
+                self._execute_run(startup_run, force_no_execute=True)
                 last_executed = startup_run["name"]
 
         while True:
@@ -473,7 +473,7 @@ class DailyScheduler:
                 return run
         return None
 
-    def _execute_run(self, run: dict) -> None:
+    def _execute_run(self, run: dict, force_no_execute: bool = False) -> None:
         run_name = run["name"]
         tickers = run["tickers"] or self._full_watchlist
         workers = run["workers"]
@@ -494,11 +494,17 @@ class DailyScheduler:
         print(f"[scheduler] Running {run_name}: {', '.join(tickers)} "
               f"({workers} workers)", flush=True)
 
-        execute, reason = _is_execution_allowed()
-        if not execute:
-            log.warning("Trade execution DISABLED: %s", reason)
-            print(f"[scheduler] Execution disabled ({reason}) — analysis only",
-                  flush=True)
+        if force_no_execute:
+            execute = False
+            reason = "startup run — analysis only, no execution on restart"
+            log.info("Trade execution BLOCKED: %s", reason)
+            print(f"[scheduler] Execution blocked ({reason})", flush=True)
+        else:
+            execute, reason = _is_execution_allowed()
+            if not execute:
+                log.warning("Trade execution DISABLED: %s", reason)
+                print(f"[scheduler] Execution disabled ({reason}) — analysis only",
+                      flush=True)
 
         try:
             batch = asyncio.run(
