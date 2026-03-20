@@ -1,0 +1,224 @@
+{
+  "strategy": "wider_universe",
+  "run_date": "2026-03-20",
+  "tickers": {
+    "AMZN": {
+      "momentum": {
+        "avg_sharpe": 0.4511,
+        "avg_win_rate": 0.1,
+        "avg_max_drawdown": 0.0015,
+        "total_trades": 5,
+        "avg_return": 0.0017,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 2.2202,
+        "avg_win_rate": 0.8572,
+        "avg_max_drawdown": 0.0032,
+        "total_trades": 9,
+        "avg_return": 0.0118,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    },
+    "AMD": {
+      "momentum": {
+        "avg_sharpe": 0.1026,
+        "avg_win_rate": 0.5,
+        "avg_max_drawdown": 0.0016,
+        "total_trades": 3,
+        "avg_return": 0.005,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": -1.1666,
+        "avg_win_rate": 0.2083,
+        "avg_max_drawdown": 0.006,
+        "total_trades": 10,
+        "avg_return": -0.004,
+        "passed": false
+      },
+      "best_strategy": "neither",
+      "recommendation": "skip"
+    },
+    "TSLA": {
+      "momentum": {
+        "avg_sharpe": -1.4345,
+        "avg_win_rate": 0.0,
+        "avg_max_drawdown": 0.0063,
+        "total_trades": 6,
+        "avg_return": -0.0044,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 0.6145,
+        "avg_win_rate": 0.4428,
+        "avg_max_drawdown": 0.003,
+        "total_trades": 12,
+        "avg_return": 0.003,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    },
+    "JPM": {
+      "momentum": {
+        "avg_sharpe": 1.4019,
+        "avg_win_rate": 0.4166,
+        "avg_max_drawdown": 0.0019,
+        "total_trades": 5,
+        "avg_return": 0.0044,
+        "passed": true
+      },
+      "pullback": {
+        "avg_sharpe": 0.723,
+        "avg_win_rate": 0.6539,
+        "avg_max_drawdown": 0.0041,
+        "total_trades": 14,
+        "avg_return": 0.001,
+        "passed": true
+      },
+      "best_strategy": "momentum",
+      "recommendation": "add_to_watchlist"
+    },
+    "BAC": {
+      "momentum": {
+        "avg_sharpe": 0.9216,
+        "avg_win_rate": 0.3667,
+        "avg_max_drawdown": 0.0046,
+        "total_trades": 11,
+        "avg_return": 0.0033,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 1.1883,
+        "avg_win_rate": 0.5476,
+        "avg_max_drawdown": 0.0037,
+        "total_trades": 10,
+        "avg_return": 0.0049,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    },
+    "GS": {
+      "momentum": {
+        "avg_sharpe": -0.521,
+        "avg_win_rate": 0.5,
+        "avg_max_drawdown": 0.0036,
+        "total_trades": 5,
+        "avg_return": -0.0001,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 0.5613,
+        "avg_win_rate": 0.2222,
+        "avg_max_drawdown": 0.0042,
+        "total_trades": 9,
+        "avg_return": 0.0029,
+        "passed": false
+      },
+      "best_strategy": "neither",
+      "recommendation": "skip"
+    },
+    "XOM": {
+      "momentum": {
+        "avg_sharpe": -0.9074,
+        "avg_win_rate": 0.0714,
+        "avg_max_drawdown": 0.0069,
+        "total_trades": 10,
+        "avg_return": -0.0035,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 2.2616,
+        "avg_win_rate": 0.6905,
+        "avg_max_drawdown": 0.0042,
+        "total_trades": 10,
+        "avg_return": 0.011,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    },
+    "CVX": {
+      "momentum": {
+        "avg_sharpe": 0.1885,
+        "avg_win_rate": 0.5,
+        "avg_max_drawdown": 0.0018,
+        "total_trades": 1,
+        "avg_return": 0.0006,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 1.7176,
+        "avg_win_rate": 0.7,
+        "avg_max_drawdown": 0.0042,
+        "total_trades": 8,
+        "avg_return": 0.007,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    },
+    "UNH": {
+      "momentum": {
+        "avg_sharpe": 0.291,
+        "avg_win_rate": 0.4166,
+        "avg_max_drawdown": 0.004,
+        "total_trades": 5,
+        "avg_return": 0.0018,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": -0.7628,
+        "avg_win_rate": 0.25,
+        "avg_max_drawdown": 0.0029,
+        "total_trades": 4,
+        "avg_return": -0.0009,
+        "passed": false
+      },
+      "best_strategy": "neither",
+      "recommendation": "skip"
+    },
+    "PFE": {
+      "momentum": {
+        "avg_sharpe": 1.0907,
+        "avg_win_rate": 0.3333,
+        "avg_max_drawdown": 0.0015,
+        "total_trades": 6,
+        "avg_return": 0.0037,
+        "passed": false
+      },
+      "pullback": {
+        "avg_sharpe": 0.9325,
+        "avg_win_rate": 0.5786,
+        "avg_max_drawdown": 0.0053,
+        "total_trades": 17,
+        "avg_return": 0.0081,
+        "passed": true
+      },
+      "best_strategy": "pullback",
+      "recommendation": "add_to_watchlist"
+    }
+  },
+  "summary": {
+    "momentum_fits": [
+      "JPM"
+    ],
+    "pullback_fits": [
+      "AMZN",
+      "TSLA",
+      "BAC",
+      "XOM",
+      "CVX",
+      "PFE"
+    ],
+    "skip": [
+      "AMD",
+      "GS",
+      "UNH"
+    ]
+  }
+}

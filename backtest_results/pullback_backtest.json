@@ -1,0 +1,124 @@
+{
+  "strategy": "pullback",
+  "run_date": "2026-03-20",
+  "tickers": {
+    "AAPL": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": 1.5619,
+          "win_rate": 0.6667,
+          "max_drawdown": 0.003,
+          "total_return": 0.0051,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 0.948,
+          "win_rate": 0.5,
+          "max_drawdown": 0.0039,
+          "total_return": 0.0032,
+          "trade_count": 4
+        }
+      ],
+      "avg_sharpe": 1.255,
+      "avg_win_rate": 0.5834,
+      "avg_max_drawdown": 0.0034,
+      "total_trades": 7,
+      "passed": true
+    },
+    "CEG": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": -1.4142,
+          "win_rate": 0.0,
+          "max_drawdown": 0.002,
+          "total_return": -0.002,
+          "trade_count": 1
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 0.4311,
+          "win_rate": 0.4,
+          "max_drawdown": 0.004,
+          "total_return": 0.0018,
+          "trade_count": 5
+        }
+      ],
+      "avg_sharpe": -0.4915,
+      "avg_win_rate": 0.2,
+      "avg_max_drawdown": 0.003,
+      "total_trades": 6,
+      "passed": false
+    },
+    "VST": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": -2.1682,
+          "win_rate": 0.0,
+          "max_drawdown": 0.0059,
+          "total_return": -0.0059,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": -0.5552,
+          "win_rate": 0.25,
+          "max_drawdown": 0.0059,
+          "total_return": -0.002,
+          "trade_count": 4
+        }
+      ],
+      "avg_sharpe": -1.3617,
+      "avg_win_rate": 0.125,
+      "avg_max_drawdown": 0.0059,
+      "total_trades": 7,
+      "passed": false
+    },
+    "MSFT": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": -0.8289,
+          "win_rate": 0.3333,
+          "max_drawdown": 0.0042,
+          "total_return": -0.0024,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 2.5397,
+          "win_rate": 1.0,
+          "max_drawdown": 0.0005,
+          "total_return": 0.0033,
+          "trade_count": 1
+        }
+      ],
+      "avg_sharpe": 0.8554,
+      "avg_win_rate": 0.6666,
+      "avg_max_drawdown": 0.0023,
+      "total_trades": 4,
+      "passed": true
+    }
+  },
+  "summary": {
+    "passed_tickers": [
+      "AAPL",
+      "MSFT"
+    ],
+    "failed_tickers": [
+      "CEG",
+      "VST"
+    ]
+  }
+}
