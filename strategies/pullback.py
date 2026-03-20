@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 class PullbackStrategy(BaseStrategy):
     """Mean-reversion pullback strategy using SMA50 as dynamic support."""
 
-    PREFERRED_TICKERS = ["AAPL", "MSFT", "CEG"]
+    PREFERRED_TICKERS = ["AAPL", "MSFT", "AMZN", "XOM", "CVX", "BAC", "PFE", "TSLA"]
 
     @property
     def name(self) -> str:

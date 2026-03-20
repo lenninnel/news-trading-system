@@ -2,16 +2,26 @@
 # News Trading System — daily scheduler configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Tickers to analyse every day (9 production-ready from trend optimization)
+# Tickers to analyse every day (validated via walk-forward backtest 2026-03-20)
+# MOMENTUM: META, JPM  — passed Sharpe > 0.5 + win rate > 45%
+# PULLBACK: AAPL, MSFT, AMZN, XOM, CVX, BAC, PFE, TSLA — pullback edge confirmed
+# REMOVED:  NVDA, DELL, GOOGL, CEG, VST — failed backtest validation
 watchlist:
-  - MSFT
+  # --- Momentum strategy tickers ---
   - META
-  - VST
+  - JPM
+  # --- Pullback strategy tickers ---
   - AAPL
-  - CEG
-  - GOOGL
-  - DELL
+  - MSFT
+  - AMZN
+  - XOM
+  - CVX
+  - BAC
+  - PFE
+  - TSLA
+  # --- German/EODHD (separate validation) ---
   - SAP.XETRA
+  - SIE.XETRA
 
 # ── Account ───────────────────────────────────────────────────────────────────
 account:

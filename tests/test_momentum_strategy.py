@@ -276,7 +276,7 @@ class TestMomentumEndToEnd:
         assert result.entry_price is not None
         assert result.stop_loss is not None
         assert result.take_profit is not None
-        expected_stop = round(result.entry_price * 0.985, 4)
+        expected_stop = round(result.entry_price * 0.98, 4)
         assert result.stop_loss == expected_stop
         assert result.take_profit > result.entry_price
 
@@ -299,9 +299,8 @@ class TestMomentumEdgeCases:
 
     def test_preferred_tickers(self):
         strat = MomentumStrategy()
-        assert "NVDA" in strat.PREFERRED_TICKERS
-        assert "MSFT" in strat.PREFERRED_TICKERS
-        assert "GOOGL" in strat.PREFERRED_TICKERS
+        assert "META" in strat.PREFERRED_TICKERS
+        assert "JPM" in strat.PREFERRED_TICKERS
 
     def test_indicators_populated(self):
         strat = MomentumStrategy()

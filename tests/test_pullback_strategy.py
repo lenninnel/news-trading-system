@@ -273,7 +273,8 @@ class TestPullbackEdgeCases:
         strat = PullbackStrategy()
         assert "AAPL" in strat.PREFERRED_TICKERS
         assert "MSFT" in strat.PREFERRED_TICKERS
-        assert "CEG" in strat.PREFERRED_TICKERS
+        assert "AMZN" in strat.PREFERRED_TICKERS
+        assert "XOM" in strat.PREFERRED_TICKERS
 
     def test_indicators_populated(self):
         strat = PullbackStrategy()
