@@ -22,8 +22,14 @@ Usage
 
 from __future__ import annotations
 
-import json
+# ── NUCLEAR SAFETY: override Alpaca keys before ANY project module loads ──
 import os
+os.environ["ALPACA_API_KEY"] = "DISABLED_IN_TESTS"
+os.environ["ALPACA_SECRET_KEY"] = "DISABLED_IN_TESTS"
+os.environ["ALPACA_BASE_URL"] = "https://DISABLED_IN_TESTS"
+os.environ["TRADING_MODE"] = "paper_local"
+
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -37,11 +43,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Set test environment variables before any project module imports.
-# CRITICAL: Force TRADING_MODE to paper_local so tests NEVER create a real
-# AlpacaTrader.  The .env file has TRADING_MODE=alpaca_paper which would
-# cause create_trader() to connect to real Alpaca API during tests.
-os.environ["TRADING_MODE"]    = "paper_local"
+# Set remaining test environment defaults (Alpaca keys + TRADING_MODE
+# are already overridden at the top of this file).
 os.environ.setdefault("DB_PATH",           "/tmp/pytest_trading.db")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-real")
 os.environ.setdefault("NEWSAPI_KEY",       "test-key-not-real")

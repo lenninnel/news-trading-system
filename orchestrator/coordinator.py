@@ -135,6 +135,28 @@ class Coordinator:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _has_alpaca_position(self, ticker: str) -> bool:
+        """Check Alpaca directly for an open position in *ticker*.
+
+        Alpaca is the source of truth — the local DB can be out of sync
+        after bracket orders fill or expire.  Returns False on any error
+        so the caller falls through to the local-DB guard.
+        """
+        try:
+            api = self.paper_trader._api
+            pos = api.get_position(ticker.upper())
+            qty = int(pos.qty)
+            if qty > 0:
+                log.info(
+                    "[%s] Alpaca position exists (%d shares) — blocking duplicate BUY",
+                    ticker, qty,
+                )
+                return True
+        except Exception:
+            # get_position raises 404 if no position — that's the happy path
+            pass
+        return False
+
     def _last_combined_signal(self, ticker: str) -> str:
         """Return the last combined_signal for *ticker* from DB, or ''."""
         try:
@@ -648,7 +670,12 @@ class Coordinator:
                     print(f"\n  [ABORTED] Missing/invalid stop_loss/take_profit for {ticker}"
                           f" (SL={risk.get('stop_loss')}, TP={risk.get('take_profit')})")
             # Guard: skip if position already open (duplicate trade prevention)
-            elif risk["direction"] == "BUY" and self.db.get_portfolio_position(ticker):
+            # Check Alpaca first (source of truth), fall back to local DB
+            elif risk["direction"] == "BUY" and (
+                self._has_alpaca_position(ticker)
+                or self.db.get_portfolio_position(ticker)
+            ):
+                log.info("[%s] Duplicate BUY blocked — position already open", ticker)
                 if verbose:
                     print(f"\n  [SKIPPED] Position already open for {ticker}")
             else:
@@ -943,8 +970,12 @@ class Coordinator:
             else:
                 # Atomic check-then-execute under a single lock acquisition
                 async with db_lock:
-                    if risk["direction"] == "BUY" and self.db.get_portfolio_position(ticker):
-                        pass  # skip — position already open
+                    # Check Alpaca first (source of truth), fall back to local DB
+                    if risk["direction"] == "BUY" and (
+                        self._has_alpaca_position(ticker)
+                        or self.db.get_portfolio_position(ticker)
+                    ):
+                        log.info("[%s] Duplicate BUY blocked — position already open", ticker)
                     else:
                         execution = self.paper_trader.track_trade(
                             ticker=ticker,
