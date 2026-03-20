@@ -40,3 +40,7 @@ def get_strategy(ticker: str) -> BaseStrategy:
 def get_strategy_name(ticker: str) -> str:
     """Return the strategy name string for *ticker*."""
     return get_strategy(ticker).name
+
+
+# Backward-compatible alias used by orchestrator/coordinator.py on main
+strategy_label = get_strategy_name
