@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -39,6 +40,11 @@ UNSUPPORTED_ALPACA: set[str] = {"SAP.XETRA", "SIE.XETRA"}
 _KNOWN_TEST_PRICES = frozenset({150.25, 149.99, 155.00, 150.0})
 
 
+def _is_pytest_running() -> bool:
+    """Detect if code is executing inside a pytest session."""
+    return "pytest" in sys.modules or "_pytest" in sys.modules
+
+
 class AlpacaTrader:
     """
     Live / paper broker execution via the Alpaca API.
@@ -56,6 +62,14 @@ class AlpacaTrader:
         db: Database | None = None,
         api: "tradeapi.REST | None" = None,
     ) -> None:
+        # Hard block: never connect to real Alpaca during pytest runs.
+        # Tests must always pass a mock via api=.
+        if api is None and _is_pytest_running():
+            raise RuntimeError(
+                "AlpacaTrader refuses to connect to real Alpaca API during "
+                "pytest — pass a mock api= argument instead"
+            )
+
         self._db = db or Database()
 
         if api is not None:

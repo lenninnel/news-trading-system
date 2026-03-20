@@ -1,0 +1,170 @@
+{
+  "strategy": "momentum",
+  "run_date": "2026-03-20",
+  "parameters": {
+    "stop_loss_pct": 0.015,
+    "risk_per_trade": 0.02,
+    "max_position_pct": 0.1,
+    "initial_capital": 100000.0,
+    "entry_conditions": [
+      "price > SMA20 > SMA50 (uptrend)",
+      "RSI(14) between 50-65 (momentum zone)",
+      "volume > 1.3x 20-day average",
+      "sentiment skipped (pure technical)"
+    ],
+    "exit_conditions": [
+      "RSI > 75 (overbought)",
+      "price < SMA20 (trend break)",
+      "stop-loss: 1.5% below entry",
+      "take-profit: 3x ATR(14) above entry"
+    ]
+  },
+  "tickers": {
+    "MSFT": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": 0.0,
+          "win_rate": 0.0,
+          "max_drawdown": 0.0,
+          "total_return": 0.0,
+          "trade_count": 0
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": -1.4314,
+          "win_rate": 0.0,
+          "max_drawdown": 0.0015,
+          "total_return": -0.0015,
+          "trade_count": 1
+        }
+      ],
+      "avg_sharpe": -0.7157,
+      "avg_win_rate": 0.0,
+      "avg_max_drawdown": 0.0008,
+      "total_trades": 1,
+      "passed": false
+    },
+    "NVDA": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": 1.7114,
+          "win_rate": 0.3333,
+          "max_drawdown": 0.003,
+          "total_return": 0.0082,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": -0.9573,
+          "win_rate": 0.0,
+          "max_drawdown": 0.0072,
+          "total_return": -0.0044,
+          "trade_count": 3
+        }
+      ],
+      "avg_sharpe": 0.377,
+      "avg_win_rate": 0.1666,
+      "avg_max_drawdown": 0.0051,
+      "total_trades": 6,
+      "passed": false
+    },
+    "DELL": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": -0.0182,
+          "win_rate": 0.3333,
+          "max_drawdown": 0.0042,
+          "total_return": -0.0001,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 0.9698,
+          "win_rate": 0.25,
+          "max_drawdown": 0.0048,
+          "total_return": 0.0067,
+          "trade_count": 4
+        }
+      ],
+      "avg_sharpe": 0.4758,
+      "avg_win_rate": 0.2916,
+      "avg_max_drawdown": 0.0045,
+      "total_trades": 7,
+      "passed": false
+    },
+    "GOOGL": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": -1.3787,
+          "win_rate": 0.0,
+          "max_drawdown": 0.007,
+          "total_return": -0.0045,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 2.1488,
+          "win_rate": 0.4,
+          "max_drawdown": 0.0029,
+          "total_return": 0.0119,
+          "trade_count": 5
+        }
+      ],
+      "avg_sharpe": 0.385,
+      "avg_win_rate": 0.2,
+      "avg_max_drawdown": 0.0049,
+      "total_trades": 8,
+      "passed": false
+    },
+    "META": {
+      "windows": [
+        {
+          "train": "2024-03-20 to 2025-03-20",
+          "test": "2025-03-20 to 2025-09-20",
+          "sharpe": 1.3523,
+          "win_rate": 0.6667,
+          "max_drawdown": 0.0049,
+          "total_return": 0.0071,
+          "trade_count": 3
+        },
+        {
+          "train": "2024-09-20 to 2025-09-20",
+          "test": "2025-09-20 to 2026-03-20",
+          "sharpe": 2.0844,
+          "win_rate": 1.0,
+          "max_drawdown": 0.0006,
+          "total_return": 0.0079,
+          "trade_count": 1
+        }
+      ],
+      "avg_sharpe": 1.7184,
+      "avg_win_rate": 0.8334,
+      "avg_max_drawdown": 0.0028,
+      "total_trades": 4,
+      "passed": true
+    }
+  },
+  "summary": {
+    "passed_tickers": [
+      "META"
+    ],
+    "failed_tickers": [
+      "MSFT",
+      "NVDA",
+      "DELL",
+      "GOOGL"
+    ]
+  }
+}

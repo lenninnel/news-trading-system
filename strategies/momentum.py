@@ -9,9 +9,9 @@ Entry conditions (all four = strongest signal):
     4. Sentiment aligns         (BUY or WEAK BUY)
 
 Confidence:  4/4 → 70-85%  |  3/4 → 45-60%  |  <=2 → HOLD
-Stop-loss:   1.5% below entry
+Stop-loss:   2.0% below entry
 Take-profit: 3x ATR above entry
-Best tickers: MSFT, NVDA, DELL, GOOGL
+Best tickers: META, JPM (validated 2026-03-20 backtest)
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 class MomentumStrategy(BaseStrategy):
     """Trend-following momentum strategy with volume confirmation."""
 
-    PREFERRED_TICKERS = ["MSFT", "NVDA", "DELL", "GOOGL"]
+    PREFERRED_TICKERS = ["META", "JPM"]
 
     @property
     def name(self) -> str:
@@ -47,7 +47,7 @@ class MomentumStrategy(BaseStrategy):
             ind = self._calculate_indicators(bars)
             signal, confidence, reasoning = self._apply_rules(ind, sentiment_signal)
             entry = ind["price"]
-            stop = round(entry * 0.985, 4) if entry else None
+            stop = round(entry * 0.98, 4) if entry else None
             atr = ind.get("atr")
             tp = round(entry + 3 * atr, 4) if entry and atr else None
         except Exception as exc:
