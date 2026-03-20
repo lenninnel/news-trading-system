@@ -54,9 +54,11 @@ def _mock_api():
     return api
 
 
-# Install a fake alpaca_trade_api module so imports succeed without pip
+# Force-inject a fake alpaca_trade_api module to prevent real API connections.
+# CRITICAL: use direct assignment, NOT setdefault — setdefault silently fails
+# if the real module was already imported by another test.
 _fake_tradeapi = MagicMock()
-sys.modules.setdefault("alpaca_trade_api", _fake_tradeapi)
+sys.modules["alpaca_trade_api"] = _fake_tradeapi
 
 from execution.alpaca_trader import AlpacaTrader  # noqa: E402
 
@@ -82,7 +84,8 @@ class TestBrokerFactory:
             with pytest.raises(ValueError, match="TRADING_MODE must be one of"):
                 get_trading_mode()
 
-    def test_alpaca_paper_returns_alpaca_trader(self):
+    @patch("execution.alpaca_trader._is_pytest_running", return_value=False)
+    def test_alpaca_paper_returns_alpaca_trader(self, _mock_guard):
         env = {
             "TRADING_MODE": "alpaca_paper",
             "ALPACA_API_KEY": "test-key",
@@ -115,7 +118,8 @@ class TestBrokerFactory:
             with pytest.raises(RuntimeError, match="LIVE TRADING BLOCKED"):
                 create_trader()
 
-    def test_alpaca_live_allowed_with_confirmation(self):
+    @patch("execution.alpaca_trader._is_pytest_running", return_value=False)
+    def test_alpaca_live_allowed_with_confirmation(self, _mock_guard):
         env = {
             "TRADING_MODE": "alpaca_live",
             "ALPACA_API_KEY": "test-key",
