@@ -179,15 +179,17 @@ class TelegramNotifier:
         signal: str,
         confidence: float,
         reasoning: str = "",
+        debate_summary: str = "",
     ) -> None:
         """
         Send a trading signal alert.
 
         Args:
-            ticker:     Stock symbol, e.g. "AAPL".
-            signal:     Combined signal string, e.g. "STRONG BUY".
-            confidence: Confidence as a percentage (0–100).
-            reasoning:  Optional short reasoning text.
+            ticker:         Stock symbol, e.g. "AAPL".
+            signal:         Combined signal string, e.g. "STRONG BUY".
+            confidence:     Confidence as a percentage (0–100).
+            reasoning:      Optional short reasoning text.
+            debate_summary: Optional bull/bear debate summary.
         """
         emoji = _SIGNAL_EMOJI.get(signal, "📌")
         lines = [
@@ -198,6 +200,9 @@ class TelegramNotifier:
             # Truncate long reasoning to keep message tidy
             short = reasoning[:300] + ("…" if len(reasoning) > 300 else "")
             lines.append(f"_{short}_")
+        if debate_summary:
+            short = debate_summary[:300] + ("…" if len(debate_summary) > 300 else "")
+            lines.append(f"🐂🐻 _{short}_")
 
         self._send("\n".join(lines))
 

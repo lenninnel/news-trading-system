@@ -121,6 +121,21 @@ class TestSendSignal:
             # Should not raise
             notifier.send_signal("AAPL", "STRONG BUY", 90.0)
 
+    def test_includes_debate_summary_when_provided(self, notifier, mock_post):
+        notifier.send_signal(
+            "AAPL", "STRONG BUY", 85.0,
+            reasoning="Bullish sentiment",
+            debate_summary="Bull and bear broadly agree — confidence boosted.",
+        )
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert "Bull and bear broadly agree" in payload["text"]
+
+    def test_works_without_debate_summary(self, notifier, mock_post):
+        notifier.send_signal("AAPL", "STRONG BUY", 85.0, "Bullish")
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        # No debate line should appear
+        assert "🐂🐻" not in payload["text"]
+
 
 # ── send_trade_executed ──────────────────────────────────────────────────────
 
