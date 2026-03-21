@@ -31,6 +31,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
+
 import anthropic
 
 from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL
@@ -86,6 +88,15 @@ _BEAR_PROMPT = (
 )
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+
+
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences wrapping JSON output from Claude."""
+    m = _FENCE_RE.search(text)
+    return m.group(1).strip() if m else text.strip()
+
+
 # ── Individual researchers ───────────────────────────────────────────────────
 
 
@@ -117,7 +128,7 @@ class BullResearcher:
                 max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return json.loads(msg.content[0].text)
+            return json.loads(_strip_fences(msg.content[0].text))
 
         try:
             result = APIRecovery.call("anthropic", _call)
@@ -158,7 +169,7 @@ class BearResearcher:
                 max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return json.loads(msg.content[0].text)
+            return json.loads(_strip_fences(msg.content[0].text))
 
         try:
             result = APIRecovery.call("anthropic", _call)

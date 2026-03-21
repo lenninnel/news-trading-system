@@ -25,17 +25,20 @@ from agents.bull_bear_debate import (
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _mock_claude_response(payload: dict) -> MagicMock:
+def _mock_claude_response(payload: dict, *, fenced: bool = False) -> MagicMock:
     """Build a mock Anthropic message with the given JSON payload."""
+    text = json.dumps(payload)
+    if fenced:
+        text = f"```json\n{text}\n```"
     msg = MagicMock()
-    msg.content = [MagicMock(text=json.dumps(payload))]
+    msg.content = [MagicMock(text=text)]
     return msg
 
 
-def _mock_client(payload: dict) -> MagicMock:
+def _mock_client(payload: dict, *, fenced: bool = False) -> MagicMock:
     """Build a mock anthropic.Anthropic client returning *payload*."""
     client = MagicMock()
-    client.messages.create.return_value = _mock_claude_response(payload)
+    client.messages.create.return_value = _mock_claude_response(payload, fenced=fenced)
     return client
 
 
@@ -63,6 +66,12 @@ class TestBullResearcher:
         client = _mock_client({"bull_case": "x", "confidence_boost": -0.99})
         result = BullResearcher(client=client).analyze("AAPL", "BUY", 0.5, {}, {})
         assert result["confidence_boost"] == -0.2
+
+    def test_handles_fenced_json_response(self):
+        client = _mock_client({"bull_case": "Fenced OK.", "confidence_boost": 0.08}, fenced=True)
+        result = BullResearcher(client=client).analyze("AAPL", "BUY", 0.5, {}, {})
+        assert result["bull_case"] == "Fenced OK."
+        assert result["confidence_boost"] == 0.08
 
     def test_fallback_on_api_error(self):
         client = MagicMock()
@@ -92,6 +101,12 @@ class TestBearResearcher:
         client = _mock_client({"bear_case": "x", "confidence_penalty": -0.99})
         result = BearResearcher(client=client).analyze("AAPL", "BUY", 0.5, {}, {})
         assert result["confidence_penalty"] == -0.2
+
+    def test_handles_fenced_json_response(self):
+        client = _mock_client({"bear_case": "Fenced risk.", "confidence_penalty": -0.12}, fenced=True)
+        result = BearResearcher(client=client).analyze("AAPL", "BUY", 0.5, {}, {})
+        assert result["bear_case"] == "Fenced risk."
+        assert result["confidence_penalty"] == -0.12
 
     def test_fallback_on_api_error(self):
         client = MagicMock()
