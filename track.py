@@ -86,11 +86,14 @@ def _send_notifications(
         if signal in ("HOLD", "CONFLICTING"):
             continue
         try:
+            debate = r.get("debate")
+            debate_summary = debate.debate_summary if debate else ""
             tg.send_signal(
                 ticker=r["ticker"],
                 signal=signal,
                 confidence=r.get("confidence", 0) * 100,
                 reasoning=r.get("sentiment", {}).get("signal", signal),
+                debate_summary=debate_summary,
             )
         except Exception as exc:
             log.warning("Telegram signal notification failed for %s: %s", r["ticker"], exc)

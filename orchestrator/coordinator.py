@@ -39,6 +39,7 @@ import time as _time
 
 log = logging.getLogger(__name__)
 
+from agents.bull_bear_debate import BullBearDebate
 from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
@@ -112,6 +113,7 @@ class Coordinator:
         marketaux_feed: MarketauxFeed | None = None,
         apewisdom_feed: ApeWisdomFeed | None = None,
         adanos_feed: AdanosFeed | None = None,
+        debate_agent: BullBearDebate | None = None,
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -121,6 +123,7 @@ class Coordinator:
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
         self.regime_agent = regime_agent or RegimeAgent()
+        self.debate_agent = debate_agent or BullBearDebate()
         self.paper_trader = paper_trader or create_trader(db=self.db)
         self.reddit_feed = reddit_feed or RedditFeed()
         self.stocktwits_feed = stocktwits_feed or StockTwitsFeed()
@@ -528,6 +531,25 @@ class Coordinator:
             technical_confidence=technical.get("adjusted_confidence"),
         )
 
+        # --- Bull/Bear Debate (optional) ---
+        debate_result = None
+        if self.debate_agent.is_enabled():
+            if verbose:
+                print(f"\n  [DEBATE] Running bull/bear debate for {ticker}...")
+            debate_result = self.debate_agent.run(
+                ticker=ticker,
+                signal=combined_signal,
+                confidence=conf,
+                technical_data=technical.get("indicators", {}),
+                sentiment_data={"signal": sentiment["signal"], "avg_score": sentiment["avg_score"]},
+            )
+            combined_signal = debate_result.final_signal
+            conf = debate_result.adjusted_confidence
+            if verbose:
+                print(f"  [DEBATE] {debate_result.debate_summary}")
+                print(f"  [DEBATE] Signal: {debate_result.original_signal} → {debate_result.final_signal}"
+                      f"  Confidence: {debate_result.original_confidence:.0%} → {debate_result.adjusted_confidence:.0%}")
+
         # --- Persist combined ---
         combined_id = self.db.log_combined_signal(
             ticker=ticker,
@@ -655,6 +677,7 @@ class Coordinator:
             "execution": execution,
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
+            "debate": debate_result,
         }
 
     # ------------------------------------------------------------------
@@ -782,6 +805,20 @@ class Coordinator:
             rvol=technical.get("indicators", {}).get("rvol"),
             technical_confidence=technical.get("adjusted_confidence"),
         )
+
+        # ── Bull/Bear Debate (optional) ──────────────────────────────
+        debate_result = None
+        if self.debate_agent.is_enabled():
+            async with api_semaphore:
+                debate_result = await self.debate_agent.run_async(
+                    ticker=ticker,
+                    signal=combined_signal,
+                    confidence=conf,
+                    technical_data=technical.get("indicators", {}),
+                    sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                )
+            combined_signal = debate_result.final_signal
+            conf = debate_result.adjusted_confidence
 
         # ── Phase 4: DB writes + risk sizing ───────────────────────────
         async with db_lock:
@@ -917,5 +954,6 @@ class Coordinator:
             "execution": execution,
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
+            "debate": debate_result,
             "elapsed_s": round(elapsed, 2),
         }
