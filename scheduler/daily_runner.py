@@ -223,12 +223,11 @@ def run_batch_sync(
 
 # Session-specific watchlists
 _XETRA_TICKERS = ["SAP.XETRA", "SIE.XETRA"]
-_US_TICKERS = ["MSFT", "META", "AAPL", "NVDA", "GOOGL", "DELL", "VST", "CEG"]
 
 # Schedule: 4 runs per weekday, all times UTC
 SCHEDULE = [
     {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False},
-    {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": _US_TICKERS,     "workers": 3, "eod": False},
+    {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False},
     {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False},
     {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True},
 ]
@@ -570,6 +569,26 @@ class DailyScheduler:
 
         if self._tg:
             self._tg._send("\n".join(lines))
+            # Send individual signal notifications with debate summaries
+            for r in results:
+                if r is None:
+                    continue
+                sig = r.get("combined_signal", "HOLD")
+                if sig in ("HOLD", "CONFLICTING"):
+                    continue
+                try:
+                    debate = r.get("debate")
+                    debate_summary = debate.debate_summary if debate else ""
+                    self._tg.send_signal(
+                        ticker=r.get("ticker", "?"),
+                        signal=sig,
+                        confidence=r.get("confidence", 0) * 100,
+                        reasoning=r.get("sentiment", {}).get("signal", sig),
+                        debate_summary=debate_summary,
+                    )
+                except Exception as exc:
+                    log.warning("Telegram signal notification failed for %s: %s",
+                                r.get("ticker", "?"), exc)
 
 
 # ── EOD summary (shared by daemon + track.py --eod) ──────────────────
