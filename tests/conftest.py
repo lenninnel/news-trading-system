@@ -28,6 +28,8 @@ os.environ["ALPACA_API_KEY"] = "DISABLED_IN_TESTS"
 os.environ["ALPACA_SECRET_KEY"] = "DISABLED_IN_TESTS"
 os.environ["ALPACA_BASE_URL"] = "https://DISABLED_IN_TESTS"
 os.environ["TRADING_MODE"] = "paper_local"
+os.environ["TELEGRAM_BOT_TOKEN"] = "DISABLED_IN_TESTS"
+os.environ["TELEGRAM_CHAT_ID"] = "DISABLED_IN_TESTS"
 
 import json
 import sys
