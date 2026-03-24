@@ -44,6 +44,7 @@ from agents.regime_agent import RegimeAgent
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
+from analytics.signal_logger import SignalLogger
 from config.settings import (
     BUY_THRESHOLD,
     SELL_THRESHOLD,
@@ -130,6 +131,7 @@ class Coordinator:
         self.marketaux_feed = marketaux_feed or MarketauxFeed()
         self.apewisdom_feed = apewisdom_feed or ApeWisdomFeed()
         self.adanos_feed = adanos_feed or AdanosFeed()
+        self.signal_logger = SignalLogger(db=self.db)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -237,6 +239,68 @@ class Coordinator:
         if avg_score <= SELL_THRESHOLD:
             return "SELL"
         return "HOLD"
+
+    def _log_signal_event(self, result: dict) -> None:
+        """Extract signal context and log it. Never raises."""
+        try:
+            technical = result.get("technical") or {}
+            indicators = technical.get("indicators") or {}
+            sentiment = result.get("sentiment") or {}
+            debate = result.get("debate")
+
+            price = indicators.get("price")
+            sma_50 = indicators.get("sma_50")
+            sma_ratio = (price / sma_50) if (price and sma_50 and sma_50 > 0) else None
+            rvol = indicators.get("rvol")
+
+            # Compute news vs social scores from source breakdown
+            breakdown = sentiment.get("source_breakdown") or {}
+            news_sources = ("newsapi", "marketaux")
+            social_sources = ("reddit", "stocktwits", "apewisdom", "adanos")
+            news_scores = [v["avg"] for k, v in breakdown.items() if k in news_sources and v.get("count")]
+            social_scores = [v["avg"] for k, v in breakdown.items() if k in social_sources and v.get("count")]
+            news_score = (sum(news_scores) / len(news_scores) + 1) / 2 if news_scores else None  # map -1..1 to 0..1
+            social_score = (sum(social_scores) / len(social_scores) + 1) / 2 if social_scores else None
+
+            avg = sentiment.get("avg_score", 0)
+            sentiment_score = (avg + 1) / 2  # map -1..1 to 0..1
+
+            execution = result.get("execution") or {}
+
+            # Determine debate outcome
+            if debate:
+                if debate.degraded:
+                    debate_outcome = "skipped"
+                elif debate.final_signal == debate.original_signal:
+                    debate_outcome = "agree"
+                elif debate.adjusted_confidence < debate.original_confidence:
+                    debate_outcome = "cautious"
+                else:
+                    debate_outcome = "disagree"
+            else:
+                debate_outcome = "skipped"
+
+            self.signal_logger.log({
+                "ticker": result.get("ticker"),
+                "session": None,  # filled by scheduler if available
+                "strategy": "Combined",
+                "signal": result.get("combined_signal"),
+                "confidence": result.get("confidence"),
+                "rsi": indicators.get("rsi"),
+                "sma_ratio": sma_ratio,
+                "volume_ratio": rvol,
+                "sentiment_score": sentiment_score,
+                "news_score": news_score,
+                "social_score": social_score,
+                "bull_case": debate.bull_case if debate else None,
+                "bear_case": debate.bear_case if debate else None,
+                "debate_outcome": debate_outcome,
+                "price_at_signal": price,
+                "trade_executed": 1 if execution.get("trade_id") else 0,
+                "trade_id": execution.get("trade_id"),
+            })
+        except Exception as exc:
+            log.warning("Signal event logging failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
@@ -665,7 +729,7 @@ class Coordinator:
                           f"{risk['direction']} {risk['shares']} {ticker} "
                           f"@ ${price:.2f}")
 
-        return {
+        final_result = {
             "ticker": ticker,
             "sentiment": sentiment,
             "technical": technical,
@@ -679,6 +743,11 @@ class Coordinator:
             "regime": regime_info,
             "debate": debate_result,
         }
+
+        # Signal analytics logging (fire-and-forget)
+        self._log_signal_event(final_result)
+
+        return final_result
 
     # ------------------------------------------------------------------
     # Async pipeline (for batch / scheduler usage)
@@ -942,7 +1011,7 @@ class Coordinator:
             "source_breakdown": breakdown,
         }
 
-        return {
+        final_result = {
             "ticker": ticker,
             "sentiment": sentiment_result,
             "technical": technical,
@@ -957,3 +1026,8 @@ class Coordinator:
             "debate": debate_result,
             "elapsed_s": round(elapsed, 2),
         }
+
+        # Signal analytics logging (fire-and-forget)
+        self._log_signal_event(final_result)
+
+        return final_result

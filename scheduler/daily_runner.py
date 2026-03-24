@@ -529,6 +529,17 @@ class DailyScheduler:
                 except Exception as exc:
                     log.warning("EOD summary failed: %s", exc)
 
+                # Backfill signal outcomes (3d/5d/10d price changes)
+                try:
+                    from analytics.outcome_tracker import run_outcome_tracker
+                    outcome_result = run_outcome_tracker()
+                    total_updated = sum(outcome_result.values())
+                    if total_updated:
+                        log.info("EOD outcome backfill: %d rows updated %s",
+                                 total_updated, outcome_result)
+                except Exception as exc:
+                    log.warning("EOD outcome tracker failed (non-fatal): %s", exc)
+
         except Exception as exc:
             log.error("Scheduler error in %s: %s", run_name, exc)
             print(f"[scheduler] ERROR in {run_name}: {exc}", flush=True)
