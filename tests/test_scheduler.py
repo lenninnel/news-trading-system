@@ -217,3 +217,62 @@ class TestScheduleConstants:
     def test_eod_is_last_run(self):
         assert SCHEDULE[-1]["eod"] is True
         assert all(not r["eod"] for r in SCHEDULE[:-1])
+
+
+# ── XETRA ticker filtering ──────────────────────────────────────────
+
+
+class TestXetraTickerFiltering:
+    """XETRA tickers must only appear in XETRA_OPEN, never in US sessions."""
+
+    @pytest.fixture
+    def mixed_scheduler(self):
+        """Scheduler whose full watchlist includes both US and XETRA tickers."""
+        return DailyScheduler(
+            full_watchlist=["AAPL", "MSFT", "SAP.XETRA", "SIE.XETRA"]
+        )
+
+    def _captured_tickers(self, scheduler, session_name):
+        """Execute a session and return the ticker list passed to run_batch."""
+        run = scheduler._run_for_session(session_name)
+        assert run is not None, f"No schedule entry for {session_name}"
+        captured = {}
+
+        async def fake_run_batch(tickers, **kwargs):
+            captured["tickers"] = list(tickers)
+            return {
+                "results": [],
+                "success_count": 0,
+                "fail_count": 0,
+                "elapsed_s": 0.0,
+            }
+
+        with patch("scheduler.daily_runner.run_batch", side_effect=fake_run_batch), \
+             patch("scheduler.daily_runner._is_execution_allowed", return_value=(False, "test")):
+            scheduler._execute_run(run)
+
+        return captured.get("tickers")
+
+    def test_xetra_open_includes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "XETRA_OPEN")
+        assert "SAP.XETRA" in tickers
+        assert "SIE.XETRA" in tickers
+
+    def test_us_open_excludes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "US_OPEN")
+        assert "AAPL" in tickers
+        assert "MSFT" in tickers
+        assert "SAP.XETRA" not in tickers
+        assert "SIE.XETRA" not in tickers
+
+    def test_midday_excludes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "MIDDAY")
+        assert "AAPL" in tickers
+        assert "SAP.XETRA" not in tickers
+        assert "SIE.XETRA" not in tickers
+
+    def test_eod_excludes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "EOD")
+        assert "AAPL" in tickers
+        assert "SAP.XETRA" not in tickers
+        assert "SIE.XETRA" not in tickers

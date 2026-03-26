@@ -609,6 +609,24 @@ class Coordinator:
             )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
+
+            # Enforce signal-type minimum floors after debate penalty.
+            # The debate can reduce confidence but must not push it below
+            # the floor for the resulting signal type.
+            _SIGNAL_FLOORS = {
+                "STRONG BUY": 0.60, "STRONG SELL": 0.60,
+                "WEAK BUY": 0.35, "WEAK SELL": 0.35,
+                "HOLD": 0.25,
+                "CONFLICTING": 0.10,
+            }
+            floor = _SIGNAL_FLOORS.get(combined_signal, 0.0)
+            if conf < floor:
+                log.debug(
+                    "[%s] Debate pushed confidence %.2f below %s floor %.2f — clamping",
+                    ticker, conf, combined_signal, floor,
+                )
+                conf = floor
+
             if verbose:
                 print(f"  [DEBATE] {debate_result.debate_summary}")
                 print(f"  [DEBATE] Signal: {debate_result.original_signal} → {debate_result.final_signal}"

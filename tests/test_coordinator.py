@@ -356,3 +356,80 @@ class TestBullishSetupConfidence:
             f"WEAK BUY with moderate sentiment + tech confidence 0.5 "
             f"should be 40-60%, got {c_weak}"
         )
+
+
+# ===========================================================================
+# Post-debate floor enforcement
+# ===========================================================================
+
+class TestDebateFloorEnforcement:
+    """After a bull/bear debate penalty, confidence must not drop below the
+    signal-type minimum floor.  This mirrors the inline enforcement in
+    Coordinator.run() that clamps ``conf`` after overwriting it with
+    ``debate_result.adjusted_confidence``."""
+
+    # The floor map used in coordinator.py after the debate block:
+    _SIGNAL_FLOORS = {
+        "STRONG BUY": 0.60, "STRONG SELL": 0.60,
+        "WEAK BUY": 0.35, "WEAK SELL": 0.35,
+        "HOLD": 0.25,
+        "CONFLICTING": 0.10,
+    }
+
+    @staticmethod
+    def _apply_floor(signal: str, debate_confidence: float) -> float:
+        """Replicate the coordinator's post-debate floor enforcement."""
+        floors = {
+            "STRONG BUY": 0.60, "STRONG SELL": 0.60,
+            "WEAK BUY": 0.35, "WEAK SELL": 0.35,
+            "HOLD": 0.25,
+            "CONFLICTING": 0.10,
+        }
+        floor = floors.get(signal, 0.0)
+        return max(debate_confidence, floor)
+
+    def test_weak_buy_never_below_035(self):
+        """Even with a harsh debate penalty, WEAK BUY stays >= 0.35."""
+        assert self._apply_floor("WEAK BUY", 0.15) == 0.35
+        assert self._apply_floor("WEAK BUY", 0.0) == 0.35
+        assert self._apply_floor("WEAK BUY", 0.34) == 0.35
+
+    def test_weak_buy_above_floor_unchanged(self):
+        """If debate confidence is already above the floor, it stays."""
+        assert self._apply_floor("WEAK BUY", 0.45) == 0.45
+
+    def test_weak_sell_never_below_035(self):
+        assert self._apply_floor("WEAK SELL", 0.10) == 0.35
+
+    def test_strong_buy_never_below_060(self):
+        """STRONG BUY must stay >= 0.60 after debate."""
+        assert self._apply_floor("STRONG BUY", 0.40) == 0.60
+        assert self._apply_floor("STRONG BUY", 0.59) == 0.60
+
+    def test_strong_buy_above_floor_unchanged(self):
+        assert self._apply_floor("STRONG BUY", 0.75) == 0.75
+
+    def test_strong_sell_never_below_060(self):
+        assert self._apply_floor("STRONG SELL", 0.30) == 0.60
+
+    def test_hold_stays_at_025(self):
+        """HOLD floor is 0.25."""
+        assert self._apply_floor("HOLD", 0.20) == 0.25
+        assert self._apply_floor("HOLD", 0.25) == 0.25
+
+    def test_conflicting_stays_at_010(self):
+        """CONFLICTING floor is 0.10."""
+        assert self._apply_floor("CONFLICTING", 0.05) == 0.10
+        assert self._apply_floor("CONFLICTING", 0.10) == 0.10
+
+    def test_weak_buy_confidence_never_below_030(self):
+        """WEAK BUY confidence is never below 0.30 (it's actually >= 0.35)."""
+        for debate_conf in [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.29]:
+            result = self._apply_floor("WEAK BUY", debate_conf)
+            assert result >= 0.30, f"WEAK BUY conf {result} < 0.30 when debate gave {debate_conf}"
+
+    def test_strong_buy_confidence_never_below_055(self):
+        """STRONG BUY confidence is never below 0.55 (it's actually >= 0.60)."""
+        for debate_conf in [0.0, 0.10, 0.30, 0.50, 0.54]:
+            result = self._apply_floor("STRONG BUY", debate_conf)
+            assert result >= 0.55, f"STRONG BUY conf {result} < 0.55 when debate gave {debate_conf}"

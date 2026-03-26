@@ -231,6 +231,33 @@ class TestBullBearDebate:
         result = debate.run("AAPL", "WEAK BUY", 0.05, {}, {})
         assert result.adjusted_confidence >= 0.0
 
+    # -- Debate can produce sub-floor values (coordinator enforces floors) --
+
+    def test_harsh_penalty_can_drop_weak_buy_below_floor(self):
+        """The debate _synthesise step itself does NOT enforce signal-type
+        floors — that is the coordinator's job.  This test documents that
+        the raw debate output CAN drop below the WEAK BUY floor of 0.35."""
+        debate = self._make_debate(
+            {"bull_case": "Uncertain.", "confidence_boost": -0.1},
+            {"bear_case": "Major risk.", "confidence_penalty": -0.2},
+        )
+        result = debate.run("AAPL", "WEAK BUY", 0.45, _TECH_DATA, _SENT_DATA)
+        # Both negative: adjustment = -0.1 + -0.2 = -0.30
+        # adjusted = 0.45 + (-0.30) = 0.15
+        assert result.adjusted_confidence == 0.15
+        # The coordinator must clamp this back to 0.35
+
+    def test_harsh_penalty_can_drop_strong_buy_below_floor(self):
+        """Same documentation for STRONG BUY: debate can drop below 0.60."""
+        debate = self._make_debate(
+            {"bull_case": "Uncertain.", "confidence_boost": -0.15},
+            {"bear_case": "Very risky.", "confidence_penalty": -0.2},
+        )
+        result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        # Mixed: adjustment = (-0.15 + -0.2) / 2 = -0.175
+        # adjusted = 0.65 + (-0.175) = 0.475 -> 0.48
+        assert result.adjusted_confidence < 0.60
+
 
 # ── Async path ───────────────────────────────────────────────────────────────
 

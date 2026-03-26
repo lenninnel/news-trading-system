@@ -474,6 +474,9 @@ class DailyScheduler:
     def _execute_run(self, run: dict) -> None:
         run_name = run["name"]
         tickers = run["tickers"] or self._full_watchlist
+        if run["name"] != "XETRA_OPEN":
+            tickers = [t for t in tickers if not t.endswith(".XETRA")]
+            log.info("Excluded XETRA tickers from %s session", run["name"])
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
 
