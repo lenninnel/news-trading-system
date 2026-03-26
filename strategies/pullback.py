@@ -34,7 +34,7 @@ class PullbackStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return "PullbackStrategy"
+        return "Pullback"
 
     def analyze(
         self,

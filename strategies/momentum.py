@@ -34,7 +34,7 @@ class MomentumStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return "MomentumStrategy"
+        return "Momentum"
 
     def analyze(
         self,
