@@ -139,6 +139,24 @@ class EODHDFeed:
             logger.warning("EODHD daily fetch failed for %s: %s", ticker, exc)
             return None
 
+    def get_bars(self, ticker: str, limit: int = 252) -> pd.DataFrame:
+        """Fetch daily OHLCV bars — compatible interface with AlpacaDataClient.
+
+        Returns:
+            DataFrame with columns: Open, High, Low, Close, Volume.
+
+        Raises:
+            ValueError: If data is unavailable or insufficient.
+        """
+        df = self.get_ohlcv_daily(ticker, limit=limit)
+        if df is None or df.empty:
+            raise ValueError(f"EODHD returned no data for {ticker}")
+        if len(df) < 20:
+            raise ValueError(
+                f"EODHD returned only {len(df)} bars for {ticker} (need >= 20)"
+            )
+        return df
+
     # ------------------------------------------------------------------
     # Intraday OHLCV
     # ------------------------------------------------------------------

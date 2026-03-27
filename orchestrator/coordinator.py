@@ -305,6 +305,41 @@ class Coordinator:
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
 
+    def _log_strategy_result(self, ticker: str, strategy_result) -> None:
+        """Log an individual strategy result to signal_events. Never raises.
+
+        Every strategy result is logged regardless of signal type or
+        confidence so the dashboard can show sub-strategy signals.
+        """
+        try:
+            indicators = strategy_result.indicators or {}
+            price = indicators.get("price")
+            sma_50 = indicators.get("sma50") or indicators.get("sma_50")
+            sma_ratio = (price / sma_50) if (price and sma_50 and sma_50 > 0) else None
+            vol_ratio = indicators.get("vol_ratio") or indicators.get("rvol")
+
+            self.signal_logger.log({
+                "ticker": ticker,
+                "session": None,
+                "strategy": strategy_result.strategy_name,
+                "signal": strategy_result.signal,
+                "confidence": strategy_result.confidence / 100.0,
+                "rsi": indicators.get("rsi"),
+                "sma_ratio": sma_ratio,
+                "volume_ratio": vol_ratio,
+                "sentiment_score": None,
+                "news_score": indicators.get("news_score"),
+                "social_score": None,
+                "bull_case": None,
+                "bear_case": None,
+                "debate_outcome": None,
+                "price_at_signal": price,
+                "trade_executed": 0,
+                "trade_id": None,
+            })
+        except Exception as exc:
+            log.warning("Strategy result logging failed (non-fatal): %s", exc)
+
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
     # ------------------------------------------------------------------
@@ -595,7 +630,11 @@ class Coordinator:
 
         if strategy is not None:
             try:
-                bars = AlpacaDataClient().get_bars(ticker, timeframe="1Day", limit=252)
+                if ticker.endswith(".XETRA"):
+                    from data.eodhd_feed import EODHDFeed
+                    bars = EODHDFeed().get_bars(ticker, limit=252)
+                else:
+                    bars = AlpacaDataClient().get_bars(ticker, timeframe="1Day", limit=252)
                 strategy_result = strategy.analyze(
                     ticker, bars, sentiment["signal"],
                 )
@@ -612,6 +651,10 @@ class Coordinator:
                     "[%s] Strategy %s failed, using generic TA: %s",
                     ticker, strat_name, exc,
                 )
+
+        # Log individual strategy result (all signals, including HOLD)
+        if strategy_result is not None:
+            self._log_strategy_result(ticker, strategy_result)
 
         # --- Fuse ---
         if strategy_result is not None:
@@ -938,11 +981,19 @@ class Coordinator:
 
         if strategy is not None:
             try:
-                _alpaca = AlpacaDataClient()
-                async with data_semaphore:
-                    bars = await asyncio.to_thread(
-                        _alpaca.get_bars, ticker, "1Day", 252,
-                    )
+                if ticker.endswith(".XETRA"):
+                    from data.eodhd_feed import EODHDFeed
+                    _eodhd = EODHDFeed()
+                    async with data_semaphore:
+                        bars = await asyncio.to_thread(
+                            _eodhd.get_bars, ticker, 252,
+                        )
+                else:
+                    _alpaca = AlpacaDataClient()
+                    async with data_semaphore:
+                        bars = await asyncio.to_thread(
+                            _alpaca.get_bars, ticker, "1Day", 252,
+                        )
                 strategy_result = await asyncio.to_thread(
                     strategy.analyze, ticker, bars, sentiment_signal,
                 )
@@ -956,6 +1007,10 @@ class Coordinator:
                     "[%s] Strategy %s failed, using generic TA: %s",
                     ticker, strat_name, exc,
                 )
+
+        # Log individual strategy result (all signals, including HOLD)
+        if strategy_result is not None:
+            self._log_strategy_result(ticker, strategy_result)
 
         # ── Fuse signals ───────────────────────────────────────────────
         if strategy_result is not None:
