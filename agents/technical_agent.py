@@ -197,6 +197,7 @@ class TechnicalAgent(BaseAgent):
             "signal_id": signal_id,
             "volume_confirmed": volume_confirmed,
             "adjusted_confidence": adjusted_confidence,
+            "bars": df,
         }
 
     # ------------------------------------------------------------------

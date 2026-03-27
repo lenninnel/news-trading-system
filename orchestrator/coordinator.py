@@ -37,7 +37,6 @@ import json
 import logging
 import time as _time
 
-from data.alpaca_data import AlpacaDataClient
 
 log = logging.getLogger(__name__)
 
@@ -630,11 +629,11 @@ class Coordinator:
 
         if strategy is not None:
             try:
-                if ticker.endswith(".XETRA"):
-                    from data.eodhd_feed import EODHDFeed
-                    bars = EODHDFeed().get_bars(ticker, limit=252)
-                else:
-                    bars = AlpacaDataClient().get_bars(ticker, timeframe="1Day", limit=252)
+                # Reuse bars already fetched by the technical agent (avoids
+                # a second Alpaca API call that was causing rate-limiting).
+                bars = technical.get("bars")
+                if bars is None or bars.empty:
+                    raise ValueError("Technical agent returned no bars")
                 strategy_result = strategy.analyze(
                     ticker, bars, sentiment["signal"],
                 )
@@ -981,19 +980,10 @@ class Coordinator:
 
         if strategy is not None:
             try:
-                if ticker.endswith(".XETRA"):
-                    from data.eodhd_feed import EODHDFeed
-                    _eodhd = EODHDFeed()
-                    async with data_semaphore:
-                        bars = await asyncio.to_thread(
-                            _eodhd.get_bars, ticker, 252,
-                        )
-                else:
-                    _alpaca = AlpacaDataClient()
-                    async with data_semaphore:
-                        bars = await asyncio.to_thread(
-                            _alpaca.get_bars, ticker, "1Day", 252,
-                        )
+                # Reuse bars already fetched by the technical agent
+                bars = technical.get("bars")
+                if bars is None or bars.empty:
+                    raise ValueError("Technical agent returned no bars")
                 strategy_result = await asyncio.to_thread(
                     strategy.analyze, ticker, bars, sentiment_signal,
                 )

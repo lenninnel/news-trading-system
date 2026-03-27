@@ -147,14 +147,21 @@ class TestXetraBarFetch:
             with pytest.raises(ValueError, match="need >= 20"):
                 feed.get_bars("SAP.XETRA")
 
-    def test_xetra_ticker_uses_eodhd_not_alpaca(self):
-        """Coordinator uses EODHD for .XETRA tickers in the bar-fetch block."""
-        # Verify that the coordinator code dispatches based on .XETRA suffix.
-        # We check this by importing and inspecting the source.
+    def test_xetra_ticker_uses_eodhd_via_technical_agent(self):
+        """Technical agent routes XETRA tickers to EODHD, and coordinator
+        reuses the bars from the technical result (single fetch)."""
         import inspect
+        from agents.technical_agent import TechnicalAgent
         from orchestrator.coordinator import Coordinator
 
-        source = inspect.getsource(Coordinator)
-        # Both sync and async paths should have the XETRA check
-        assert 'ticker.endswith(".XETRA")' in source
-        assert "EODHDFeed" in source
+        # Technical agent handles XETRA via is_german_ticker()
+        ta_source = inspect.getsource(TechnicalAgent)
+        assert "is_german_ticker" in ta_source
+        assert "eodhd" in ta_source.lower()
+
+        # Technical agent now returns bars in its result dict
+        assert '"bars": df' in ta_source or "'bars': df" in ta_source
+
+        # Coordinator reuses technical["bars"] instead of fetching again
+        coord_source = inspect.getsource(Coordinator)
+        assert 'technical.get("bars")' in coord_source
