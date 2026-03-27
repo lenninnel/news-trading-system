@@ -1,17 +1,14 @@
 #!/bin/sh
-export STREAMLIT_SERVER_PORT="${PORT:-8501}"
-echo "[entrypoint] Listening on port $STREAMLIT_SERVER_PORT"
-
 echo "[entrypoint] /data check: exists=$(test -d /data && echo yes || echo no) writable=$(test -w /data && echo yes || echo no)"
 ls -la /data/ 2>/dev/null || echo "[entrypoint] /data not accessible"
 
 echo "[entrypoint] Initialising database tables..."
 python3 -c "from storage.database import Database; db=Database(); print(f'[entrypoint] DB path: {db.db_path}')"
 
-# Start Streamlit FIRST so the healthcheck passes while the pipeline runs
-echo "[entrypoint] Starting Streamlit on port $STREAMLIT_SERVER_PORT..."
+# Start Streamlit on fixed internal port (NOT $PORT — that's for FastAPI)
+echo "[entrypoint] Starting Streamlit on internal port 8501..."
 streamlit run dashboard/app.py \
-    --server.port="$STREAMLIT_SERVER_PORT" \
+    --server.port=8501 \
     --server.address=0.0.0.0 \
     --server.headless=true &
 STREAMLIT_PID=$!
@@ -19,7 +16,7 @@ STREAMLIT_PID=$!
 # Wait for Streamlit to become ready (up to 60s)
 echo "[entrypoint] Waiting for Streamlit healthcheck..."
 for i in $(seq 1 60); do
-    if curl -sf "http://localhost:$STREAMLIT_SERVER_PORT/_stcore/health" > /dev/null 2>&1; then
+    if curl -sf "http://localhost:8501/_stcore/health" > /dev/null 2>&1; then
         echo "[entrypoint] Streamlit ready after ${i}s"
         break
     fi
@@ -32,15 +29,11 @@ done
 echo "[entrypoint] Cleaning ghost trades from DB..."
 python3 scripts/clean_ghost_trades.py --apply 2>&1 || echo "[entrypoint] Ghost cleanup skipped (non-fatal)"
 
-# Start FastAPI API layer for the React dashboard
-echo "[entrypoint] Starting FastAPI on port 8001..."
-uvicorn api.main:app --host 0.0.0.0 --port 8001 &
-
-# Start ONLY the daemon scheduler — it handles all runs including
-# an immediate first run if within trading hours.
-# Do NOT also run --now separately — that causes duplicate trades.
+# Start daemon scheduler in background
 echo "[entrypoint] Starting daemon scheduler (4 runs/day, weekdays UTC)..."
 python3 -m scheduler.daily_runner --daemon 2>&1 &
 
-# Keep container alive — wait for ALL background jobs
-wait
+# Start FastAPI on Railway's public port (foreground, PID 1).
+# FastAPI serves /api/* directly and proxies everything else to Streamlit on :8501.
+echo "[entrypoint] Starting FastAPI on public port ${PORT:-8000}..."
+exec uvicorn api.main:app --host 0.0.0.0 --port "${PORT:-8000}"
