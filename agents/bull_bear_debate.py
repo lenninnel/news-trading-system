@@ -311,28 +311,33 @@ class BullBearDebate:
         bull: dict,
         bear: dict,
     ) -> DebateResult:
-        """Merge bull and bear perspectives into a final verdict."""
+        """Merge bull and bear perspectives into a final verdict.
 
-        boost = bull.get("confidence_boost", 0.0)
+        Outcome classification based on bear pushback strength:
+            agree    (penalty > -0.05) → 0 adjustment
+            cautious (penalty -0.05 to -0.12) → -0.05 to -0.15
+            disagree (penalty <= -0.12) → -0.15 to -0.30
+        """
+
         penalty = bear.get("confidence_penalty", 0.0)
 
-        # Both agree with direction → stronger confidence
-        # Both disagree → weaker confidence
-        bull_agrees = boost > 0
-        bear_agrees = penalty > -0.05  # bear didn't push back hard
-
-        if bull_agrees and bear_agrees:
-            # Consensus: apply full boost, mild penalty
-            adjustment = boost + penalty
-            summary = "Bull and bear broadly agree — confidence boosted."
-        elif not bull_agrees and not bear_agrees:
-            # Both negative: double the caution
-            adjustment = boost + penalty
-            summary = "Both researchers express doubt — confidence reduced."
+        # Classify outcome by bear pushback strength
+        if penalty > -0.05:
+            # Agree: bear sees little risk → no penalty
+            adjustment = 0.0
+            summary = "Bull and bear broadly agree — confidence unchanged."
+        elif penalty > -0.12:
+            # Cautious: moderate bear pushback → -0.05 to -0.15
+            bear_strength = abs(penalty)
+            t = (bear_strength - 0.05) / 0.07  # 0.0–1.0
+            adjustment = -(0.05 + t * 0.10)
+            summary = "Bear raises concerns — cautious penalty applied."
         else:
-            # Mixed: average adjustment, moderate stance
-            adjustment = (boost + penalty) / 2
-            summary = "Bull and bear disagree — cautious adjustment applied."
+            # Disagree: strong bear pushback → -0.15 to -0.30
+            bear_strength = min(abs(penalty), 0.20)
+            t = (bear_strength - 0.12) / 0.08  # 0.0–1.0
+            adjustment = -(0.15 + t * 0.15)
+            summary = "Bull and bear disagree — significant penalty applied."
 
         adjusted = round(max(0.0, min(1.0, confidence + adjustment)), 2)
 
@@ -344,6 +349,11 @@ class BullBearDebate:
 
         bull_case = bull.get("bull_case", "")
         bear_case = bear.get("bear_case", "")
+
+        log.debug(
+            "Debate %s: penalty=%.3f adjustment=%.3f conf=%.2f→%.2f signal=%s→%s",
+            ticker, penalty, adjustment, confidence, adjusted, signal, final_signal,
+        )
 
         return DebateResult(
             ticker=ticker,

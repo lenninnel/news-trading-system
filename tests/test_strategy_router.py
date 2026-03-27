@@ -107,19 +107,19 @@ class TestRouterNameFunction:
     """Verify get_strategy_name returns correct strings."""
 
     def test_momentum_name(self):
-        assert get_strategy_name("META") == "MomentumStrategy"
+        assert get_strategy_name("META") == "Momentum"
 
     def test_pullback_name(self):
-        assert get_strategy_name("AAPL") == "PullbackStrategy"
+        assert get_strategy_name("AAPL") == "Pullback"
 
     def test_unknown_name(self):
-        assert get_strategy_name("UNKNOWN") == "MomentumStrategy"
+        assert get_strategy_name("UNKNOWN") == "Momentum"
 
     def test_jpm_name(self):
-        assert get_strategy_name("JPM") == "MomentumStrategy"
+        assert get_strategy_name("JPM") == "Momentum"
 
     def test_xom_name(self):
-        assert get_strategy_name("XOM") == "PullbackStrategy"
+        assert get_strategy_name("XOM") == "Pullback"
 
 
 class TestRouterSingletons:

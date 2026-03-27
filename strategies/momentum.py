@@ -154,10 +154,23 @@ class MomentumStrategy(BaseStrategy):
             reasoning.append(f"Volume {vol_ratio:.1f}x above average (>1.3x)")
 
         # Condition 4: sentiment alignment
-        sentiment_upper = sentiment_signal.upper()
-        if sentiment_upper in ("BUY", "STRONG BUY", "WEAK BUY"):
+        sentiment_upper = sentiment_signal.strip().upper()
+        if sentiment_upper in (
+            "BUY", "STRONG BUY", "WEAK BUY",
+            "STRONG_BUY", "WEAK_BUY",
+        ):
             conditions_met += 1
             reasoning.append(f"Sentiment aligned: {sentiment_signal}")
+
+        log.debug(
+            "Momentum conditions=%d price=%.2f sma20=%s sma50=%s rsi=%s vol=%.2f sent=%s",
+            conditions_met, price,
+            f"{sma20:.2f}" if sma20 else "N/A",
+            f"{sma50:.2f}" if sma50 else "N/A",
+            f"{rsi:.1f}" if rsi else "N/A",
+            vol_ratio,
+            sentiment_upper,
+        )
 
         # Signal and confidence based on conditions met
         if conditions_met >= 4:

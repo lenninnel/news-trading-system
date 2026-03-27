@@ -140,19 +140,62 @@ class TestBullBearDebate:
         assert result.final_signal == "CONFLICTING"
         assert result.adjusted_confidence == 0.10
 
-    # -- Agreement boosts confidence --
+    # -- Agreement: no penalty --
 
-    def test_agreement_boosts_confidence(self):
+    def test_agree_no_change(self):
+        """agree outcome → adjusted_confidence == original_confidence."""
         debate = self._make_debate(
             {"bull_case": "Strong trend.", "confidence_boost": 0.15},
             {"bear_case": "Minor risk.", "confidence_penalty": -0.02},
         )
         result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
-        assert result.adjusted_confidence > result.original_confidence
+        assert result.adjusted_confidence == result.original_confidence
         assert result.final_signal == "STRONG BUY"
         assert "agree" in result.debate_summary.lower()
 
-    # -- Disagreement reduces confidence --
+    # -- Cautious: moderate penalty --
+
+    def test_cautious_reduces_confidence(self):
+        """cautious outcome → adjusted_confidence < original_confidence."""
+        debate = self._make_debate(
+            {"bull_case": "Upside potential.", "confidence_boost": 0.1},
+            {"bear_case": "Earnings risk.", "confidence_penalty": -0.08},
+        )
+        result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        assert result.adjusted_confidence < result.original_confidence
+        assert "cautious" in result.debate_summary.lower()
+
+    def test_cautious_penalty_varies_with_strength(self):
+        """Two cautious cases with different bear strength → different deltas."""
+        debate_mild = self._make_debate(
+            {"bull_case": "OK.", "confidence_boost": 0.05},
+            {"bear_case": "Some risk.", "confidence_penalty": -0.06},
+        )
+        debate_strong = self._make_debate(
+            {"bull_case": "OK.", "confidence_boost": 0.05},
+            {"bear_case": "More risk.", "confidence_penalty": -0.10},
+        )
+        r_mild = debate_mild.run("AAPL", "BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        r_strong = debate_strong.run("AAPL", "BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        # Both cautious, but different penalties
+        assert r_mild.adjusted_confidence > r_strong.adjusted_confidence
+
+    # -- Disagreement: larger penalty --
+
+    def test_disagree_reduces_more_than_cautious(self):
+        """disagree outcome → adjusted_confidence < cautious penalty."""
+        debate_cautious = self._make_debate(
+            {"bull_case": "x.", "confidence_boost": 0.1},
+            {"bear_case": "Moderate concern.", "confidence_penalty": -0.08},
+        )
+        debate_disagree = self._make_debate(
+            {"bull_case": "x.", "confidence_boost": 0.1},
+            {"bear_case": "Major risk.", "confidence_penalty": -0.15},
+        )
+        r_cautious = debate_cautious.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        r_disagree = debate_disagree.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
+        assert r_disagree.adjusted_confidence < r_cautious.adjusted_confidence
+        assert "disagree" in r_disagree.debate_summary.lower()
 
     def test_disagreement_reduces_confidence(self):
         debate = self._make_debate(
@@ -161,17 +204,6 @@ class TestBullBearDebate:
         )
         result = debate.run("AAPL", "WEAK BUY", 0.45, _TECH_DATA, _SENT_DATA)
         assert result.adjusted_confidence < result.original_confidence
-        assert "doubt" in result.debate_summary.lower()
-
-    # -- Mixed perspectives --
-
-    def test_mixed_applies_cautious_adjustment(self):
-        debate = self._make_debate(
-            {"bull_case": "Upside potential.", "confidence_boost": 0.1},
-            {"bear_case": "Earnings risk.", "confidence_penalty": -0.15},
-        )
-        result = debate.run("AAPL", "WEAK BUY", 0.45, _TECH_DATA, _SENT_DATA)
-        assert result.final_signal == "WEAK BUY"
         assert "disagree" in result.debate_summary.lower()
 
     # -- Very low confidence downgrades to HOLD --
@@ -242,7 +274,7 @@ class TestBullBearDebate:
             {"bear_case": "Major risk.", "confidence_penalty": -0.2},
         )
         result = debate.run("AAPL", "WEAK BUY", 0.45, _TECH_DATA, _SENT_DATA)
-        # Both negative: adjustment = -0.1 + -0.2 = -0.30
+        # Disagree: bear_strength=0.20, t=1.0, adjustment = -0.30
         # adjusted = 0.45 + (-0.30) = 0.15
         assert result.adjusted_confidence == 0.15
         # The coordinator must clamp this back to 0.35
@@ -254,8 +286,7 @@ class TestBullBearDebate:
             {"bear_case": "Very risky.", "confidence_penalty": -0.2},
         )
         result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
-        # Mixed: adjustment = (-0.15 + -0.2) / 2 = -0.175
-        # adjusted = 0.65 + (-0.175) = 0.475 -> 0.48
+        # Disagree: adjustment = -0.30, adjusted = 0.65 - 0.30 = 0.35
         assert result.adjusted_confidence < 0.60
 
 
@@ -276,7 +307,7 @@ class TestBullBearDebateAsync:
         result = asyncio.run(debate.run_async(
             "AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA,
         ))
-        assert result.adjusted_confidence > result.original_confidence
+        assert result.adjusted_confidence == result.original_confidence
 
     def test_async_hold_skips(self):
         debate = self._make_debate({}, {})

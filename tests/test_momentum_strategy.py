@@ -184,6 +184,48 @@ class TestMomentumRulesDirectly:
         signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, "WEAK BUY")
         assert signal == "STRONG BUY"
 
+    def test_underscore_sentiment_counts_as_aligned(self):
+        """STRONG_BUY / WEAK_BUY (underscore variants) satisfy sentiment."""
+        ind = {
+            "price": 150.0, "rsi": 57.5, "sma20": 148.0, "sma50": 145.0,
+            "vol_ratio": 1.5, "atr": 2.0,
+        }
+        for sent in ("STRONG_BUY", "WEAK_BUY"):
+            signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, sent)
+            assert signal == "STRONG BUY", f"Failed for sentiment={sent}"
+            assert len(reasoning) == 4
+
+    def test_whitespace_sentiment_trimmed(self):
+        """Leading/trailing whitespace in sentiment is ignored."""
+        ind = {
+            "price": 150.0, "rsi": 57.5, "sma20": 148.0, "sma50": 145.0,
+            "vol_ratio": 1.5, "atr": 2.0,
+        }
+        signal, _, reasoning = MomentumStrategy._apply_rules(ind, "  BUY  ")
+        assert signal == "STRONG BUY"
+        assert len(reasoning) == 4
+
+    def test_three_conditions_confidence_above_floor(self):
+        """3/4 conditions → BUY with confidence well above 25% floor."""
+        ind = {
+            "price": 150.0, "rsi": 57.5, "sma20": 148.0, "sma50": 145.0,
+            "vol_ratio": 1.5, "atr": 2.0,
+        }
+        signal, confidence, _ = MomentumStrategy._apply_rules(ind, "HOLD")
+        assert signal == "BUY"
+        assert confidence > 25.0  # must be above HOLD floor
+        assert 45.0 <= confidence <= 60.0
+
+    def test_strong_buy_reaches_70_plus(self):
+        """4/4 conditions with ideal RSI → confidence ≥ 70%."""
+        ind = {
+            "price": 150.0, "rsi": 57.5, "sma20": 148.0, "sma50": 145.0,
+            "vol_ratio": 1.5, "atr": 2.0,
+        }
+        signal, confidence, _ = MomentumStrategy._apply_rules(ind, "BUY")
+        assert signal == "STRONG BUY"
+        assert confidence >= 70.0
+
     def test_missing_indicators_hold(self):
         """None values → HOLD with 0 confidence."""
         ind = {"price": None, "rsi": None, "sma20": None, "sma50": None,
@@ -223,7 +265,7 @@ class TestMomentumEndToEnd:
         # With gentle uptrend: price > SMA20 > SMA50, RSI ~55-65
         assert result.signal == "STRONG BUY"
         assert 70.0 <= result.confidence <= 85.0
-        assert result.strategy_name == "MomentumStrategy"
+        assert result.strategy_name == "Momentum"
 
     def test_gentle_uptrend_reasoning(self):
         strat = MomentumStrategy()

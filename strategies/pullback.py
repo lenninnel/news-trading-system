@@ -103,6 +103,14 @@ class PullbackStrategy(BaseStrategy):
         stoch_k_prev = self._prev(stoch_k)
         stoch_d_val = self._latest(stoch_d)
 
+        # Minimum RSI / stoch_k over last 5 bars (catches bounces that
+        # started a few bars ago, not just the immediately previous bar)
+        rsi_clean = rsi_series.dropna()
+        rsi_min_5 = float(rsi_clean.iloc[-5:].min()) if len(rsi_clean) >= 5 else rsi_prev
+
+        stoch_k_clean = stoch_k.dropna()
+        stoch_k_min_5 = float(stoch_k_clean.iloc[-5:].min()) if len(stoch_k_clean) >= 5 else stoch_k_prev
+
         # Distance from SMA50 as percentage
         sma50_dist_pct = ((price - sma50) / sma50 * 100) if sma50 else None
 
@@ -110,10 +118,12 @@ class PullbackStrategy(BaseStrategy):
             "price": price,
             "rsi": rsi,
             "rsi_prev": rsi_prev,
+            "rsi_min_5": rsi_min_5,
             "sma50": sma50,
             "sma50_dist_pct": round(sma50_dist_pct, 3) if sma50_dist_pct is not None else None,
             "stoch_k": stoch_k_val,
             "stoch_k_prev": stoch_k_prev,
+            "stoch_k_min_5": stoch_k_min_5,
             "stoch_d": stoch_d_val,
         }
 
@@ -130,11 +140,18 @@ class PullbackStrategy(BaseStrategy):
 
         price = ind.get("price")
         rsi = ind.get("rsi")
-        rsi_prev = ind.get("rsi_prev")
         sma50 = ind.get("sma50")
         sma50_dist_pct = ind.get("sma50_dist_pct")
         stoch_k = ind.get("stoch_k")
-        stoch_k_prev = ind.get("stoch_k_prev")
+
+        # 5-bar window minimums (fall back to prev-bar values for
+        # backward compat with direct _apply_rules tests)
+        rsi_min_5 = ind.get("rsi_min_5")
+        if rsi_min_5 is None:
+            rsi_min_5 = ind.get("rsi_prev")
+        stoch_k_min_5 = ind.get("stoch_k_min_5")
+        if stoch_k_min_5 is None:
+            stoch_k_min_5 = ind.get("stoch_k_prev")
 
         # Guard: need valid indicators
         if price is None or sma50 is None or rsi is None or stoch_k is None:
@@ -147,11 +164,12 @@ class PullbackStrategy(BaseStrategy):
                 f"Uptrend: price {price:.2f} > SMA50 {sma50:.2f}"
             )
 
-        # Condition 2: RSI dipped below 45 and now rising (bounce signal)
-        if rsi_prev is not None and rsi_prev < 45 and rsi > rsi_prev:
+        # Condition 2: RSI dipped below 45 within last 5 bars and is
+        # now above that low (bounce signal)
+        if rsi_min_5 is not None and rsi_min_5 < 45 and rsi > rsi_min_5:
             conditions_met += 1
             reasoning.append(
-                f"RSI bounce: {rsi_prev:.1f} -> {rsi:.1f} (dipped below 45, now rising)"
+                f"RSI bounce: min5 {rsi_min_5:.1f} -> {rsi:.1f} (dipped below 45, now rising)"
             )
 
         # Condition 3: price within 3% of SMA50 (pullback not too deep)
@@ -161,12 +179,22 @@ class PullbackStrategy(BaseStrategy):
                 f"Near SMA50: {sma50_dist_pct:.1f}% above (within 3%)"
             )
 
-        # Condition 4: stochastic crossing up from oversold
-        if stoch_k_prev is not None and stoch_k_prev < 30 and stoch_k > stoch_k_prev:
+        # Condition 4: stochastic was oversold (<30) within last 5 bars
+        # and is now above that low (crossing up)
+        if stoch_k_min_5 is not None and stoch_k_min_5 < 30 and stoch_k > stoch_k_min_5:
             conditions_met += 1
             reasoning.append(
-                f"Stochastic crossup: %K {stoch_k_prev:.1f} -> {stoch_k:.1f} (from oversold)"
+                f"Stochastic crossup: min5 %K {stoch_k_min_5:.1f} -> {stoch_k:.1f} (from oversold)"
             )
+
+        log.debug(
+            "Pullback conditions=%d rsi=%.1f rsi_min5=%s stoch_k=%.1f stoch_min5=%s sma50_dist=%.1f%%",
+            conditions_met, rsi,
+            f"{rsi_min_5:.1f}" if rsi_min_5 is not None else "N/A",
+            stoch_k,
+            f"{stoch_k_min_5:.1f}" if stoch_k_min_5 is not None else "N/A",
+            sma50_dist_pct if sma50_dist_pct is not None else 0.0,
+        )
 
         # Signal and confidence
         if conditions_met >= 4:

@@ -159,14 +159,75 @@ class TestPullbackRulesDirectly:
         assert signal == "HOLD"
 
     def test_stoch_not_oversold_blocks(self):
-        """Stoch prev > 30 → stochastic condition fails."""
+        """Stoch never below 30 in window → stochastic condition fails."""
         ind = {
             "price": 102.0, "rsi": 43.0, "rsi_prev": 38.0,
             "sma50": 100.0, "sma50_dist_pct": 2.0,
-            "stoch_k": 40.0, "stoch_k_prev": 35.0, "stoch_d": 37.0,
+            "stoch_k": 40.0, "stoch_k_prev": 35.0,
+            "stoch_k_min_5": 33.0,  # never dipped below 30
+            "stoch_d": 37.0,
         }
         signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
         assert signal == "WEAK BUY"  # 3/4
+
+    def test_rsi_dip_in_window_fires_condition(self):
+        """RSI dipped below 45 three bars ago (not prev bar) → condition fires
+        with 5-bar window."""
+        ind = {
+            "price": 102.0, "rsi": 48.0,
+            "rsi_prev": 46.0,       # prev bar already above 45
+            "rsi_min_5": 38.0,      # but min in last 5 bars was below 45
+            "sma50": 100.0, "sma50_dist_pct": 2.0,
+            "stoch_k": 35.0, "stoch_k_prev": 28.0,
+            "stoch_k_min_5": 22.0,
+            "stoch_d": 30.0,
+        }
+        signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
+        assert signal == "BUY"
+        assert 65.0 <= confidence <= 80.0
+        assert len(reasoning) == 4
+
+    def test_stoch_dip_in_window_fires_condition(self):
+        """Stoch K dipped below 30 three bars ago → condition fires."""
+        ind = {
+            "price": 102.0, "rsi": 43.0, "rsi_prev": 38.0,
+            "sma50": 100.0, "sma50_dist_pct": 2.0,
+            "stoch_k": 35.0,
+            "stoch_k_prev": 32.0,      # prev bar already above 30
+            "stoch_k_min_5": 22.0,      # but dipped below 30 within window
+            "stoch_d": 30.0,
+        }
+        signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
+        assert signal == "BUY"
+        assert 65.0 <= confidence <= 80.0
+        assert len(reasoning) == 4
+
+    def test_pullback_confidence_above_floor(self):
+        """3/4 conditions → WEAK BUY with confidence above 20% floor."""
+        ind = {
+            "price": 102.0, "rsi": 43.0, "rsi_prev": 38.0,
+            "sma50": 100.0, "sma50_dist_pct": 2.0,
+            "stoch_k": 35.0, "stoch_k_prev": 35.0,
+            "stoch_k_min_5": 33.0,
+            "stoch_d": 33.0,
+        }
+        signal, confidence, _ = PullbackStrategy._apply_rules(ind)
+        assert signal == "WEAK BUY"
+        assert confidence > 20.0
+        assert 40.0 <= confidence <= 55.0
+
+    def test_buy_reaches_65_plus(self):
+        """4/4 conditions → BUY with confidence ≥ 65%."""
+        ind = {
+            "price": 102.0, "rsi": 43.0, "rsi_prev": 38.0,
+            "sma50": 100.0, "sma50_dist_pct": 2.0,
+            "stoch_k": 28.0, "stoch_k_prev": 22.0,
+            "stoch_k_min_5": 20.0,
+            "stoch_d": 25.0,
+        }
+        signal, confidence, _ = PullbackStrategy._apply_rules(ind)
+        assert signal == "BUY"
+        assert confidence >= 65.0
 
     def test_missing_indicators_hold(self):
         """None values → HOLD with 0 confidence."""
@@ -192,7 +253,7 @@ class TestPullbackEndToEnd:
         result = strat.analyze("AAPL", bars)
 
         # At minimum, some conditions should fire (data shows bounce)
-        assert result.strategy_name == "PullbackStrategy"
+        assert result.strategy_name == "Pullback"
         assert len(result.reasoning) >= 1
 
     def test_downtrend_hold(self):
