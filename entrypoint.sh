@@ -32,6 +32,10 @@ done
 echo "[entrypoint] Cleaning ghost trades from DB..."
 python3 scripts/clean_ghost_trades.py --apply 2>&1 || echo "[entrypoint] Ghost cleanup skipped (non-fatal)"
 
+# Start FastAPI API layer for the React dashboard
+echo "[entrypoint] Starting FastAPI on port 8001..."
+uvicorn api.main:app --host 0.0.0.0 --port 8001 &
+
 # Start ONLY the daemon scheduler — it handles all runs including
 # an immediate first run if within trading hours.
 # Do NOT also run --now separately — that causes duplicate trades.
