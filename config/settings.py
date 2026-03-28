@@ -105,6 +105,15 @@ CRYPTO_TICKERS: set[str] = {
 DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
 
 # ---------------------------------------------------------------------------
+# IBKR (Interactive Brokers) — used when TRADING_MODE=ibkr_paper or ibkr_live
+# ---------------------------------------------------------------------------
+
+IBKR_HOST: str = os.environ.get("IBKR_HOST", "127.0.0.1")
+IBKR_PORT: int = int(os.environ.get("IBKR_PORT", "0"))  # 0 = auto (7497 paper / 7496 live)
+IBKR_CLIENT_ID: int = int(os.environ.get("IBKR_CLIENT_ID", "1"))
+IBKR_PAPER: bool = os.environ.get("IBKR_PAPER", "true").lower() in ("true", "1", "yes")
+
+# ---------------------------------------------------------------------------
 # German / EU ticker lists (used to route to EODHD)
 # ---------------------------------------------------------------------------
 

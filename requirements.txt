@@ -40,3 +40,4 @@ uvicorn[standard]
 # ── Testing ───────────────────────────────────────────────────────────────────
 # Test deps moved to requirements-test.txt — NEVER install in production.
 # pip install -r requirements-test.txt
+ib_insync
