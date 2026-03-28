@@ -54,10 +54,10 @@ class NewsCatalystStrategy(BaseStrategy):
             )
 
         # Extract latest data
-        close = bars["close"].iloc[-1]
-        prev_close = bars["close"].iloc[-2]
-        volume = bars["volume"].iloc[-1]
-        avg_volume = bars["volume"].iloc[-21:-1].mean()
+        close = bars["Close"].iloc[-1]
+        prev_close = bars["Close"].iloc[-2]
+        volume = bars["Volume"].iloc[-1]
+        avg_volume = bars["Volume"].iloc[-21:-1].mean()
 
         # Default news_data if not provided
         if not news_data:

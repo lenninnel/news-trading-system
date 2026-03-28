@@ -16,11 +16,11 @@ def _make_bars(days=30, base_price=100.0, last_volume_mult=1.5, last_pct_change=
     volumes = np.full(days, 1_000_000)
     volumes[-1] = int(volumes[-1] * last_volume_mult)
     return pd.DataFrame({
-        "open": prices * 0.999,
-        "high": prices * 1.01,
-        "low": prices * 0.99,
-        "close": prices,
-        "volume": volumes,
+        "Open": prices * 0.999,
+        "High": prices * 1.01,
+        "Low": prices * 0.99,
+        "Close": prices,
+        "Volume": volumes,
     }, index=dates)
 
 
@@ -66,7 +66,7 @@ class TestNewsCatalystStrategy:
         assert result.confidence == 25.0
 
     def test_insufficient_bars(self):
-        bars = pd.DataFrame({"close": [100], "volume": [1000], "open": [99], "high": [101], "low": [99]})
+        bars = pd.DataFrame({"Close": [100], "Volume": [1000], "Open": [99], "High": [101], "Low": [99]})
         news = {"news_score": 0.80, "headline_count": 3, "sentiment_direction": "BUY"}
         result = self.strategy.analyze("AAPL", bars, "BUY", news_data=news)
         assert result.signal == "HOLD"
