@@ -433,3 +433,80 @@ class TestDebateFloorEnforcement:
         for debate_conf in [0.0, 0.10, 0.30, 0.50, 0.54]:
             result = self._apply_floor("STRONG BUY", debate_conf)
             assert result >= 0.55, f"STRONG BUY conf {result} < 0.55 when debate gave {debate_conf}"
+
+
+# ===========================================================================
+# Session propagation
+# ===========================================================================
+
+class TestSessionPropagation:
+    """Verify that a session name passed to _log_signal_event and
+    _log_strategy_result reaches the SignalLogger."""
+
+    def test_session_passed_to_signal_logger_via_log_signal_event(self):
+        """When session='US_OPEN' is passed to _log_signal_event, the
+        SignalLogger.log() call should receive session='US_OPEN'."""
+        from unittest.mock import MagicMock, patch
+
+        coordinator = Coordinator.__new__(Coordinator)
+        coordinator.signal_logger = MagicMock()
+
+        fake_result = {
+            "ticker": "AAPL",
+            "combined_signal": "STRONG BUY",
+            "confidence": 0.85,
+            "technical": {
+                "indicators": {"price": 180.0, "rsi": 45.0, "sma_50": 175.0, "rvol": 1.5},
+            },
+            "sentiment": {"avg_score": 0.6, "source_breakdown": {}},
+            "debate": None,
+            "execution": {},
+        }
+
+        coordinator._log_signal_event(fake_result, session="US_OPEN")
+
+        coordinator.signal_logger.log.assert_called_once()
+        logged = coordinator.signal_logger.log.call_args[0][0]
+        assert logged["session"] == "US_OPEN"
+
+    def test_session_passed_to_signal_logger_via_log_strategy_result(self):
+        """When session='MIDDAY' is passed to _log_strategy_result, the
+        SignalLogger.log() call should receive session='MIDDAY'."""
+        from unittest.mock import MagicMock
+
+        coordinator = Coordinator.__new__(Coordinator)
+        coordinator.signal_logger = MagicMock()
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_name = "TrendFollowing"
+        fake_strategy.signal = "BUY"
+        fake_strategy.confidence = 75.0
+        fake_strategy.indicators = {"price": 180.0, "rsi": 45.0, "sma_50": 175.0}
+
+        coordinator._log_strategy_result("AAPL", fake_strategy, session="MIDDAY")
+
+        coordinator.signal_logger.log.assert_called_once()
+        logged = coordinator.signal_logger.log.call_args[0][0]
+        assert logged["session"] == "MIDDAY"
+
+    def test_session_defaults_to_none(self):
+        """Without a session argument, session should be None (backward compat)."""
+        from unittest.mock import MagicMock
+
+        coordinator = Coordinator.__new__(Coordinator)
+        coordinator.signal_logger = MagicMock()
+
+        fake_result = {
+            "ticker": "AAPL",
+            "combined_signal": "HOLD",
+            "confidence": 0.25,
+            "technical": {"indicators": {}},
+            "sentiment": {"avg_score": 0.0, "source_breakdown": {}},
+            "debate": None,
+            "execution": {},
+        }
+
+        coordinator._log_signal_event(fake_result)
+
+        logged = coordinator.signal_logger.log.call_args[0][0]
+        assert logged["session"] is None

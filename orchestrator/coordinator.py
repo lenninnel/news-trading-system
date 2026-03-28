@@ -242,7 +242,7 @@ class Coordinator:
             return "SELL"
         return "HOLD"
 
-    def _log_signal_event(self, result: dict) -> None:
+    def _log_signal_event(self, result: dict, *, session: str | None = None) -> None:
         """Extract signal context and log it. Never raises."""
         try:
             technical = result.get("technical") or {}
@@ -284,7 +284,7 @@ class Coordinator:
 
             self.signal_logger.log({
                 "ticker": result.get("ticker"),
-                "session": None,  # filled by scheduler if available
+                "session": session,
                 "strategy": "Combined",
                 "signal": result.get("combined_signal"),
                 "confidence": result.get("confidence"),
@@ -304,7 +304,7 @@ class Coordinator:
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
 
-    def _log_strategy_result(self, ticker: str, strategy_result) -> None:
+    def _log_strategy_result(self, ticker: str, strategy_result, *, session: str | None = None) -> None:
         """Log an individual strategy result to signal_events. Never raises.
 
         Every strategy result is logged regardless of signal type or
@@ -319,7 +319,7 @@ class Coordinator:
 
             self.signal_logger.log({
                 "ticker": ticker,
-                "session": None,
+                "session": session,
                 "strategy": strategy_result.strategy_name,
                 "signal": strategy_result.signal,
                 "confidence": strategy_result.confidence / 100.0,
@@ -570,6 +570,7 @@ class Coordinator:
         verbose: bool = True,
         account_balance: float = 10_000.0,
         execute: bool = False,
+        session: str | None = None,
     ) -> dict:
         """
         Run sentiment, technical, and risk agents, then fuse their signals.
@@ -653,7 +654,7 @@ class Coordinator:
 
         # Log individual strategy result (all signals, including HOLD)
         if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result)
+            self._log_strategy_result(ticker, strategy_result, session=session)
 
         # --- Fuse ---
         if strategy_result is not None:
@@ -855,7 +856,7 @@ class Coordinator:
         }
 
         # Signal analytics logging (fire-and-forget)
-        self._log_signal_event(final_result)
+        self._log_signal_event(final_result, session=session)
 
         return final_result
 
@@ -872,6 +873,7 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
+        session: str | None = None,
     ) -> dict:
         """
         Async version of ``run_combined()`` with semaphore-controlled phases.
@@ -1000,7 +1002,7 @@ class Coordinator:
 
         # Log individual strategy result (all signals, including HOLD)
         if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result)
+            self._log_strategy_result(ticker, strategy_result, session=session)
 
         # ── Fuse signals ───────────────────────────────────────────────
         if strategy_result is not None:
@@ -1186,6 +1188,6 @@ class Coordinator:
         }
 
         # Signal analytics logging (fire-and-forget)
-        self._log_signal_event(final_result)
+        self._log_signal_event(final_result, session=session)
 
         return final_result

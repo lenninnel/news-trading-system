@@ -97,6 +97,7 @@ async def _process_ticker(
     db_lock: asyncio.Lock,
     worker_semaphore: asyncio.Semaphore,
     tracker: _ProgressTracker,
+    session: str | None = None,
 ) -> dict | None:
     """Process one ticker under the worker semaphore, report progress."""
     async with worker_semaphore:
@@ -108,6 +109,7 @@ async def _process_ticker(
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
+                session=session,
             )
             await tracker.record(ticker, result, None)
             return result
@@ -124,6 +126,7 @@ async def run_batch(
     workers: int = 5,
     account_balance: float = 10_000.0,
     execute: bool = False,
+    session: str | None = None,
 ) -> dict:
     """
     Analyse a list of tickers concurrently.
@@ -133,6 +136,7 @@ async def run_batch(
         workers:         Max concurrent tickers.
         account_balance: Account size in USD.
         execute:         When True, execute trades via broker.
+        session:         Trading session name (e.g. "US_OPEN").
 
     Returns:
         dict with keys: results, elapsed_s, success_count, fail_count.
@@ -158,6 +162,7 @@ async def run_batch(
             db_lock=db_lock,
             worker_semaphore=worker_semaphore,
             tracker=tracker,
+            session=session,
         )
         for ticker in tickers
     ]
@@ -508,6 +513,7 @@ class DailyScheduler:
                     workers=workers,
                     account_balance=10_000.0,
                     execute=execute,
+                    session=run_name,
                 )
             )
 
