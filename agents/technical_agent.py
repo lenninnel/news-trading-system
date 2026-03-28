@@ -9,7 +9,7 @@ BUY / SELL / HOLD.
 Data source routing:
     - Crypto tickers -> Binance
     - German/EU tickers (.XETRA, .DE) -> EODHD (fallback: yfinance)
-    - All others -> Alpaca Data API
+    - All others -> yfinance (Alpaca reserved for trade execution only)
 
 Signal rules (weighted scoring system -- score >= +2 -> BUY, <= -2 -> SELL):
     RSI           -- graduated: <30 (+2), <35 (+1.5), <45 (+0.5),
@@ -29,7 +29,7 @@ Volume confirmation (adjusts confidence, does not change signal):
 Results are persisted to the ``technical_signals`` table.
 
 Requires:
-    pip install alpaca-trade-api ta
+    pip install yfinance ta
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ import ta
 
 from agents.base_agent import BaseAgent
 from config.settings import CRYPTO_TICKERS, is_german_ticker
-from data.alpaca_data import AlpacaDataClient
 from data.binance_feed import BinanceFeed
 from data.eodhd_feed import EODHDFeed
+from data.yfinance_feed import YFinanceFeed
 from storage.database import Database
 from utils import safe_column
 
@@ -80,12 +80,15 @@ class TechnicalAgent(BaseAgent):
         db: Database | None = None,
         binance_feed: BinanceFeed | None = None,
         eodhd_feed: EODHDFeed | None = None,
-        alpaca_client: AlpacaDataClient | None = None,
+        yfinance_feed: YFinanceFeed | None = None,
+        alpaca_client: object | None = None,
     ) -> None:
         self._db = db or Database()
         self._binance = binance_feed or BinanceFeed()
         self._eodhd = eodhd_feed or EODHDFeed()
-        self._alpaca = alpaca_client or AlpacaDataClient()
+        # alpaca_client accepted for backward compat (tests pass a mock
+        # whose .get_bars() returns the same OHLCV DataFrame format)
+        self._yf = yfinance_feed or alpaca_client or YFinanceFeed()
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -219,14 +222,14 @@ class TechnicalAgent(BaseAgent):
         if is_german_ticker(ticker):
             return self._fetch_german_history(ticker)
 
-        # US stocks: use Alpaca bars
+        # US / other stocks: use yfinance
         try:
-            df = self._alpaca.get_bars(ticker, "1Day", limit=252)
+            df = self._yf.get_bars(ticker, "1Day", limit=252)
             if not df.empty:
-                logger.debug("Alpaca returned %d bars for %s", len(df), ticker)
+                logger.debug("yfinance returned %d bars for %s", len(df), ticker)
                 return df
         except Exception as exc:
-            logger.warning("Alpaca bars failed for %s: %s", ticker, exc)
+            logger.warning("yfinance bars failed for %s: %s", ticker, exc)
 
         raise ValueError(f"No price data returned for ticker '{ticker}'")
 
@@ -290,7 +293,7 @@ class TechnicalAgent(BaseAgent):
 
         # --- 1-hour bars → RSI-14 ---
         try:
-            df_1h = self._alpaca.get_bars(ticker, "1Hour", limit=100)
+            df_1h = self._yf.get_bars(ticker, "1Hour", limit=100)
             if df_1h is not None and len(df_1h) >= 20:
                 close_1h = safe_column(df_1h, "Close")
                 rsi_series = ta.momentum.RSIIndicator(close=close_1h, window=14).rsi()
@@ -302,7 +305,7 @@ class TechnicalAgent(BaseAgent):
 
         # --- 15-minute bars → MACD histogram ---
         try:
-            df_15m = self._alpaca.get_bars(ticker, "15Min", limit=100)
+            df_15m = self._yf.get_bars(ticker, "15Min", limit=100)
             if df_15m is not None and len(df_15m) >= 30:
                 close_15m = safe_column(df_15m, "Close")
                 macd_obj = ta.trend.MACD(
