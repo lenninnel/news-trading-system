@@ -84,8 +84,9 @@ class PullbackStrategy(BaseStrategy):
         # RSI-14
         rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
 
-        # SMA-50
+        # SMA-50 and SMA-200
         sma50_series = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
+        sma200_series = ta.trend.SMAIndicator(close=close, window=200).sma_indicator()
 
         # Stochastic oscillator (14,3)
         stoch = ta.momentum.StochasticOscillator(
@@ -114,12 +115,15 @@ class PullbackStrategy(BaseStrategy):
         # Distance from SMA50 as percentage
         sma50_dist_pct = ((price - sma50) / sma50 * 100) if sma50 else None
 
+        sma200 = self._latest(sma200_series)
+
         return {
             "price": price,
             "rsi": rsi,
             "rsi_prev": rsi_prev,
             "rsi_min_5": rsi_min_5,
             "sma50": sma50,
+            "sma200": sma200,
             "sma50_dist_pct": round(sma50_dist_pct, 3) if sma50_dist_pct is not None else None,
             "stoch_k": stoch_k_val,
             "stoch_k_prev": stoch_k_prev,
@@ -200,14 +204,30 @@ class PullbackStrategy(BaseStrategy):
         if conditions_met >= 4:
             # Perfect pullback setup: 65-80%
             confidence = 65.0 + conditions_met * 3.75
-            return "BUY", min(confidence, 80.0), reasoning
-
-        if conditions_met == 3:
+            signal, confidence = "BUY", min(confidence, 80.0)
+        elif conditions_met == 3:
             # Good setup missing one piece: 40-55%
             confidence = 40.0 + conditions_met * 5.0
-            return "WEAK BUY", min(confidence, 55.0), reasoning
+            signal, confidence = "WEAK BUY", min(confidence, 55.0)
+        else:
+            # 2 or fewer — no actionable signal
+            if not reasoning:
+                reasoning.append("No pullback conditions triggered")
+            signal, confidence = "HOLD", 20.0
 
-        # 2 or fewer — no actionable signal
-        if not reasoning:
-            reasoning.append("No pullback conditions triggered")
-        return "HOLD", 20.0, reasoning
+        # ── Downtrend filter: prevent catching falling knives ──
+        sma200 = ind.get("sma200")
+        if sma200 and price and sma200 > 0:
+            sma_ratio = price / sma200
+            if sma_ratio < 0.70:
+                signal = "HOLD"
+                confidence = 20.0
+                reasoning.append("Extreme downtrend \u2014 signal suppressed")
+            elif sma_ratio < 0.80 and signal in ("BUY", "STRONG BUY"):
+                signal = "WEAK BUY"
+                confidence = min(confidence, 55.0)
+                reasoning.append(
+                    f"Severe downtrend filter applied (SMA ratio: {sma_ratio:.2f})"
+                )
+
+        return signal, confidence, reasoning

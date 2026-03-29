@@ -84,9 +84,10 @@ class MomentumStrategy(BaseStrategy):
         # RSI-14
         rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
 
-        # SMA-20 and SMA-50
+        # SMA-20, SMA-50, and SMA-200
         sma20_series = ta.trend.SMAIndicator(close=close, window=20).sma_indicator()
         sma50_series = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
+        sma200_series = ta.trend.SMAIndicator(close=close, window=200).sma_indicator()
 
         # Volume ratio: current bar vs 20-day average
         vol_avg = volume.rolling(20).mean()
@@ -103,6 +104,7 @@ class MomentumStrategy(BaseStrategy):
         rsi = self._latest(rsi_series)
         sma20 = self._latest(sma20_series)
         sma50 = self._latest(sma50_series)
+        sma200 = self._latest(sma200_series)
         atr = self._latest(atr_series)
 
         return {
@@ -110,6 +112,7 @@ class MomentumStrategy(BaseStrategy):
             "rsi": rsi,
             "sma20": sma20,
             "sma50": sma50,
+            "sma200": sma200,
             "vol_ratio": round(vol_ratio, 3),
             "atr": atr,
         }
@@ -178,14 +181,30 @@ class MomentumStrategy(BaseStrategy):
             # Scale within range based on RSI proximity to sweet-spot center (57.5)
             rsi_bonus = max(0, 15 - abs(rsi - 57.5))  # 0-15 bonus
             confidence = 70.0 + rsi_bonus
-            return "STRONG BUY", min(confidence, 85.0), reasoning
-
-        if conditions_met == 3:
+            signal, confidence = "STRONG BUY", min(confidence, 85.0)
+        elif conditions_met == 3:
             # Strong setup missing one piece: 45-60%
             confidence = 45.0 + conditions_met * 5.0
-            return "BUY", min(confidence, 60.0), reasoning
+            signal, confidence = "BUY", min(confidence, 60.0)
+        else:
+            # 2 or fewer conditions — no actionable signal
+            if not reasoning:
+                reasoning.append("No momentum conditions triggered")
+            signal, confidence = "HOLD", 25.0
 
-        # 2 or fewer conditions — no actionable signal
-        if not reasoning:
-            reasoning.append("No momentum conditions triggered")
-        return "HOLD", 25.0, reasoning
+        # ── Downtrend filter: prevent catching falling knives ──
+        sma200 = ind.get("sma200")
+        if sma200 and price and sma200 > 0:
+            sma_ratio = price / sma200
+            if sma_ratio < 0.70:
+                signal = "HOLD"
+                confidence = 25.0
+                reasoning.append("Extreme downtrend \u2014 signal suppressed")
+            elif sma_ratio < 0.80 and signal in ("BUY", "STRONG BUY"):
+                signal = "WEAK BUY"
+                confidence = min(confidence, 55.0)
+                reasoning.append(
+                    f"Severe downtrend filter applied (SMA ratio: {sma_ratio:.2f})"
+                )
+
+        return signal, confidence, reasoning

@@ -350,3 +350,45 @@ class TestPullbackEdgeCases:
         bars = _make_pullback_bounce()
         result = strat.analyze("AAPL", bars)
         assert result.signal in ("BUY", "WEAK BUY", "HOLD")
+
+
+# ===========================================================================
+# Downtrend filter tests
+# ===========================================================================
+
+class TestPullbackDowntrendFilter:
+    """Downtrend filter prevents catching falling knives."""
+
+    @staticmethod
+    def _buy_setup(**overrides) -> dict:
+        """4/4 conditions indicator dict (normally → BUY)."""
+        base = {
+            "price": 78.0, "rsi": 43.0, "rsi_prev": 38.0,
+            "sma50": 76.0, "sma50_dist_pct": 2.6,
+            "stoch_k": 28.0, "stoch_k_prev": 22.0, "stoch_d": 25.0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_severe_downtrend_caps_at_weak_buy(self):
+        """sma_ratio < 0.80 → BUY capped to WEAK BUY."""
+        ind = self._buy_setup(sma200=100.0)  # ratio = 0.78
+        signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
+        assert signal == "WEAK BUY"
+        assert any("Severe downtrend" in r for r in reasoning)
+
+    def test_extreme_downtrend_forces_hold(self):
+        """sma_ratio < 0.70 → forced HOLD."""
+        ind = self._buy_setup(price=68.0, sma50=66.0, sma50_dist_pct=3.0,
+                              sma200=100.0)  # ratio = 0.68
+        signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
+        assert signal == "HOLD"
+        assert any("Extreme downtrend" in r for r in reasoning)
+
+    def test_normal_pullback_unaffected(self):
+        """sma_ratio > 0.80 → no filter applied."""
+        ind = self._buy_setup(price=92.0, sma50=90.0, sma50_dist_pct=2.2,
+                              sma200=100.0)  # ratio = 0.92
+        signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
+        assert signal == "BUY"
+        assert not any("downtrend" in r.lower() for r in reasoning)

@@ -351,3 +351,44 @@ class TestMomentumEdgeCases:
         for key in ("price", "rsi", "sma20", "sma50", "vol_ratio", "atr"):
             assert key in result.indicators
             assert result.indicators[key] is not None
+
+
+# ===========================================================================
+# Downtrend filter tests
+# ===========================================================================
+
+class TestMomentumDowntrendFilter:
+    """Downtrend filter prevents catching falling knives."""
+
+    @staticmethod
+    def _strong_buy_setup(**overrides) -> dict:
+        """4/4 conditions indicator dict (normally → STRONG BUY with BUY sentiment)."""
+        base = {
+            "price": 78.0, "rsi": 57.5, "sma20": 76.0, "sma50": 74.0,
+            "vol_ratio": 1.5, "atr": 2.0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_severe_downtrend_caps_at_weak_buy(self):
+        """sma_ratio < 0.80 → STRONG BUY capped to WEAK BUY."""
+        ind = self._strong_buy_setup(sma200=100.0)  # ratio = 0.78
+        signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, "BUY")
+        assert signal == "WEAK BUY"
+        assert any("Severe downtrend" in r for r in reasoning)
+
+    def test_extreme_downtrend_forces_hold(self):
+        """sma_ratio < 0.70 → forced HOLD."""
+        ind = self._strong_buy_setup(price=68.0, sma20=66.0, sma50=64.0,
+                                     sma200=100.0)  # ratio = 0.68
+        signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, "BUY")
+        assert signal == "HOLD"
+        assert any("Extreme downtrend" in r for r in reasoning)
+
+    def test_normal_pullback_unaffected(self):
+        """sma_ratio > 0.80 → no filter applied."""
+        ind = self._strong_buy_setup(price=92.0, sma20=90.0, sma50=88.0,
+                                     sma200=100.0)  # ratio = 0.92
+        signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, "BUY")
+        assert signal == "STRONG BUY"
+        assert not any("downtrend" in r.lower() for r in reasoning)
