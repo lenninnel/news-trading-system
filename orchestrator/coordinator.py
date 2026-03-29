@@ -874,6 +874,7 @@ class Coordinator:
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
         session: str | None = None,
+        session_type: str = "signal",
     ) -> dict:
         """
         Async version of ``run_combined()`` with semaphore-controlled phases.
@@ -895,10 +896,30 @@ class Coordinator:
             api_semaphore:   Limits concurrent Claude API calls.
             data_semaphore:  Limits concurrent yfinance / HTTP fetches.
             db_lock:         Serialises all database writes.
+            session_type:    "signal" | "execution" | "monitor".
 
         Returns:
             Same dict shape as ``run_combined()``, plus ``elapsed_s``.
         """
+        # ── Dispatch by session type ──────────────────────────────────
+        if session_type == "monitor":
+            return await self._monitor_position_async(
+                ticker,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                session=session,
+            )
+        if session_type == "execution":
+            return await self._execute_forward_signals_async(
+                ticker,
+                account_balance=account_balance,
+                execute=execute,
+                api_semaphore=api_semaphore,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                session=session,
+            )
+
         t0 = _time.monotonic()
         ticker = ticker.upper()
 
@@ -1190,4 +1211,236 @@ class Coordinator:
         # Signal analytics logging (fire-and-forget)
         self._log_signal_event(final_result, session=session)
 
+        # ── Forward signal storage (EOD → US_OPEN pipeline) ──────────
+        # In signal mode, store actionable signals as forward signals
+        # so the next execution session can validate and trade them.
+        if session_type == "signal" and combined_signal not in ("HOLD", "CONFLICTING"):
+            try:
+                self.signal_logger.store_forward_signal({
+                    "source_session": session or "EOD",
+                    "target_session": "US_OPEN",
+                    "ticker": ticker,
+                    "signal": combined_signal,
+                    "confidence": conf,
+                    "price_at_signal": price,
+                    "strategy_name": strat_name,
+                    "stop_loss": risk.get("stop_loss") if not risk.get("skipped") else None,
+                    "take_profit": risk.get("take_profit") if not risk.get("skipped") else None,
+                })
+            except Exception as exc:
+                log.warning("[%s] Forward signal storage failed (non-fatal): %s", ticker, exc)
+
         return final_result
+
+    # ------------------------------------------------------------------
+    # Monitor mode (MIDDAY — position check only)
+    # ------------------------------------------------------------------
+
+    async def _monitor_position_async(
+        self,
+        ticker: str,
+        *,
+        data_semaphore: asyncio.Semaphore,
+        db_lock: asyncio.Lock,
+        session: str | None = None,
+    ) -> dict:
+        """Lightweight position check — no signal generation."""
+        t0 = _time.monotonic()
+        ticker = ticker.upper()
+
+        position = None
+        async with db_lock:
+            position = self.db.get_portfolio_position(ticker)
+
+        if not position:
+            return {
+                "ticker": ticker,
+                "session_type": "monitor",
+                "combined_signal": "MONITOR",
+                "confidence": 0,
+                "has_position": False,
+                "elapsed_s": round(_time.monotonic() - t0, 2),
+            }
+
+        # Fetch current price
+        current_price = None
+        async with data_semaphore:
+            try:
+                market = await asyncio.to_thread(self.market_data.fetch, ticker)
+                current_price = market.get("price")
+            except Exception as exc:
+                log.warning("[%s] Monitor price fetch failed: %s", ticker, exc)
+
+        # Load stop-loss / take-profit from most recent trade
+        trade_info: dict = {}
+        async with db_lock:
+            try:
+                with self.db._connect() as conn:
+                    row = conn.execute(
+                        "SELECT stop_loss, take_profit FROM trade_history "
+                        "WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+                        (ticker,),
+                    ).fetchone()
+                    if row:
+                        trade_info = dict(row)
+            except Exception:
+                pass
+
+        stop_loss = trade_info.get("stop_loss")
+        take_profit = trade_info.get("take_profit")
+
+        # Compute distances
+        dist_to_stop = None
+        dist_to_tp = None
+        if current_price and stop_loss:
+            dist_to_stop = round((current_price - stop_loss) / current_price * 100, 2)
+        if current_price and take_profit:
+            dist_to_tp = round((take_profit - current_price) / current_price * 100, 2)
+
+        elapsed = _time.monotonic() - t0
+
+        return {
+            "ticker": ticker,
+            "session_type": "monitor",
+            "combined_signal": "MONITOR",
+            "confidence": 0,
+            "has_position": True,
+            "current_price": current_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "distance_to_stop_pct": dist_to_stop,
+            "distance_to_tp_pct": dist_to_tp,
+            "elapsed_s": round(elapsed, 2),
+        }
+
+    # ------------------------------------------------------------------
+    # Execution mode (US_OPEN — validate and execute forward signals)
+    # ------------------------------------------------------------------
+
+    _FORWARD_PRICE_DRIFT_PCT = 2.0  # max acceptable price drift
+
+    async def _execute_forward_signals_async(
+        self,
+        ticker: str,
+        *,
+        account_balance: float = 10_000.0,
+        execute: bool = False,
+        api_semaphore: asyncio.Semaphore,
+        data_semaphore: asyncio.Semaphore,
+        db_lock: asyncio.Lock,
+        session: str | None = None,
+    ) -> dict:
+        """
+        Validate pending forward signals and execute if conditions hold.
+
+        Also runs the standard signal pipeline for gap plays.
+        """
+        t0 = _time.monotonic()
+        ticker = ticker.upper()
+
+        # Load pending forward signals for this ticker
+        pending = self.signal_logger.get_pending_forward_signals(
+            target_session="US_OPEN",
+            ticker=ticker,
+        )
+
+        # Fetch current price
+        current_price = None
+        async with data_semaphore:
+            try:
+                market = await asyncio.to_thread(self.market_data.fetch, ticker)
+                current_price = market.get("price")
+            except Exception as exc:
+                log.warning("[%s] Execution mode price fetch failed: %s", ticker, exc)
+
+        forward_results: list[dict] = []
+
+        for fwd in pending:
+            fwd_id = fwd["id"]
+            signal_price = fwd.get("price_at_signal")
+            fwd_signal = fwd.get("signal", "")
+
+            # Validate: need current price and signal price
+            if not current_price or not signal_price:
+                self.signal_logger.update_forward_signal(
+                    fwd_id, "invalidated", "no price data available",
+                )
+                forward_results.append({"id": fwd_id, "status": "invalidated", "reason": "no_price"})
+                continue
+
+            # Direction-specific adverse drift check
+            is_buy = "BUY" in fwd_signal.upper()
+            if is_buy:
+                adverse_drift = (signal_price - current_price) / signal_price * 100
+            else:
+                adverse_drift = (current_price - signal_price) / signal_price * 100
+
+            if adverse_drift > self._FORWARD_PRICE_DRIFT_PCT:
+                reason = (
+                    f"price moved {adverse_drift:.1f}% against signal "
+                    f"(was {signal_price:.2f}, now {current_price:.2f})"
+                )
+                self.signal_logger.update_forward_signal(fwd_id, "invalidated", reason)
+                log.info("[%s] Forward signal invalidated: %s", ticker, reason)
+                forward_results.append({"id": fwd_id, "status": "invalidated", "reason": reason})
+                continue
+
+            # Confirmed — proceed to execution
+            self.signal_logger.update_forward_signal(fwd_id, "confirmed")
+            forward_results.append({"id": fwd_id, "status": "confirmed"})
+
+            if execute:
+                async with db_lock:
+                    risk = self.risk_agent.run(
+                        ticker=ticker,
+                        signal=fwd_signal,
+                        confidence=(fwd.get("confidence") or 0.5) * 100,
+                        current_price=current_price,
+                        account_balance=account_balance,
+                    )
+
+                if not risk["skipped"]:
+                    if fwd.get("stop_loss"):
+                        risk["stop_loss"] = fwd["stop_loss"]
+                    if fwd.get("take_profit"):
+                        risk["take_profit"] = fwd["take_profit"]
+
+                    if (risk.get("stop_loss") and risk["stop_loss"] > 0
+                            and risk.get("take_profit") and risk["take_profit"] > 0):
+                        async with db_lock:
+                            if risk["direction"] == "BUY" and (
+                                self._has_alpaca_position(ticker)
+                                or self.db.get_portfolio_position(ticker)
+                            ):
+                                log.info("[%s] Forward BUY blocked — position open", ticker)
+                            else:
+                                self.paper_trader.track_trade(
+                                    ticker=ticker,
+                                    action=risk["direction"],
+                                    shares=risk["shares"],
+                                    price=current_price,
+                                    stop_loss=risk["stop_loss"],
+                                    take_profit=risk["take_profit"],
+                                )
+                                self.signal_logger.update_forward_signal(fwd_id, "executed")
+                                log.info(
+                                    "[%s] Forward signal executed: %s %d shares @ %.2f",
+                                    ticker, risk["direction"], risk["shares"], current_price,
+                                )
+
+        # Also run the standard signal pipeline for gap plays
+        gap_result = await self.analyse_ticker_async(
+            ticker,
+            account_balance=account_balance,
+            execute=execute,
+            api_semaphore=api_semaphore,
+            data_semaphore=data_semaphore,
+            db_lock=db_lock,
+            session=session,
+            session_type="signal",  # standard pipeline
+        )
+
+        gap_result["session_type"] = "execution"
+        gap_result["forward_signals"] = forward_results
+        gap_result["elapsed_s"] = round(_time.monotonic() - t0, 2)
+        return gap_result

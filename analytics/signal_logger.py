@@ -27,6 +27,25 @@ from storage.database import Database
 
 log = logging.getLogger(__name__)
 
+_CREATE_FORWARD_TABLE = """
+CREATE TABLE IF NOT EXISTS forward_signals (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at          TEXT    NOT NULL,
+    source_session      TEXT    NOT NULL,
+    target_session      TEXT    NOT NULL,
+    ticker              TEXT    NOT NULL,
+    signal              TEXT    NOT NULL,
+    confidence          REAL,
+    price_at_signal     REAL,
+    strategy_name       TEXT,
+    stop_loss           REAL,
+    take_profit         REAL,
+    status              TEXT    NOT NULL DEFAULT 'pending',
+    resolved_at         TEXT,
+    invalidated_reason  TEXT
+)
+"""
+
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +94,7 @@ class SignalLogger:
         try:
             with self._db._connect() as conn:
                 conn.executescript(_CREATE_TABLE)
+                conn.executescript(_CREATE_FORWARD_TABLE)
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -150,3 +170,109 @@ class SignalLogger:
         except Exception as exc:
             log.warning("SignalLogger.get_signals() failed: %s", exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Forward signals (EOD → US_OPEN execution pipeline)
+    # ------------------------------------------------------------------
+
+    def store_forward_signal(self, data: dict) -> int | None:
+        """Store an EOD signal for next-day execution. Never raises."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            with self._db._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO forward_signals
+                        (created_at, source_session, target_session, ticker,
+                         signal, confidence, price_at_signal, strategy_name,
+                         stop_loss, take_profit, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        now,
+                        data.get("source_session", "EOD"),
+                        data.get("target_session", "US_OPEN"),
+                        data.get("ticker", ""),
+                        data.get("signal", ""),
+                        data.get("confidence"),
+                        data.get("price_at_signal"),
+                        data.get("strategy_name"),
+                        data.get("stop_loss"),
+                        data.get("take_profit"),
+                    ),
+                )
+                return cur.lastrowid
+        except Exception as exc:
+            log.warning("store_forward_signal() failed (non-fatal): %s", exc)
+            return None
+
+    def get_pending_forward_signals(
+        self,
+        target_session: str = "US_OPEN",
+        ticker: str | None = None,
+    ) -> list[dict]:
+        """Return pending forward signals for the given target session."""
+        try:
+            if ticker:
+                sql = (
+                    "SELECT * FROM forward_signals "
+                    "WHERE status = 'pending' AND target_session = ? "
+                    "AND ticker = ? ORDER BY id DESC"
+                )
+                params: tuple = (target_session, ticker.upper())
+            else:
+                sql = (
+                    "SELECT * FROM forward_signals "
+                    "WHERE status = 'pending' AND target_session = ? "
+                    "ORDER BY id DESC"
+                )
+                params = (target_session,)
+            with self._db._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            log.warning("get_pending_forward_signals() failed: %s", exc)
+            return []
+
+    def update_forward_signal(
+        self,
+        signal_id: int,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        """Update a forward signal's status. Never raises."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            with self._db._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE forward_signals
+                    SET status = ?, resolved_at = ?, invalidated_reason = ?
+                    WHERE id = ?
+                    """,
+                    (status, now, reason, signal_id),
+                )
+        except Exception as exc:
+            log.warning("update_forward_signal() failed (non-fatal): %s", exc)
+
+    def expire_stale_forward_signals(self, max_age_hours: int = 24) -> int:
+        """Mark pending forward signals older than *max_age_hours* as expired."""
+        try:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+            ).isoformat()
+            with self._db._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE forward_signals
+                    SET status = 'expired',
+                        resolved_at = ?,
+                        invalidated_reason = 'stale (> 24h)'
+                    WHERE status = 'pending' AND created_at < ?
+                    """,
+                    (datetime.now(timezone.utc).isoformat(), cutoff),
+                )
+                return cur.rowcount
+        except Exception as exc:
+            log.warning("expire_stale_forward_signals() failed: %s", exc)
+            return 0

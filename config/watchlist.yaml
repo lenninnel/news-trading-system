@@ -6,6 +6,30 @@
 # MOMENTUM: META, JPM  — passed Sharpe > 0.5 + win rate > 45%
 # PULLBACK: AAPL, MSFT, AMZN, XOM, CVX, BAC, PFE, TSLA — pullback edge confirmed
 # REMOVED:  NVDA, DELL, GOOGL, CEG, VST — failed backtest validation
+
+# ── Ticker lists by exchange ─────────────────────────────────────────────────
+# US_OPEN / MIDDAY / EOD sessions run us_tickers only.
+# XETRA_OPEN runs xetra_tickers only.
+# The combined "watchlist" key is the union (kept for backward compat).
+
+us_tickers:
+  # --- Momentum strategy tickers ---
+  - META
+  - JPM
+  # --- Pullback strategy tickers ---
+  - AAPL
+  - MSFT
+  - AMZN
+  - XOM
+  - CVX
+  - BAC
+  - PFE
+  - TSLA
+
+xetra_tickers:
+  - SAP.XETRA
+  - SIE.XETRA
+
 watchlist:
   # --- Momentum strategy tickers ---
   - META

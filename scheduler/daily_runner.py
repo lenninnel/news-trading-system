@@ -98,6 +98,7 @@ async def _process_ticker(
     worker_semaphore: asyncio.Semaphore,
     tracker: _ProgressTracker,
     session: str | None = None,
+    session_type: str = "signal",
 ) -> dict | None:
     """Process one ticker under the worker semaphore, report progress."""
     async with worker_semaphore:
@@ -110,6 +111,7 @@ async def _process_ticker(
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
                 session=session,
+                session_type=session_type,
             )
             await tracker.record(ticker, result, None)
             return result
@@ -127,6 +129,7 @@ async def run_batch(
     account_balance: float = 10_000.0,
     execute: bool = False,
     session: str | None = None,
+    session_type: str = "signal",
 ) -> dict:
     """
     Analyse a list of tickers concurrently.
@@ -137,6 +140,7 @@ async def run_batch(
         account_balance: Account size in USD.
         execute:         When True, execute trades via broker.
         session:         Trading session name (e.g. "US_OPEN").
+        session_type:    "signal" | "execution" | "monitor".
 
     Returns:
         dict with keys: results, elapsed_s, success_count, fail_count.
@@ -163,6 +167,7 @@ async def run_batch(
             worker_semaphore=worker_semaphore,
             tracker=tracker,
             session=session,
+            session_type=session_type,
         )
         for ticker in tickers
     ]
@@ -226,15 +231,20 @@ def run_batch_sync(
 
 # ── Daemon scheduler ─────────────────────────────────────────────────
 
-# Session-specific watchlists
+# Session-specific watchlists (fallback — prefer YAML config)
 _XETRA_TICKERS = ["SAP.XETRA", "SIE.XETRA"]
 
+# Session types:
+#   "signal"    — full signal generation, store forward signals for next session
+#   "execution" — validate yesterday's EOD signals, execute if conditions hold
+#   "monitor"   — lightweight position check only, no new signals
+#
 # Schedule: 4 runs per weekday, all times UTC
 SCHEDULE = [
-    {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False},
-    {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False},
-    {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False},
-    {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True},
+    {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
+    {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
+    {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
+    {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
 ]
 
 # Trading window (UTC)
@@ -288,6 +298,35 @@ class DailyScheduler:
             return cfg.get("watchlist", DEFAULT_WATCHLIST)
         except Exception:
             return DEFAULT_WATCHLIST
+
+    @staticmethod
+    def _load_us_tickers() -> list[str]:
+        """Load US-only tickers from watchlist.yaml (us_tickers key)."""
+        path = Path(__file__).resolve().parent.parent / "config" / "watchlist.yaml"
+        try:
+            with open(path) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            us = cfg.get("us_tickers")
+            if us:
+                return us
+        except Exception:
+            pass
+        # Fallback: full watchlist minus XETRA
+        return [t for t in DEFAULT_WATCHLIST if not t.endswith(".XETRA")]
+
+    @staticmethod
+    def _load_xetra_tickers() -> list[str]:
+        """Load XETRA tickers from watchlist.yaml (xetra_tickers key)."""
+        path = Path(__file__).resolve().parent.parent / "config" / "watchlist.yaml"
+        try:
+            with open(path) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            xetra = cfg.get("xetra_tickers")
+            if xetra:
+                return xetra
+        except Exception:
+            pass
+        return _XETRA_TICKERS
 
     @staticmethod
     def _build_telegram():
@@ -409,6 +448,21 @@ class DailyScheduler:
             except Exception as exc:
                 log.warning("Telegram startup notification failed: %s", exc)
 
+        # Start the intraday position manager (stop-loss / trailing-stop monitor)
+        position_manager = None
+        try:
+            from execution.broker_factory import create_trader
+            from monitoring.position_manager import PositionManager
+            trader = create_trader()
+            position_manager = PositionManager(
+                trader=trader, notifier=self._tg,
+            )
+            position_manager.start()
+            log.info("PositionManager background thread started")
+            print("[scheduler] PositionManager started (60s interval)", flush=True)
+        except Exception as exc:
+            log.warning("PositionManager startup failed (non-fatal): %s", exc)
+
         # Run once immediately on startup if within trading hours
         last_executed: str | None = None
         session = self.current_session()
@@ -420,46 +474,53 @@ class DailyScheduler:
                 self._execute_run(startup_run)
                 last_executed = startup_run["name"]
 
-        while True:
-            try:
-                nrt = self.next_run_time()
-                wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
-                run_info = self._run_for_time(nrt)
-                run_name = run_info["name"] if run_info else "UNKNOWN"
+        try:
+            while True:
+                try:
+                    nrt = self.next_run_time()
+                    wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
+                    run_info = self._run_for_time(nrt)
+                    run_name = run_info["name"] if run_info else "UNKNOWN"
 
-                # Skip if this is the same session we just ran at startup
-                if run_info and run_info["name"] == last_executed and wait_s == 0:
-                    log.info("Skipping %s — already executed at startup", run_name)
-                    print(f"[scheduler] Skipping {run_name} — already ran at startup",
+                    # Skip if this is the same session we just ran at startup
+                    if run_info and run_info["name"] == last_executed and wait_s == 0:
+                        log.info("Skipping %s — already executed at startup", run_name)
+                        print(f"[scheduler] Skipping {run_name} — already ran at startup",
+                              flush=True)
+                        last_executed = None  # only skip once
+                        continue
+
+                    print(f"[scheduler] Next: {run_name} at "
+                          f"{nrt.strftime('%Y-%m-%d %H:%M')} UTC ({wait_s}s away)",
                           flush=True)
-                    last_executed = None  # only skip once
-                    continue
+                    log.info("Sleeping %ds until %s at %s", wait_s, run_name,
+                             nrt.strftime("%H:%M"))
 
-                print(f"[scheduler] Next: {run_name} at "
-                      f"{nrt.strftime('%Y-%m-%d %H:%M')} UTC ({wait_s}s away)",
-                      flush=True)
-                log.info("Sleeping %ds until %s at %s", wait_s, run_name,
-                         nrt.strftime("%H:%M"))
+                    time.sleep(wait_s)
 
-                time.sleep(wait_s)
+                    if run_info:
+                        self._execute_run(run_info)
+                        last_executed = run_info["name"]
 
-                if run_info:
-                    self._execute_run(run_info)
-                    last_executed = run_info["name"]
-
-            except Exception as exc:
-                log.error("Unhandled exception in scheduler loop: %s", exc,
-                          exc_info=True)
-                print(f"[scheduler] LOOP ERROR (restarting in 60s): {exc}", flush=True)
-                if self._tg:
-                    try:
-                        self._tg._send(
-                            f"\U0001f6a8 *Scheduler loop crashed:*\n"
-                            f"{str(exc)[:300]}\nRestarting in 60s\u2026"
-                        )
-                    except Exception:
-                        pass
-                time.sleep(60)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    log.error("Unhandled exception in scheduler loop: %s", exc,
+                              exc_info=True)
+                    print(f"[scheduler] LOOP ERROR (restarting in 60s): {exc}", flush=True)
+                    if self._tg:
+                        try:
+                            self._tg._send(
+                                f"\U0001f6a8 *Scheduler loop crashed:*\n"
+                                f"{str(exc)[:300]}\nRestarting in 60s\u2026"
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(60)
+        finally:
+            if position_manager is not None:
+                position_manager.stop()
+                log.info("PositionManager stopped on shutdown")
 
     # ── Execution ─────────────────────────────────────────────────────
 
@@ -478,10 +539,17 @@ class DailyScheduler:
 
     def _execute_run(self, run: dict) -> None:
         run_name = run["name"]
-        tickers = run["tickers"] or self._full_watchlist
-        if run["name"] != "XETRA_OPEN":
+        session_type = run.get("session_type", "signal")
+
+        # Resolve ticker list based on session
+        if run["name"] == "XETRA_OPEN":
+            tickers = run["tickers"] or self._load_xetra_tickers()
+        else:
+            tickers = run["tickers"] or self._load_us_tickers()
+            # Safety belt: also strip any XETRA tickers that snuck in
             tickers = [t for t in tickers if not t.endswith(".XETRA")]
             log.info("Excluded XETRA tickers from %s session", run["name"])
+
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
 
@@ -489,15 +557,15 @@ class DailyScheduler:
         if self._tg:
             try:
                 self._tg._send(
-                    f"\U0001f558 *{run_name}* run starting \u2014 {now_str} UTC\n"
+                    f"\U0001f558 *{run_name}* ({session_type}) starting \u2014 {now_str} UTC\n"
                     f"Tickers: {', '.join(tickers)}"
                 )
             except Exception as exc:
                 log.warning("Telegram session-start notification failed: %s", exc)
 
-        log.info("Starting %s: %d tickers, %d workers",
-                 run_name, len(tickers), workers)
-        print(f"[scheduler] Running {run_name}: {', '.join(tickers)} "
+        log.info("Starting %s [%s]: %d tickers, %d workers",
+                 run_name, session_type, len(tickers), workers)
+        print(f"[scheduler] Running {run_name} [{session_type}]: {', '.join(tickers)} "
               f"({workers} workers)", flush=True)
 
         execute, reason = _is_execution_allowed()
@@ -505,6 +573,16 @@ class DailyScheduler:
             log.warning("Trade execution DISABLED: %s", reason)
             print(f"[scheduler] Execution disabled ({reason}) — analysis only",
                   flush=True)
+
+        # Expire stale forward signals before execution sessions
+        if session_type == "execution":
+            try:
+                from analytics.signal_logger import SignalLogger
+                expired = SignalLogger().expire_stale_forward_signals()
+                if expired:
+                    log.info("Expired %d stale forward signals", expired)
+            except Exception as exc:
+                log.warning("Forward signal expiry failed (non-fatal): %s", exc)
 
         try:
             batch = asyncio.run(
@@ -514,6 +592,7 @@ class DailyScheduler:
                     account_balance=10_000.0,
                     execute=execute,
                     session=run_name,
+                    session_type=session_type,
                 )
             )
 
