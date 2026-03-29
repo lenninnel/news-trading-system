@@ -55,12 +55,20 @@ Requires:
 
 from __future__ import annotations
 
+import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
+import yfinance as yf
+
 from agents.base_agent import BaseAgent
+from config.settings import DRAWDOWN_HALT_THRESHOLD
 from data.events_feed import get_days_to_earnings
 from storage.database import Database
+
+log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
 _MAX_PORTFOLIO_FRACTION = 0.10   # 10 % portfolio cap
@@ -70,6 +78,14 @@ _REWARD_RISK_RATIO      = 2.0    # 2:1 take-profit
 _MIN_CONFIDENCE         = 30.0   # below this → no position
 _WIN_PROB_BASE          = 0.50   # base win probability (random)
 _WIN_PROB_RANGE         = 0.30   # additional range driven by confidence
+
+# Historical Kelly constants
+_HISTORICAL_KELLY_MIN_TRADES = 10  # need ≥10 outcomes for historical Kelly
+_HISTORICAL_KELLY_CAP        = 0.05  # 5 % hard cap per position
+_HISTORICAL_KELLY_FALLBACK   = 0.02  # fixed 2 % when insufficient data
+
+# Portfolio VaR z-scores (avoids scipy dependency)
+_Z_SCORES: dict[float, float] = {0.90: 1.282, 0.95: 1.645, 0.99: 2.326}
 
 # Regime-based position multipliers
 _REGIME_MULTIPLIER: dict[str, float] = {
@@ -260,7 +276,13 @@ class RiskAgent(BaseAgent):
         stop_pct = _STOP_PCT[strength]
 
         # -- 3. Kelly Criterion sizing --------------------------------------
-        kelly = _kelly_fraction(confidence)
+        # Use historical win rate when ≥10 outcomes exist; otherwise fall
+        # back to the confidence-based estimate (2 % risk budget still
+        # applies via _MAX_RISK_FRACTION regardless).
+        historical_kelly = self.calculate_kelly_position(
+            ticker, signal, confidence, account_balance,
+        )
+        kelly = historical_kelly if historical_kelly is not None else _kelly_fraction(confidence)
 
         max_by_kelly     = account_balance * kelly
         max_by_portfolio = account_balance * _MAX_PORTFOLIO_FRACTION
@@ -288,8 +310,12 @@ class RiskAgent(BaseAgent):
                 f"Price ${current_price:.2f} exceeds affordable position "
                 f"(budget: ${position_after_cost:.2f})"
             )
-            return self._no_position(ticker, signal, confidence, current_price,
-                                     account_balance, skip_reason)
+            result = self._no_position(ticker, signal, confidence, current_price,
+                                       account_balance, skip_reason)
+            result["event_risk_flag"] = event_risk_flag
+            result["days_to_earnings"] = days_to_earn
+            result["regime"] = regime
+            return result
 
         # Recalculate on whole-share basis
         position_size_usd = shares * current_price
@@ -395,3 +421,216 @@ class RiskAgent(BaseAgent):
             "days_to_earnings": days_to_earnings,
             "regime":           regime,
         }
+
+    # ------------------------------------------------------------------
+    # Historical Kelly Criterion
+    # ------------------------------------------------------------------
+
+    def calculate_kelly_position(
+        self,
+        ticker: str,
+        signal: str,
+        confidence: float,
+        account_balance: float,
+    ) -> float | None:
+        """
+        Kelly criterion using historical signal outcomes.
+
+        ``f* = (b·p − q) / b`` where:
+        - *p* = win rate from signal_events history
+        - *q* = 1 − p
+        - *b* = avg win / avg loss ratio (from outcome_5d_pct)
+
+        Falls back to ``None`` when fewer than 10 outcomes exist
+        (caller should use fixed 2 %).  Uses half-Kelly (0.5×) and
+        caps at 5 % regardless of Kelly output.
+        """
+        try:
+            rows = self._query_outcomes(ticker)
+            if len(rows) < _HISTORICAL_KELLY_MIN_TRADES:
+                # Try portfolio-wide
+                rows = self._query_outcomes(None)
+            if len(rows) < _HISTORICAL_KELLY_MIN_TRADES:
+                return None
+
+            wins = [r for r in rows if r["outcome_correct"] == 1]
+            losses = [r for r in rows if r["outcome_correct"] == 0]
+            p = len(wins) / len(rows)
+            q = 1.0 - p
+
+            avg_win = (
+                sum(abs(r["outcome_5d_pct"]) for r in wins) / len(wins)
+                if wins else 0.0
+            )
+            avg_loss = (
+                sum(abs(r["outcome_5d_pct"]) for r in losses) / len(losses)
+                if losses else 0.0
+            )
+
+            b = avg_win / avg_loss if avg_loss > 0 else 10.0
+            kelly_star = (b * p - q) / b
+            kelly = max(0.0, kelly_star * 0.5)          # half-Kelly
+            kelly = min(kelly, _HISTORICAL_KELLY_CAP)    # 5 % cap
+            return kelly
+
+        except Exception as exc:
+            log.debug("Historical Kelly failed (non-fatal): %s", exc)
+            return None
+
+    def _query_outcomes(self, ticker: str | None) -> list[dict]:
+        """Read signal_events rows that have outcome data."""
+        try:
+            with self._db._connect() as conn:
+                if ticker:
+                    rows = conn.execute(
+                        "SELECT outcome_correct, outcome_5d_pct "
+                        "FROM signal_events "
+                        "WHERE ticker = ? AND outcome_correct IS NOT NULL "
+                        "AND outcome_5d_pct IS NOT NULL",
+                        (ticker.upper(),),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT outcome_correct, outcome_5d_pct "
+                        "FROM signal_events "
+                        "WHERE outcome_correct IS NOT NULL "
+                        "AND outcome_5d_pct IS NOT NULL",
+                    ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # Portfolio VaR
+    # ------------------------------------------------------------------
+
+    def calculate_portfolio_var(
+        self,
+        positions: list[dict],
+        confidence_level: float = 0.95,
+        lookback_days: int = 252,
+    ) -> dict:
+        """
+        Parametric Value-at-Risk for the current portfolio.
+
+        Args:
+            positions:        List of dicts with ``ticker`` and ``current_value``.
+            confidence_level: Confidence level (0.90, 0.95, or 0.99).
+            lookback_days:    Trading days of history for covariance estimation.
+
+        Returns:
+            dict with var_1day, var_1day_pct, var_5day, should_halt, reasoning.
+        """
+        if not positions:
+            return {
+                "var_1day": 0.0, "var_1day_pct": 0.0, "var_5day": 0.0,
+                "should_halt": False, "reasoning": "No positions.",
+            }
+
+        total_value = sum(p.get("current_value", 0) for p in positions)
+        if total_value <= 0:
+            return {
+                "var_1day": 0.0, "var_1day_pct": 0.0, "var_5day": 0.0,
+                "should_halt": False, "reasoning": "Portfolio value is zero.",
+            }
+
+        # Convert XETRA tickers for yfinance
+        raw_tickers = [p["ticker"] for p in positions]
+        yf_tickers = [self._yf_ticker(t) for t in raw_tickers]
+        weights = np.array([p.get("current_value", 0) / total_value for p in positions])
+
+        # Fetch historical prices
+        try:
+            period = "1y" if lookback_days <= 252 else f"{lookback_days}d"
+            data = yf.download(
+                yf_tickers, period=period, interval="1d",
+                progress=False, auto_adjust=True,
+            )
+            if data.empty:
+                return {
+                    "var_1day": 0.0, "var_1day_pct": 0.0, "var_5day": 0.0,
+                    "should_halt": True,
+                    "reasoning": "No price data available — halting conservatively.",
+                }
+
+            # Extract Close prices
+            if len(yf_tickers) == 1:
+                closes = data[["Close"]].rename(columns={"Close": yf_tickers[0]})
+            else:
+                closes = data["Close"]
+
+            # Daily log returns
+            returns = np.log(closes / closes.shift(1)).dropna()
+            if returns.empty or len(returns) < 20:
+                return {
+                    "var_1day": 0.0, "var_1day_pct": 0.0, "var_5day": 0.0,
+                    "should_halt": True,
+                    "reasoning": "Insufficient return data — halting conservatively.",
+                }
+
+            # Covariance matrix
+            cov_matrix = returns.cov().values
+
+            # Portfolio variance and std
+            port_variance = float(weights @ cov_matrix @ weights)
+            port_daily_std = math.sqrt(port_variance)
+
+            # z-score
+            z = _Z_SCORES.get(confidence_level, 1.645)
+
+            var_1day = z * port_daily_std * total_value
+            var_1day_pct = z * port_daily_std
+            var_5day = var_1day * math.sqrt(5)
+            should_halt = var_1day_pct > 0.03
+
+            reasoning = (
+                f"1-day VaR at {confidence_level:.0%}: "
+                f"${var_1day:,.2f} ({var_1day_pct:.2%} of portfolio). "
+            )
+            if should_halt:
+                reasoning += "HALT: exceeds 3% threshold."
+            else:
+                reasoning += "Within acceptable limits."
+
+            return {
+                "var_1day": round(var_1day, 2),
+                "var_1day_pct": round(var_1day_pct, 4),
+                "var_5day": round(var_5day, 2),
+                "should_halt": should_halt,
+                "reasoning": reasoning,
+            }
+
+        except Exception as exc:
+            log.warning("Portfolio VaR calculation failed: %s", exc)
+            return {
+                "var_1day": 0.0, "var_1day_pct": 0.0, "var_5day": 0.0,
+                "should_halt": True,
+                "reasoning": f"VaR calculation failed ({exc}) — halting conservatively.",
+            }
+
+    @staticmethod
+    def _yf_ticker(ticker: str) -> str:
+        """Convert internal ticker format to yfinance format."""
+        if ticker.endswith(".XETRA"):
+            return ticker.replace(".XETRA", ".DE")
+        return ticker
+
+    # ------------------------------------------------------------------
+    # Drawdown halt
+    # ------------------------------------------------------------------
+
+    def check_drawdown_halt(
+        self,
+        current_portfolio_value: float,
+        peak_portfolio_value: float,
+    ) -> bool:
+        """
+        Return True if the portfolio has drawn down beyond the halt threshold.
+
+        The threshold defaults to 10 % (configurable via DRAWDOWN_HALT_THRESHOLD
+        in config/settings.py or the environment).
+        """
+        if peak_portfolio_value <= 0:
+            return False
+        drawdown = (peak_portfolio_value - current_portfolio_value) / peak_portfolio_value
+        return drawdown > DRAWDOWN_HALT_THRESHOLD

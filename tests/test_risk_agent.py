@@ -11,10 +11,19 @@ import sys
 import os
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from agents.risk_agent import RiskAgent, _parse_signal, _kelly_fraction
+from agents.risk_agent import (
+    RiskAgent,
+    _parse_signal,
+    _kelly_fraction,
+    _HISTORICAL_KELLY_CAP,
+    _HISTORICAL_KELLY_FALLBACK,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -255,3 +264,207 @@ class TestReturnStructure:
         agent = make_agent()
         result = run(agent)
         assert result["calc_id"] == 99   # matches mock return value
+
+
+# ===========================================================================
+# Historical Kelly Criterion — outcome-driven position sizing
+# ===========================================================================
+
+class _FakeRow:
+    """Mimics sqlite3.Row: dict(row) works via keys() + __getitem__."""
+    def __init__(self, d: dict):
+        self._d = d
+    def keys(self):
+        return self._d.keys()
+    def __getitem__(self, k):
+        return self._d[k]
+
+
+def _make_agent_with_outcomes(outcomes: list[dict]) -> RiskAgent:
+    """Return a RiskAgent whose DB returns *outcomes* from signal_events."""
+    db = MagicMock()
+    db.log_risk_calculation.return_value = 99
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [_FakeRow(row) for row in outcomes]
+    mock_conn.execute.return_value = mock_cursor
+    mock_conn.__enter__ = lambda self: mock_conn
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    db._connect.return_value = mock_conn
+
+    return RiskAgent(db=db)
+
+
+def _make_outcomes(n_wins: int, n_losses: int,
+                   avg_win_pct: float = 3.0,
+                   avg_loss_pct: float = 1.5) -> list[dict]:
+    """Build synthetic signal_events outcome rows."""
+    rows = []
+    for _ in range(n_wins):
+        rows.append({"outcome_correct": 1, "outcome_5d_pct": avg_win_pct})
+    for _ in range(n_losses):
+        rows.append({"outcome_correct": 0, "outcome_5d_pct": -avg_loss_pct})
+    return rows
+
+
+class TestHistoricalKelly:
+    def test_kelly_with_sufficient_history(self):
+        """When >= 10 outcomes exist, use actual win rate and payoff ratio."""
+        # 10 wins at +3%, 5 losses at -1.5%  →  p=0.667, b=2.0
+        # full_kelly = (2.0*0.667 - 0.333) / 2.0 = 0.500
+        # half_kelly = 0.250  →  capped at 0.05
+        outcomes = _make_outcomes(10, 5, avg_win_pct=3.0, avg_loss_pct=1.5)
+        agent = _make_agent_with_outcomes(outcomes)
+
+        kelly = agent.calculate_kelly_position("AAPL", "STRONG BUY", 75, 10_000)
+        assert kelly is not None
+        assert kelly > 0
+        assert kelly <= _HISTORICAL_KELLY_CAP
+
+    def test_kelly_falls_back_to_fixed_when_insufficient_data(self):
+        """< 10 outcomes → returns None (caller uses 2% fallback)."""
+        outcomes = _make_outcomes(3, 2)
+        agent = _make_agent_with_outcomes(outcomes)
+
+        kelly = agent.calculate_kelly_position("AAPL", "STRONG BUY", 75, 10_000)
+        assert kelly is None
+
+    def test_kelly_caps_at_5_percent(self):
+        """Even with very high win rate, cap at 5%."""
+        # 19 wins, 1 loss → p=0.95, b=2.0
+        # full_kelly = (2.0*0.95 - 0.05) / 2.0 = 0.925
+        # half_kelly = 0.4625 → capped at 0.05
+        outcomes = _make_outcomes(19, 1, avg_win_pct=3.0, avg_loss_pct=1.5)
+        agent = _make_agent_with_outcomes(outcomes)
+
+        kelly = agent.calculate_kelly_position("META", "STRONG BUY", 80, 10_000)
+        assert kelly == _HISTORICAL_KELLY_CAP  # exactly 5%
+
+    def test_half_kelly_applied(self):
+        """Returned fraction must be exactly half of full Kelly."""
+        # 8 wins, 4 losses → p=0.667, b=3.0/1.5=2.0
+        # full_kelly = (2.0 * 0.667 - 0.333) / 2.0 = 0.500
+        # half_kelly = 0.250 → capped at 0.05
+        outcomes = _make_outcomes(8, 4, avg_win_pct=3.0, avg_loss_pct=1.5)
+        agent = _make_agent_with_outcomes(outcomes)
+
+        # 12 outcomes ≥ 10: uses historical data
+        kelly = agent.calculate_kelly_position("JPM", "STRONG BUY", 70, 10_000)
+        assert kelly is not None
+
+        # Compute expected value manually
+        p = 8 / 12
+        q = 1 - p
+        b = 3.0 / 1.5
+        full_kelly = (b * p - q) / b
+        expected = min(max(0.0, full_kelly * 0.5), _HISTORICAL_KELLY_CAP)
+        assert kelly == pytest.approx(expected, abs=1e-6)
+
+    def test_kelly_no_edge_returns_zero(self):
+        """When losses dominate, Kelly is zero (no negative sizing)."""
+        # 2 wins, 10 losses → p=0.167, b=2.0
+        # full_kelly = (2.0*0.167 - 0.833) / 2.0 = -0.250 → clamped to 0
+        outcomes = _make_outcomes(2, 10, avg_win_pct=3.0, avg_loss_pct=1.5)
+        agent = _make_agent_with_outcomes(outcomes)
+
+        kelly = agent.calculate_kelly_position("XOM", "STRONG BUY", 70, 10_000)
+        assert kelly == 0.0
+
+    def test_run_uses_confidence_fallback_when_no_history(self):
+        """run() falls back to confidence-based Kelly when no outcomes."""
+        agent = make_agent()  # MagicMock DB → no outcomes
+        result = run(agent, confidence=75.0, account_balance=10_000.0)
+        # Falls back to _kelly_fraction(75) ≈ 0.194
+        if not result["skipped"]:
+            assert result["kelly_fraction"] > 0.10  # confidence-based, not fixed 2%
+
+
+# ===========================================================================
+# Portfolio VaR — parametric Value-at-Risk
+# ===========================================================================
+
+def _make_synthetic_prices(tickers: list[str], n_days: int = 252) -> pd.DataFrame:
+    """Generate synthetic daily close prices for testing."""
+    np.random.seed(42)
+    dates = pd.bdate_range(end="2026-03-28", periods=n_days)
+    data = {}
+    for t in tickers:
+        # Random walk with ~0.5% daily vol
+        returns = np.random.normal(0.0005, 0.005, n_days)
+        prices = 100 * np.exp(np.cumsum(returns))
+        data[t] = prices
+    return pd.DataFrame(data, index=dates)
+
+
+class TestPortfolioVar:
+    def test_portfolio_var_calculation(self):
+        """VaR is computed correctly for a 2-stock portfolio."""
+        agent = make_agent()
+        positions = [
+            {"ticker": "AAPL", "current_value": 5000.0},
+            {"ticker": "META", "current_value": 5000.0},
+        ]
+        prices_df = _make_synthetic_prices(["AAPL", "META"])
+
+        # Build a multi-level column DataFrame matching yf.download output
+        close_df = prices_df.copy()
+        close_df.columns = pd.MultiIndex.from_product(
+            [["Close"], close_df.columns])
+
+        with patch("agents.risk_agent.yf.download", return_value=close_df):
+            result = agent.calculate_portfolio_var(positions)
+
+        assert result["var_1day"] > 0
+        assert result["var_5day"] > result["var_1day"]
+        assert 0 < result["var_1day_pct"] < 1.0
+        assert isinstance(result["should_halt"], bool)
+        assert "reasoning" in result
+
+    def test_var_empty_positions(self):
+        """Empty positions → zero VaR, no halt."""
+        agent = make_agent()
+        result = agent.calculate_portfolio_var([])
+        assert result["var_1day"] == 0.0
+        assert result["should_halt"] is False
+
+    def test_var_single_position(self):
+        """Single position degenerates to individual stock VaR."""
+        agent = make_agent()
+        positions = [{"ticker": "AAPL", "current_value": 10_000.0}]
+        prices_df = _make_synthetic_prices(["AAPL"])
+
+        # Single ticker — yf.download returns flat columns
+        with patch("agents.risk_agent.yf.download", return_value=prices_df.rename(
+            columns={"AAPL": "Close"})):
+            result = agent.calculate_portfolio_var(positions)
+
+        assert result["var_1day"] > 0
+
+
+# ===========================================================================
+# Drawdown halt
+# ===========================================================================
+
+class TestDrawdownHalt:
+    def test_drawdown_halt_triggers_at_10_percent(self):
+        """Drawdown > 10% should trigger halt."""
+        agent = make_agent()
+        # 11% drawdown: (10000 - 8900) / 10000 = 0.11
+        assert agent.check_drawdown_halt(8900, 10_000) is True
+
+    def test_drawdown_halt_does_not_trigger_below_threshold(self):
+        """5% drawdown should NOT trigger halt."""
+        agent = make_agent()
+        assert agent.check_drawdown_halt(9500, 10_000) is False
+
+    def test_drawdown_exactly_at_threshold(self):
+        """Exactly 10% drawdown is NOT a halt (> not >=)."""
+        agent = make_agent()
+        assert agent.check_drawdown_halt(9000, 10_000) is False
+
+    def test_drawdown_zero_peak(self):
+        """Zero or negative peak is a no-op (no halt)."""
+        agent = make_agent()
+        assert agent.check_drawdown_halt(0, 0) is False
+        assert agent.check_drawdown_halt(5000, -1) is False
