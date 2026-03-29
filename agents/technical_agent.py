@@ -42,7 +42,7 @@ import pandas as pd
 import ta
 
 from agents.base_agent import BaseAgent
-from config.settings import CRYPTO_TICKERS, is_german_ticker
+from config.settings import CRYPTO_TICKERS, USE_IBKR_DATA, is_german_ticker
 from data.binance_feed import BinanceFeed
 from data.eodhd_feed import EODHDFeed
 from data.yfinance_feed import YFinanceFeed
@@ -82,6 +82,7 @@ class TechnicalAgent(BaseAgent):
         eodhd_feed: EODHDFeed | None = None,
         yfinance_feed: YFinanceFeed | None = None,
         alpaca_client: object | None = None,
+        ibkr_feed: object | None = None,
     ) -> None:
         self._db = db or Database()
         self._binance = binance_feed or BinanceFeed()
@@ -89,6 +90,15 @@ class TechnicalAgent(BaseAgent):
         # alpaca_client accepted for backward compat (tests pass a mock
         # whose .get_bars() returns the same OHLCV DataFrame format)
         self._yf = yfinance_feed or alpaca_client or YFinanceFeed()
+
+        # IBKR intraday feed (lazy-loaded when USE_IBKR_DATA=true)
+        self._ibkr_feed = ibkr_feed
+        if self._ibkr_feed is None and USE_IBKR_DATA:
+            try:
+                from data.ibkr_feed import IBKRFeed
+                self._ibkr_feed = IBKRFeed()
+            except Exception as exc:
+                logger.warning("IBKR feed init failed, using yfinance: %s", exc)
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -291,9 +301,14 @@ class TechnicalAgent(BaseAgent):
         rsi_1h: float | None = None
         macd_15m_hist: float | None = None
 
+        # Pick the intraday data source
+        intraday_src = self._ibkr_feed if self._ibkr_feed is not None else self._yf
+        src_name = "IBKR" if self._ibkr_feed is not None else "yfinance"
+
         # --- 1-hour bars → RSI-14 ---
         try:
-            df_1h = self._yf.get_bars(ticker, "1Hour", limit=100)
+            df_1h = intraday_src.get_bars(ticker, "1Hour", limit=100)
+            logger.debug("1h bars for %s from %s", ticker, src_name)
             if df_1h is not None and len(df_1h) >= 20:
                 close_1h = safe_column(df_1h, "Close")
                 rsi_series = ta.momentum.RSIIndicator(close=close_1h, window=14).rsi()
@@ -305,7 +320,8 @@ class TechnicalAgent(BaseAgent):
 
         # --- 15-minute bars → MACD histogram ---
         try:
-            df_15m = self._yf.get_bars(ticker, "15Min", limit=100)
+            df_15m = intraday_src.get_bars(ticker, "15Min", limit=100)
+            logger.debug("15m bars for %s from %s", ticker, src_name)
             if df_15m is not None and len(df_15m) >= 30:
                 close_15m = safe_column(df_15m, "Close")
                 macd_obj = ta.trend.MACD(

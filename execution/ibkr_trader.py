@@ -20,6 +20,8 @@ import os
 import sys
 from typing import Any
 
+import pandas as pd
+
 from storage.database import Database
 
 log = logging.getLogger(__name__)
@@ -275,6 +277,84 @@ class IBKRTrader:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Bar data
+    # ------------------------------------------------------------------
+
+    # Timeframe mapping: our convention → IBKR (barSizeSetting, durationStr)
+    _BAR_MAP: dict[str, tuple[str, str]] = {
+        "1Day":  ("1 day",   "1 Y"),
+        "1Hour": ("1 hour",  "5 D"),
+        "15Min": ("15 mins", "2 D"),
+    }
+
+    def get_bars(
+        self,
+        ticker: str,
+        timeframe: str = "1Day",
+        limit: int = 252,
+    ) -> pd.DataFrame:
+        """Fetch OHLCV bars from IB Gateway.
+
+        Args:
+            ticker:    Stock symbol (XETRA suffixes are stripped).
+            timeframe: ``"1Day"``, ``"1Hour"``, or ``"15Min"``.
+            limit:     Number of bars to return (most recent).
+
+        Returns:
+            DataFrame with columns: Open, High, Low, Close, Volume.
+        """
+        if timeframe not in self._BAR_MAP:
+            raise ValueError(
+                f"Unsupported timeframe '{timeframe}'. "
+                f"Supported: {', '.join(self._BAR_MAP)}"
+            )
+
+        bar_size, duration = self._BAR_MAP[timeframe]
+
+        # XETRA tickers: SAP.XETRA → SAP (IBKR uses exchange routing)
+        symbol = ticker.upper()
+        if symbol.endswith(".XETRA"):
+            symbol = symbol.rsplit(".", 1)[0]
+        elif symbol.endswith(".DE"):
+            symbol = symbol.rsplit(".", 1)[0]
+
+        contract = self._Stock(symbol, "SMART", "USD")
+        self._ib.qualifyContracts(contract)
+
+        bars = self._ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+
+        if not bars:
+            raise ValueError(f"IBKR returned no bars for {ticker} ({timeframe})")
+
+        rows = [
+            {
+                "date": b.date,
+                "Open": b.open,
+                "High": b.high,
+                "Low": b.low,
+                "Close": b.close,
+                "Volume": int(b.volume),
+            }
+            for b in bars
+        ]
+        df = pd.DataFrame(rows).set_index("date")
+
+        # Trim to requested limit (keep most recent)
+        if len(df) > limit:
+            df = df.iloc[-limit:]
+
+        log.debug("IBKR bars: %s → %d bars (%s)", ticker, len(df), timeframe)
+        return df
 
     def get_trade_history(
         self,
