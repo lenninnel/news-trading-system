@@ -109,7 +109,7 @@ DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
 # ---------------------------------------------------------------------------
 
 IBKR_HOST: str = os.environ.get("IBKR_HOST", "127.0.0.1")
-IBKR_PORT: int = int(os.environ.get("IBKR_PORT", "0"))  # 0 = auto (7497 paper / 7496 live)
+IBKR_PORT: int = int(os.environ.get("IBKR_PORT", "0"))  # 0 = auto (4002 paper / 4001 live)
 IBKR_CLIENT_ID: int = int(os.environ.get("IBKR_CLIENT_ID", "1"))
 IBKR_PAPER: bool = os.environ.get("IBKR_PAPER", "true").lower() in ("true", "1", "yes")
 

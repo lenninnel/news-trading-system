@@ -8,7 +8,7 @@ interchangeable behind broker_factory.
 Environment variables
 ---------------------
 IBKR_HOST         IB Gateway hostname (default "127.0.0.1")
-IBKR_PORT         IB Gateway port (default auto: 7497 paper / 7496 live)
+IBKR_PORT         IB Gateway port (default auto: 4002 paper / 4001 live)
 IBKR_CLIENT_ID    TWS API client ID (default 1)
 IBKR_PAPER        "true" (default) or "false" for live trading
 """
@@ -54,7 +54,7 @@ class IBKRTrader:
 
         paper = os.environ.get("IBKR_PAPER", "true").lower() in ("true", "1", "yes")
         host = os.environ.get("IBKR_HOST", "127.0.0.1")
-        default_port = 7497 if paper else 7496
+        default_port = 4002 if paper else 4001
         port = int(os.environ.get("IBKR_PORT", str(default_port)))
         client_id = int(os.environ.get("IBKR_CLIENT_ID", "1"))
 

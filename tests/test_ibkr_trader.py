@@ -43,16 +43,16 @@ def _make_trader(ib=None, **env_overrides):
 class TestIBKRConnection:
 
     def test_connect_paper_port(self):
-        """Paper mode uses port 7497 by default."""
+        """Paper mode uses port 4002 by default (IB Gateway)."""
         trader, _, _ = _make_trader(IBKR_PAPER="true")
         assert trader._paper is True
-        assert trader._port == 7497
+        assert trader._port == 4002
 
     def test_connect_live_port(self):
-        """Live mode uses port 7496 by default."""
+        """Live mode uses port 4001 by default (IB Gateway)."""
         trader, _, _ = _make_trader(IBKR_PAPER="false")
         assert trader._paper is False
-        assert trader._port == 7496
+        assert trader._port == 4001
 
     def test_custom_port_overrides_default(self):
         """Explicit IBKR_PORT overrides the paper/live default."""
@@ -77,7 +77,7 @@ class TestIBKRConnection:
         # Verify that calling connect on the mock raises as expected
         with pytest.raises(ConnectionError):
             try:
-                mock_ib.connect("127.0.0.1", 7497, clientId=1, timeout=10)
+                mock_ib.connect("127.0.0.1", 4002, clientId=1, timeout=10)
             except Exception as exc:
                 raise ConnectionError(f"Cannot connect: {exc}") from exc
 
