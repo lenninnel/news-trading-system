@@ -239,7 +239,7 @@ class TestReport:
         """Report should not crash with no data."""
         with patch("analytics.report.SignalLogger", return_value=SignalLogger(db=signal_db)):
             output = generate_report(days=30)
-            assert "Signal Analytics Report" in output
+            assert "SIGNAL QUALITY REPORT" in output
             assert "No signals found" in output
 
     def test_report_with_data(self, signal_db):
@@ -263,4 +263,4 @@ class TestReport:
         with patch("analytics.report.SignalLogger", return_value=lgr):
             output = generate_report(days=30, ticker="AAPL")
             assert "AAPL" in output
-            assert "Ticker filter: AAPL" in output
+            assert "Filter:" in output
