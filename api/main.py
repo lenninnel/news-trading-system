@@ -40,6 +40,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:3001",
         "https://news-trading-system-production.up.railway.app",
+        "http://195.201.124.154:3000",
     ],
     allow_credentials=True,
     allow_methods=["GET"],
