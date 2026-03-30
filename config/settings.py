@@ -196,6 +196,9 @@ TICKER_TO_COMPANY: dict[str, str] = {
 # Adanos — disabled by default (free tier quota too small)
 ADANOS_ENABLED: bool = os.environ.get("ADANOS_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# Pre-market sessions (XETRA_PRE, US_PRE) — lightweight signal refresh
+ENABLE_PRE_SESSIONS: bool = os.environ.get("ENABLE_PRE_SESSIONS", "true").lower() in ("true", "1", "yes")
+
 
 # ---------------------------------------------------------------------------
 # Optimized trend-following parameters (2-stage walk-forward, 2023–2025)

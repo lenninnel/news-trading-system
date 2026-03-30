@@ -919,6 +919,14 @@ class Coordinator:
                 db_lock=db_lock,
                 session=session,
             )
+        if session_type == "pre_signal":
+            return await self._pre_signal_refresh_async(
+                ticker,
+                api_semaphore=api_semaphore,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                session=session,
+            )
 
         t0 = _time.monotonic()
         ticker = ticker.upper()
@@ -1310,6 +1318,151 @@ class Coordinator:
             "take_profit": take_profit,
             "distance_to_stop_pct": dist_to_stop,
             "distance_to_tp_pct": dist_to_tp,
+            "elapsed_s": round(elapsed, 2),
+        }
+
+    # ------------------------------------------------------------------
+    # Pre-signal mode (XETRA_PRE, US_PRE — news + sentiment refresh)
+    # ------------------------------------------------------------------
+
+    _PRE_CONVICTION_DELTA = 0.10  # only update forward signal if >10% change
+
+    async def _pre_signal_refresh_async(
+        self,
+        ticker: str,
+        *,
+        api_semaphore: asyncio.Semaphore,
+        data_semaphore: asyncio.Semaphore,
+        db_lock: asyncio.Lock,
+        session: str | None = None,
+    ) -> dict:
+        """
+        Lightweight signal refresh — news + sentiment + debate only.
+
+        Skips: technical analysis, position sizing, execution.
+        Only updates the forward signal if conviction changed by >10%.
+        """
+        t0 = _time.monotonic()
+        ticker = ticker.upper()
+        log.info("[%s] Refreshing signals (pre-session)", ticker)
+
+        # ── Phase 1: Data fetches ─────────────────────────────────────
+        async with data_semaphore:
+            newsapi_headlines = await asyncio.to_thread(
+                self.news_feed.fetch, ticker,
+            )
+            stocktwits_items = await asyncio.to_thread(
+                self.stocktwits_feed.fetch, ticker,
+            )
+            marketaux_items = await asyncio.to_thread(
+                self.marketaux_feed.fetch, ticker,
+                self._last_combined_signal(ticker),
+            )
+
+        items: list[dict] = []
+        for h in newsapi_headlines:
+            items.append({"text": h, "source": "newsapi"})
+        for st_item in stocktwits_items:
+            items.append({"text": st_item["text"], "source": "stocktwits"})
+        for mx in marketaux_items:
+            items.append({"text": mx["text"], "source": "marketaux"})
+
+        # ── Phase 2: Sentiment scoring (Claude API) ───────────────────
+        scored: list[dict] = []
+        for item in items:
+            async with api_semaphore:
+                try:
+                    result = await asyncio.to_thread(
+                        self.sentiment_agent.run, item["text"], ticker,
+                    )
+                    result["source"] = item["source"]
+                    scored.append(result)
+                except Exception:
+                    pass
+
+        avg_score = self._weighted_aggregate(scored, self._active_weights())
+        sentiment_signal = self._signal(avg_score)
+
+        # ── Fuse with sentiment-only (no TA) ──────────────────────────
+        combined_signal = self.combine_signals(sentiment_signal, "HOLD")
+        conf = self.confidence(combined_signal, avg_score)
+
+        # ── Bull/Bear Debate (optional) ───────────────────────────────
+        debate_result = None
+        if self.debate_agent.is_enabled():
+            async with api_semaphore:
+                debate_result = await self.debate_agent.run_async(
+                    ticker=ticker,
+                    signal=combined_signal,
+                    confidence=conf,
+                    technical_data={},
+                    sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                )
+            combined_signal = debate_result.final_signal
+            conf = debate_result.adjusted_confidence
+
+        # ── Check existing forward signal for conviction delta ────────
+        updated_forward = False
+        if combined_signal not in ("HOLD", "CONFLICTING"):
+            try:
+                # Determine target execution session
+                target_session = "XETRA_OPEN" if session and "XETRA" in session else "US_OPEN"
+                pending = self.signal_logger.get_pending_forward_signals(
+                    target_session, ticker,
+                )
+                if pending:
+                    old_conf = pending[0].get("confidence", 0)
+                    delta = abs(conf - old_conf)
+                    if delta > self._PRE_CONVICTION_DELTA:
+                        log.info(
+                            "[%s] PRE conviction changed %.0f%% → %.0f%% (delta %.0f%%) — updating forward signal",
+                            ticker, old_conf * 100, conf * 100, delta * 100,
+                        )
+                        self.signal_logger.store_forward_signal({
+                            "source_session": session or "PRE",
+                            "target_session": target_session,
+                            "ticker": ticker,
+                            "signal": combined_signal,
+                            "confidence": conf,
+                            "price_at_signal": None,
+                        })
+                        updated_forward = True
+                    else:
+                        log.info(
+                            "[%s] PRE conviction stable (%.0f%% → %.0f%%, delta %.0f%%) — no update",
+                            ticker, old_conf * 100, conf * 100, delta * 100,
+                        )
+                else:
+                    # No existing forward signal — store new one
+                    log.info(
+                        "[%s] PRE new forward signal: %s (%.0f%%)",
+                        ticker, combined_signal, conf * 100,
+                    )
+                    self.signal_logger.store_forward_signal({
+                        "source_session": session or "PRE",
+                        "target_session": "XETRA_OPEN" if session and "XETRA" in session else "US_OPEN",
+                        "ticker": ticker,
+                        "signal": combined_signal,
+                        "confidence": conf,
+                        "price_at_signal": None,
+                    })
+                    updated_forward = True
+            except Exception as exc:
+                log.warning("[%s] PRE forward signal update failed: %s", ticker, exc)
+
+        elapsed = _time.monotonic() - t0
+
+        return {
+            "ticker": ticker,
+            "session_type": "pre_signal",
+            "combined_signal": combined_signal,
+            "confidence": conf,
+            "headlines_fetched": len(items),
+            "headlines_scored": len(scored),
+            "avg_score": avg_score,
+            "sentiment_signal": sentiment_signal,
+            "debate": debate_result,
+            "updated_forward": updated_forward,
             "elapsed_s": round(elapsed, 2),
         }
 

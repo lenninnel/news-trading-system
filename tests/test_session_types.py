@@ -60,10 +60,18 @@ class TestScheduleSessionTypes:
         xetra = next(r for r in SCHEDULE if r["name"] == "XETRA_OPEN")
         assert xetra["session_type"] == "signal"
 
+    def test_xetra_pre_is_pre_signal_type(self):
+        xetra_pre = next(r for r in SCHEDULE if r["name"] == "XETRA_PRE")
+        assert xetra_pre["session_type"] == "pre_signal"
+
+    def test_us_pre_is_pre_signal_type(self):
+        us_pre = next(r for r in SCHEDULE if r["name"] == "US_PRE")
+        assert us_pre["session_type"] == "pre_signal"
+
     def test_all_sessions_have_session_type(self):
         for run in SCHEDULE:
             assert "session_type" in run, f"{run['name']} missing session_type"
-            assert run["session_type"] in ("signal", "execution", "monitor")
+            assert run["session_type"] in ("signal", "pre_signal", "execution", "monitor")
 
 
 # ── Forward signals storage ──────────────────────────────────────────
@@ -396,3 +404,123 @@ class TestSessionTypePipeline:
 
         assert captured.get("AAPL") == "monitor"
         assert result["success_count"] == 1
+
+    def test_run_batch_passes_pre_signal_type(self):
+        """run_batch passes pre_signal session_type for PRE sessions."""
+        captured = {}
+
+        async def fake_analyse(ticker, *, account_balance, execute,
+                               api_semaphore, data_semaphore, db_lock,
+                               session, session_type="signal"):
+            captured[ticker] = session_type
+            return {
+                "ticker": ticker,
+                "combined_signal": "HOLD",
+                "confidence": 0,
+                "elapsed_s": 0.1,
+            }
+
+        with patch("scheduler.daily_runner.Coordinator") as MockCoord:
+            mock_instance = MagicMock()
+            mock_instance.analyse_ticker_async = fake_analyse
+            MockCoord.return_value = mock_instance
+
+            result = asyncio.run(
+                run_batch(
+                    ["SAP.XETRA"],
+                    workers=1,
+                    session="XETRA_PRE",
+                    session_type="pre_signal",
+                )
+            )
+
+        assert captured.get("SAP.XETRA") == "pre_signal"
+        assert result["success_count"] == 1
+
+
+# ── PRE session coordinator logic ────────────────────────────────────
+
+
+class TestPreSessionLogic:
+    def test_pre_signal_skips_technical_analysis(self, db):
+        """Pre-signal mode must NOT call the technical agent."""
+        from orchestrator.coordinator import Coordinator
+
+        coord = Coordinator(db=db)
+        coord.technical_agent.run = MagicMock(
+            side_effect=AssertionError("TA called in pre_signal mode!")
+        )
+        coord.risk_agent.run = MagicMock(
+            side_effect=AssertionError("Risk called in pre_signal mode!")
+        )
+
+        # Mock data feeds to return empty
+        coord.news_feed.fetch = MagicMock(return_value=[])
+        coord.stocktwits_feed.fetch = MagicMock(return_value=[])
+        coord.marketaux_feed.fetch = MagicMock(return_value=[])
+
+        result = asyncio.run(
+            coord._pre_signal_refresh_async(
+                "AAPL",
+                api_semaphore=asyncio.Semaphore(5),
+                data_semaphore=asyncio.Semaphore(5),
+                db_lock=asyncio.Lock(),
+                session="US_PRE",
+            )
+        )
+
+        assert result["session_type"] == "pre_signal"
+        assert result["ticker"] == "AAPL"
+        coord.technical_agent.run.assert_not_called()
+        coord.risk_agent.run.assert_not_called()
+
+    def test_pre_signal_returns_expected_fields(self, db):
+        """Pre-signal result has all expected keys."""
+        from orchestrator.coordinator import Coordinator
+
+        coord = Coordinator(db=db)
+        coord.news_feed.fetch = MagicMock(return_value=[])
+        coord.stocktwits_feed.fetch = MagicMock(return_value=[])
+        coord.marketaux_feed.fetch = MagicMock(return_value=[])
+
+        result = asyncio.run(
+            coord._pre_signal_refresh_async(
+                "SAP.XETRA",
+                api_semaphore=asyncio.Semaphore(5),
+                data_semaphore=asyncio.Semaphore(5),
+                db_lock=asyncio.Lock(),
+                session="XETRA_PRE",
+            )
+        )
+
+        assert result["session_type"] == "pre_signal"
+        assert "combined_signal" in result
+        assert "confidence" in result
+        assert "headlines_fetched" in result
+        assert "headlines_scored" in result
+        assert "elapsed_s" in result
+        assert "updated_forward" in result
+
+    def test_pre_signal_dispatched_by_analyse_ticker_async(self, db):
+        """analyse_ticker_async routes pre_signal to _pre_signal_refresh_async."""
+        from orchestrator.coordinator import Coordinator
+
+        coord = Coordinator(db=db)
+        coord.news_feed.fetch = MagicMock(return_value=[])
+        coord.stocktwits_feed.fetch = MagicMock(return_value=[])
+        coord.marketaux_feed.fetch = MagicMock(return_value=[])
+
+        result = asyncio.run(
+            coord.analyse_ticker_async(
+                "AAPL",
+                account_balance=10_000.0,
+                execute=False,
+                api_semaphore=asyncio.Semaphore(5),
+                data_semaphore=asyncio.Semaphore(5),
+                db_lock=asyncio.Lock(),
+                session="US_PRE",
+                session_type="pre_signal",
+            )
+        )
+
+        assert result["session_type"] == "pre_signal"

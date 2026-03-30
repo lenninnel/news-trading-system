@@ -30,20 +30,20 @@ def scheduler():
 
 
 class TestNextRunTime:
-    def test_before_first_run_returns_xetra(self, scheduler):
-        """Monday 05:00 UTC → next run is XETRA_OPEN at 07:00."""
+    def test_before_first_run_returns_xetra_pre(self, scheduler):
+        """Monday 05:00 UTC → next run is XETRA_PRE at 06:45."""
         monday_5am = datetime(2026, 3, 16, 5, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_5am)
-        assert nrt.hour == 7
-        assert nrt.minute == 0
+        assert nrt.hour == 6
+        assert nrt.minute == 45
         assert nrt.day == 16
 
     def test_between_runs_returns_next(self, scheduler):
-        """Monday 10:00 UTC → next run is US_OPEN at 14:30."""
+        """Monday 10:00 UTC → next run is US_PRE at 13:15."""
         monday_10am = datetime(2026, 3, 16, 10, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_10am)
-        assert nrt.hour == 14
-        assert nrt.minute == 30
+        assert nrt.hour == 13
+        assert nrt.minute == 15
 
     def test_after_midday_returns_eod(self, scheduler):
         """Monday 20:00 UTC → next run is EOD at 22:15."""
@@ -53,23 +53,22 @@ class TestNextRunTime:
         assert nrt.minute == 15
 
     def test_after_last_run_returns_next_day(self, scheduler):
-        """Monday 22:30 UTC → next run is Tuesday XETRA_OPEN 07:00."""
+        """Monday 22:30 UTC → next run is Tuesday XETRA_PRE 06:45."""
         monday_late = datetime(2026, 3, 16, 22, 30, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_late)
         assert nrt.weekday() == 1  # Tuesday
-        assert nrt.hour == 7
-        assert nrt.minute == 0
+        assert nrt.hour == 6
+        assert nrt.minute == 45
 
-    def test_all_four_runs_fire_on_weekday(self, scheduler):
-        """Starting from Monday 00:00, iterating should hit all 4 run times."""
+    def test_all_six_runs_fire_on_weekday(self, scheduler):
+        """Starting from Monday 00:00, iterating should hit all 6 run times."""
         t = datetime(2026, 3, 16, 0, 0, 0, tzinfo=timezone.utc)
         run_hours = []
-        for _ in range(4):
+        for _ in range(6):
             t = scheduler.next_run_time(after=t)
             run_hours.append((t.hour, t.minute))
-            # Advance 1 minute past the run time
             t = t.replace(second=1)
-        assert run_hours == [(7, 0), (14, 30), (18, 0), (22, 15)]
+        assert run_hours == [(6, 45), (7, 0), (13, 15), (14, 30), (18, 0), (22, 15)]
 
 
 # ── Weekend skip ──────────────────────────────────────────────────────
@@ -77,27 +76,28 @@ class TestNextRunTime:
 
 class TestWeekendSkip:
     def test_friday_after_eod_skips_to_monday(self, scheduler):
-        """Friday 23:00 UTC → next run is Monday 07:00."""
+        """Friday 23:00 UTC → next run is Monday XETRA_PRE at 06:45."""
         # 2026-03-20 is a Friday
         friday_late = datetime(2026, 3, 20, 23, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=friday_late)
         assert nrt.weekday() == 0  # Monday
         assert nrt.day == 23
-        assert nrt.hour == 7
+        assert nrt.hour == 6
+        assert nrt.minute == 45
 
     def test_saturday_skips_to_monday(self, scheduler):
-        """Saturday 12:00 UTC → next run is Monday 07:00."""
+        """Saturday 12:00 UTC → next run is Monday XETRA_PRE at 06:45."""
         saturday = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=saturday)
         assert nrt.weekday() == 0
-        assert nrt.hour == 7
+        assert nrt.hour == 6
 
     def test_sunday_skips_to_monday(self, scheduler):
-        """Sunday 18:00 UTC → next run is Monday 07:00."""
+        """Sunday 18:00 UTC → next run is Monday XETRA_PRE at 06:45."""
         sunday = datetime(2026, 3, 22, 18, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=sunday)
         assert nrt.weekday() == 0
-        assert nrt.hour == 7
+        assert nrt.hour == 6
 
 
 # ── current_session ───────────────────────────────────────────────────
@@ -111,12 +111,20 @@ class TestCurrentSession:
             return scheduler.current_session()
 
     def test_before_trading_is_closed(self, scheduler):
-        dt = datetime(2026, 3, 16, 6, 0, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 3, 16, 5, 0, 0, tzinfo=timezone.utc)
         assert self._session_at(scheduler, dt) == "CLOSED"
+
+    def test_xetra_pre_session(self, scheduler):
+        dt = datetime(2026, 3, 16, 6, 50, 0, tzinfo=timezone.utc)
+        assert self._session_at(scheduler, dt) == "XETRA_PRE"
 
     def test_xetra_session(self, scheduler):
         dt = datetime(2026, 3, 16, 8, 0, 0, tzinfo=timezone.utc)
         assert self._session_at(scheduler, dt) == "XETRA_OPEN"
+
+    def test_us_pre_session(self, scheduler):
+        dt = datetime(2026, 3, 16, 13, 30, 0, tzinfo=timezone.utc)
+        assert self._session_at(scheduler, dt) == "US_PRE"
 
     def test_us_open_session(self, scheduler):
         dt = datetime(2026, 3, 16, 15, 0, 0, tzinfo=timezone.utc)
@@ -203,12 +211,12 @@ class TestEodSummary:
 
 
 class TestScheduleConstants:
-    def test_four_runs_defined(self):
-        assert len(SCHEDULE) == 4
+    def test_six_runs_defined(self):
+        assert len(SCHEDULE) == 6
 
     def test_run_names(self):
         names = [r["name"] for r in SCHEDULE]
-        assert names == ["XETRA_OPEN", "US_OPEN", "MIDDAY", "EOD"]
+        assert names == ["XETRA_PRE", "XETRA_OPEN", "US_PRE", "US_OPEN", "MIDDAY", "EOD"]
 
     def test_runs_are_chronological(self):
         minutes = [r["hour"] * 60 + r["minute"] for r in SCHEDULE]
@@ -217,6 +225,12 @@ class TestScheduleConstants:
     def test_eod_is_last_run(self):
         assert SCHEDULE[-1]["eod"] is True
         assert all(not r["eod"] for r in SCHEDULE[:-1])
+
+    def test_pre_sessions_are_pre_signal_type(self):
+        pre_sessions = [r for r in SCHEDULE if r["name"].endswith("_PRE")]
+        assert len(pre_sessions) == 2
+        for s in pre_sessions:
+            assert s["session_type"] == "pre_signal"
 
 
 # ── XETRA ticker filtering ──────────────────────────────────────────
@@ -253,10 +267,20 @@ class TestXetraTickerFiltering:
 
         return captured.get("tickers")
 
+    def test_xetra_pre_includes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "XETRA_PRE")
+        assert "SAP.XETRA" in tickers
+        assert "SIE.XETRA" in tickers
+
     def test_xetra_open_includes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "XETRA_OPEN")
         assert "SAP.XETRA" in tickers
         assert "SIE.XETRA" in tickers
+
+    def test_us_pre_excludes_xetra_tickers(self, mixed_scheduler):
+        tickers = self._captured_tickers(mixed_scheduler, "US_PRE")
+        assert "AAPL" in tickers
+        assert "SAP.XETRA" not in tickers
 
     def test_us_open_excludes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "US_OPEN")
