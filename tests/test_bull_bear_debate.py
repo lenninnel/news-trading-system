@@ -140,30 +140,30 @@ class TestBullBearDebate:
         assert result.final_signal == "CONFLICTING"
         assert result.adjusted_confidence == 0.10
 
-    # -- Agreement: no penalty --
+    # -- Strong bull case: boost --
 
-    def test_agree_no_change(self):
-        """agree outcome → adjusted_confidence == original_confidence."""
+    def test_strong_bull_boosts_confidence(self):
+        """Strong bull case with high boost and weak bear → confidence increases."""
         debate = self._make_debate(
             {"bull_case": "Strong trend.", "confidence_boost": 0.15},
-            {"bear_case": "Minor risk.", "confidence_penalty": -0.02},
+            {"bear_case": "Minor worry.", "confidence_penalty": -0.02},
         )
         result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
-        assert result.adjusted_confidence == result.original_confidence
+        assert result.adjusted_confidence > result.original_confidence
+        assert result.debate_adjustment > 0
         assert result.final_signal == "STRONG BUY"
-        assert "agree" in result.debate_summary.lower()
 
     # -- Cautious: moderate penalty --
 
     def test_cautious_reduces_confidence(self):
-        """cautious outcome → adjusted_confidence < original_confidence."""
+        """Bear risk words with modest penalty → adjusted_confidence < original."""
         debate = self._make_debate(
             {"bull_case": "Upside potential.", "confidence_boost": 0.1},
             {"bear_case": "Earnings risk.", "confidence_penalty": -0.08},
         )
         result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
         assert result.adjusted_confidence < result.original_confidence
-        assert "cautious" in result.debate_summary.lower()
+        assert result.debate_adjustment < 0
 
     def test_cautious_penalty_varies_with_strength(self):
         """Two cautious cases with different bear strength → different deltas."""
@@ -274,9 +274,9 @@ class TestBullBearDebate:
             {"bear_case": "Major risk.", "confidence_penalty": -0.2},
         )
         result = debate.run("AAPL", "WEAK BUY", 0.45, _TECH_DATA, _SENT_DATA)
-        # Disagree: bear_strength=0.20, t=1.0, adjustment = -0.30
-        # adjusted = 0.45 + (-0.30) = 0.15
-        assert result.adjusted_confidence == 0.15
+        # Max penalty is -0.15 → adjusted = 0.45 - 0.15 = 0.30
+        assert result.adjusted_confidence < 0.35
+        assert result.debate_adjustment == -0.15
         # The coordinator must clamp this back to 0.35
 
     def test_harsh_penalty_can_drop_strong_buy_below_floor(self):
@@ -286,8 +286,8 @@ class TestBullBearDebate:
             {"bear_case": "Very risky.", "confidence_penalty": -0.2},
         )
         result = debate.run("AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA)
-        # Disagree: adjustment = -0.30, adjusted = 0.65 - 0.30 = 0.35
         assert result.adjusted_confidence < 0.60
+        assert result.debate_adjustment == -0.15
 
 
 # ── Async path ───────────────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ class TestBullBearDebateAsync:
         bear = BearResearcher(client=_mock_client(bear_payload))
         return BullBearDebate(bull=bull, bear=bear)
 
-    def test_async_agreement(self):
+    def test_async_strong_bull_boosts(self):
         debate = self._make_debate(
             {"bull_case": "Strong.", "confidence_boost": 0.1},
             {"bear_case": "Minor.", "confidence_penalty": -0.02},
@@ -307,7 +307,8 @@ class TestBullBearDebateAsync:
         result = asyncio.run(debate.run_async(
             "AAPL", "STRONG BUY", 0.65, _TECH_DATA, _SENT_DATA,
         ))
-        assert result.adjusted_confidence == result.original_confidence
+        assert result.adjusted_confidence > result.original_confidence
+        assert result.debate_adjustment > 0
 
     def test_async_hold_skips(self):
         debate = self._make_debate({}, {})
@@ -345,3 +346,73 @@ class TestIsEnabled:
     def test_disabled_with_false(self):
         with patch.dict(os.environ, {"ENABLE_BULL_BEAR_DEBATE": "false"}):
             assert BullBearDebate.is_enabled() is False
+
+
+# ── Dynamic adjustment tests ────────────────────────────────────────────────
+
+
+class TestDynamicDebateAdjustment:
+    """Tests for the new dynamic debate adjustment (replaces hardcoded -6%)."""
+
+    def _make_debate(self, bull_payload: dict, bear_payload: dict) -> BullBearDebate:
+        bull = BullResearcher(client=_mock_client(bull_payload))
+        bear = BearResearcher(client=_mock_client(bear_payload))
+        return BullBearDebate(bull=bull, bear=bear)
+
+    def test_debate_returns_dynamic_adjustment(self):
+        """DebateResult includes a numeric debate_adjustment field."""
+        debate = self._make_debate(
+            {"bull_case": "Solid trend.", "confidence_boost": 0.05},
+            {"bear_case": "Some concern.", "confidence_penalty": -0.06},
+        )
+        result = debate.run("AAPL", "BUY", 0.60, _TECH_DATA, _SENT_DATA)
+        assert hasattr(result, "debate_adjustment")
+        assert isinstance(result.debate_adjustment, float)
+        assert result.debate_adjustment != 0  # not the old fixed value
+        assert result.adjusted_confidence == round(
+            result.original_confidence + result.debate_adjustment, 2,
+        )
+
+    def test_strong_bull_case_gives_positive_adjustment(self):
+        """Clear bull win: strong conviction + high boost → positive adjustment."""
+        debate = self._make_debate(
+            {"bull_case": "Strong compelling trend with clear decisive momentum.",
+             "confidence_boost": 0.18},
+            {"bear_case": "Minor worry.", "confidence_penalty": -0.01},
+        )
+        result = debate.run("AAPL", "STRONG BUY", 0.60, _TECH_DATA, _SENT_DATA)
+        assert result.debate_adjustment > 0
+        assert result.adjusted_confidence > result.original_confidence
+
+    def test_contested_debate_gives_negative_adjustment(self):
+        """Contested / slight bear win: weak bull + risk words → negative."""
+        debate = self._make_debate(
+            {"bull_case": "Maybe upside, although uncertain.",
+             "confidence_boost": -0.02},
+            {"bear_case": "Significant risk of declining value, concern about weakness.",
+             "confidence_penalty": -0.12},
+        )
+        result = debate.run("AAPL", "BUY", 0.60, _TECH_DATA, _SENT_DATA)
+        assert result.debate_adjustment < 0
+        assert result.adjusted_confidence < result.original_confidence
+
+    def test_adjustment_bounded_between_minus15_and_plus10(self):
+        """Adjustment is always clamped to [-0.15, +0.10] regardless of inputs."""
+        # Extreme bull case
+        debate_bull = self._make_debate(
+            {"bull_case": "Strong compelling robust significant clear solid decisive.",
+             "confidence_boost": 0.20},
+            {"bear_case": "None.", "confidence_penalty": 0.0},
+        )
+        r_bull = debate_bull.run("AAPL", "STRONG BUY", 0.50, {}, {})
+        assert r_bull.debate_adjustment <= 0.10
+
+        # Extreme bear case
+        debate_bear = self._make_debate(
+            {"bull_case": "Weak uncertain unclear.",
+             "confidence_boost": -0.20},
+            {"bear_case": "Significant risk, vulnerable, declining, dangerous concern.",
+             "confidence_penalty": -0.20},
+        )
+        r_bear = debate_bear.run("AAPL", "WEAK BUY", 0.50, {}, {})
+        assert r_bear.debate_adjustment >= -0.15

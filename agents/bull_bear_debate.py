@@ -54,6 +54,7 @@ class DebateResult:
     bear_case: str = ""
     final_signal: str = ""
     adjusted_confidence: float = 0.0
+    debate_adjustment: float = 0.0
     debate_summary: str = ""
     degraded: bool = False
 
@@ -303,6 +304,51 @@ class BullBearDebate:
 
     # ── Private synthesis ────────────────────────────────────────────────
 
+    # Words indicating strong, convincing arguments
+    _CONVICTION = frozenset([
+        "strong", "compelling", "robust", "significant", "clear",
+        "solid", "decisive", "convincing", "healthy",
+    ])
+    # Words indicating weakness, risk, or problems
+    _WEAKNESS = frozenset([
+        "weak", "risky", "risk", "vulnerable", "declining",
+        "deteriorating", "overvalued", "concern", "fragile",
+        "dangerous", "uncertain", "unclear",
+    ])
+    # Hedging / qualification words that undermine the argument containing them
+    _HEDGING = frozenset([
+        "however", "but", "despite", "although", "might", "could",
+    ])
+
+    @staticmethod
+    def _analyze_transcript(bull_case: str, bear_case: str) -> float:
+        """Score debate text for bull vs bear strength.
+
+        Positive → bull wins, negative → bear wins.
+        """
+        bull_words = set(re.findall(r"[a-z]+", bull_case.lower()))
+        bear_words = set(re.findall(r"[a-z]+", bear_case.lower()))
+
+        C = BullBearDebate._CONVICTION
+        W = BullBearDebate._WEAKNESS
+        H = BullBearDebate._HEDGING
+
+        # Bull case: conviction words strengthen, weakness/hedging weaken
+        bull_score = (
+            len(bull_words & C) * 0.12
+            - len(bull_words & W) * 0.10
+            - len(bull_words & H) * 0.08
+        )
+
+        # Bear case: weakness words = strong bear, hedging = weak bear
+        bear_score = (
+            len(bear_words & W) * 0.10
+            + len(bear_words & C) * 0.08
+            - len(bear_words & H) * 0.10
+        )
+
+        return bull_score - bear_score
+
     @staticmethod
     def _synthesise(
         ticker: str,
@@ -313,31 +359,49 @@ class BullBearDebate:
     ) -> DebateResult:
         """Merge bull and bear perspectives into a final verdict.
 
-        Outcome classification based on bear pushback strength:
-            agree    (penalty > -0.05) → 0 adjustment
-            cautious (penalty -0.05 to -0.12) → -0.05 to -0.15
-            disagree (penalty <= -0.12) → -0.15 to -0.30
+        Returns a dynamic adjustment between -0.15 and +0.10 based on:
+            1. Numeric scores from both researchers (60% weight)
+            2. Text analysis of argument strength (40% weight)
+
+        Outcome bands:
+            Clear bull win   (+0.05 to +0.10)
+            Slight bull win  (+0.02 to +0.05)
+            Contested        (-0.03 to +0.02)
+            Slight bear win  (-0.06 to -0.03) — cautious
+            Bear win         (-0.10 to -0.06) — disagree
+            Clear bear win   (-0.15 to -0.10) — strong disagree
         """
 
-        penalty = bear.get("confidence_penalty", 0.0)
+        bull_boost = bull.get("confidence_boost", 0.0)
+        bear_penalty = bear.get("confidence_penalty", 0.0)
+        bull_case = bull.get("bull_case", "")
+        bear_case = bear.get("bear_case", "")
 
-        # Classify outcome by bear pushback strength
-        if penalty > -0.05:
-            # Agree: bear sees little risk → no penalty
-            adjustment = 0.0
-            summary = "Bull and bear broadly agree — confidence unchanged."
-        elif penalty > -0.12:
-            # Cautious: moderate bear pushback → -0.05 to -0.15
-            bear_strength = abs(penalty)
-            t = (bear_strength - 0.05) / 0.07  # 0.0–1.0
-            adjustment = -(0.05 + t * 0.10)
-            summary = "Bear raises concerns — cautious penalty applied."
+        # 1. Numeric component: combine both researcher scores
+        numeric = bull_boost + bear_penalty
+
+        # 2. Text analysis: who made the stronger argument?
+        text_score = BullBearDebate._analyze_transcript(bull_case, bear_case)
+
+        # 3. Weighted combination
+        raw = 0.6 * numeric + 0.4 * text_score
+
+        # 4. Clamp to [-0.15, +0.10]
+        adjustment = round(max(-0.15, min(0.10, raw)), 4)
+
+        # 5. Classify for summary
+        if adjustment > 0.05:
+            summary = "Clear bull win — conviction strengthened."
+        elif adjustment > 0.02:
+            summary = "Slight bull advantage — modest confidence boost."
+        elif adjustment > -0.03:
+            summary = "Contested debate — signal held with minor adjustment."
+        elif adjustment > -0.06:
+            summary = "Bear raises cautious concerns — penalty applied."
+        elif adjustment > -0.10:
+            summary = "Bull and bear disagree — confidence reduced."
         else:
-            # Disagree: strong bear pushback → -0.15 to -0.30
-            bear_strength = min(abs(penalty), 0.20)
-            t = (bear_strength - 0.12) / 0.08  # 0.0–1.0
-            adjustment = -(0.15 + t * 0.15)
-            summary = "Bull and bear disagree — significant penalty applied."
+            summary = "Clear bear win — bull and bear disagree significantly."
 
         adjusted = round(max(0.0, min(1.0, confidence + adjustment)), 2)
 
@@ -347,12 +411,10 @@ class BullBearDebate:
             final_signal = "HOLD"
             summary += " Confidence too low — downgraded to HOLD."
 
-        bull_case = bull.get("bull_case", "")
-        bear_case = bear.get("bear_case", "")
-
         log.debug(
-            "Debate %s: penalty=%.3f adjustment=%.3f conf=%.2f→%.2f signal=%s→%s",
-            ticker, penalty, adjustment, confidence, adjusted, signal, final_signal,
+            "Debate %s: boost=%.3f penalty=%.3f text=%.3f adj=%.4f conf=%.2f→%.2f signal=%s→%s",
+            ticker, bull_boost, bear_penalty, text_score, adjustment,
+            confidence, adjusted, signal, final_signal,
         )
 
         return DebateResult(
@@ -363,5 +425,6 @@ class BullBearDebate:
             bear_case=bear_case,
             final_signal=final_signal,
             adjusted_confidence=adjusted,
+            debate_adjustment=adjustment,
             debate_summary=summary,
         )
