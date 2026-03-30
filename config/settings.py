@@ -6,6 +6,7 @@ constants so that every module imports from a single source of truth.
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -198,6 +199,19 @@ ADANOS_ENABLED: bool = os.environ.get("ADANOS_ENABLED", "false").lower() in ("tr
 
 # Pre-market sessions (XETRA_PRE, US_PRE) — lightweight signal refresh
 ENABLE_PRE_SESSIONS: bool = os.environ.get("ENABLE_PRE_SESSIONS", "true").lower() in ("true", "1", "yes")
+
+# PEAD (Post-Earnings Announcement Drift) strategy
+PEAD_ENABLED: bool = os.environ.get("PEAD_ENABLED", "true").lower() in ("true", "1", "yes")
+PEAD_TICKERS: list[str] = [
+    # US mid-caps (validated: DSR=1.00 in walk-forward backtest)
+    "CASY", "TXRH", "DECK", "TRGP", "CACI", "MEDP", "UFPI", "TOL", "PBR",
+    # EU mid-caps (top Sharpe from IBKR cache run)
+    "VNA.DE", "HOT.DE", "COFA.PA", "VIE.PA", "FNTN.DE", "LEG.DE",
+]
+PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
+    "PEAD_EARNINGS_CACHE_PATH",
+    str(Path(__file__).resolve().parent.parent.parent / "walk-forward-backtest" / "data" / "ibkr_earnings_cache.json"),
+)
 
 
 # ---------------------------------------------------------------------------

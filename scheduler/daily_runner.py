@@ -240,11 +240,12 @@ _XETRA_TICKERS = ["SAP.XETRA", "SIE.XETRA"]
 #   "execution" — validate yesterday's EOD signals, execute if conditions hold
 #   "monitor"   — lightweight position check only, no new signals
 #
-# Schedule: 6 runs per weekday, all times UTC
+# Schedule: 7 runs per weekday, all times UTC
 SCHEDULE = [
     {"name": "XETRA_PRE",  "hour": 6,  "minute": 45, "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
     {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
     {"name": "US_PRE",     "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "pre_signal"},
+    {"name": "PEAD_OPEN",  "hour": 13, "minute": 45, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
     {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
     {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
     {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
@@ -283,10 +284,10 @@ def _is_execution_allowed() -> tuple[bool, str]:
 
 class DailyScheduler:
     """
-    Daemon that sleeps between 6 daily trading runs (weekdays, UTC).
+    Daemon that sleeps between 7 daily trading runs (weekdays, UTC).
 
     Runs: XETRA_PRE (06:45), XETRA_OPEN (07:00), US_PRE (13:15),
-          US_OPEN (14:30), MIDDAY (18:00), EOD (22:15).
+          PEAD_OPEN (13:45), US_OPEN (14:30), MIDDAY (18:00), EOD (22:15).
     """
 
     def __init__(self, full_watchlist: list[str] | None = None) -> None:
@@ -557,6 +558,13 @@ class DailyScheduler:
         # Resolve ticker list based on session
         if run_name in ("XETRA_OPEN", "XETRA_PRE"):
             tickers = run["tickers"] or self._load_xetra_tickers()
+        elif run_name == "PEAD_OPEN":
+            from config.settings import PEAD_ENABLED, PEAD_TICKERS
+            if not PEAD_ENABLED:
+                log.info("Skipping %s — PEAD_ENABLED=false", run_name)
+                print(f"[scheduler] Skipping {run_name} — PEAD disabled", flush=True)
+                return
+            tickers = PEAD_TICKERS
         else:
             tickers = run["tickers"] or self._load_us_tickers()
             # Safety belt: also strip any XETRA tickers that snuck in

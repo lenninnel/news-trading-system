@@ -68,6 +68,10 @@ class TestScheduleSessionTypes:
         us_pre = next(r for r in SCHEDULE if r["name"] == "US_PRE")
         assert us_pre["session_type"] == "pre_signal"
 
+    def test_pead_open_is_signal_type(self):
+        pead = next(r for r in SCHEDULE if r["name"] == "PEAD_OPEN")
+        assert pead["session_type"] == "signal"
+
     def test_all_sessions_have_session_type(self):
         for run in SCHEDULE:
             assert "session_type" in run, f"{run['name']} missing session_type"

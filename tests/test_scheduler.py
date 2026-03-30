@@ -60,15 +60,15 @@ class TestNextRunTime:
         assert nrt.hour == 6
         assert nrt.minute == 45
 
-    def test_all_six_runs_fire_on_weekday(self, scheduler):
-        """Starting from Monday 00:00, iterating should hit all 6 run times."""
+    def test_all_seven_runs_fire_on_weekday(self, scheduler):
+        """Starting from Monday 00:00, iterating should hit all 7 run times."""
         t = datetime(2026, 3, 16, 0, 0, 0, tzinfo=timezone.utc)
         run_hours = []
-        for _ in range(6):
+        for _ in range(7):
             t = scheduler.next_run_time(after=t)
             run_hours.append((t.hour, t.minute))
             t = t.replace(second=1)
-        assert run_hours == [(6, 45), (7, 0), (13, 15), (14, 30), (18, 0), (22, 15)]
+        assert run_hours == [(6, 45), (7, 0), (13, 15), (13, 45), (14, 30), (18, 0), (22, 15)]
 
 
 # ── Weekend skip ──────────────────────────────────────────────────────
@@ -211,12 +211,12 @@ class TestEodSummary:
 
 
 class TestScheduleConstants:
-    def test_six_runs_defined(self):
-        assert len(SCHEDULE) == 6
+    def test_seven_runs_defined(self):
+        assert len(SCHEDULE) == 7
 
     def test_run_names(self):
         names = [r["name"] for r in SCHEDULE]
-        assert names == ["XETRA_PRE", "XETRA_OPEN", "US_PRE", "US_OPEN", "MIDDAY", "EOD"]
+        assert names == ["XETRA_PRE", "XETRA_OPEN", "US_PRE", "PEAD_OPEN", "US_OPEN", "MIDDAY", "EOD"]
 
     def test_runs_are_chronological(self):
         minutes = [r["hour"] * 60 + r["minute"] for r in SCHEDULE]

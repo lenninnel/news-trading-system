@@ -61,6 +61,8 @@ from data.marketaux_feed import MarketauxFeed
 from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
 from storage.database import Database
+from strategies.pead_strategy import PEADStrategy
+from strategies.news_catalyst import NewsCatalystStrategy
 from strategies.router import get_strategy, strategy_label
 
 # Maps (sentiment_signal, technical_signal) → combined label
@@ -75,6 +77,9 @@ _FUSION_TABLE: dict[tuple[str, str], str] = {
     ("HOLD", "SELL"): "HOLD",
     ("HOLD", "HOLD"): "HOLD",
 }
+
+
+_news_catalyst = NewsCatalystStrategy()
 
 
 class Coordinator:
@@ -134,6 +139,12 @@ class Coordinator:
         self.apewisdom_feed = apewisdom_feed or ApeWisdomFeed()
         self.adanos_feed = adanos_feed or AdanosFeed()
         self.signal_logger = SignalLogger(db=self.db)
+
+        # PEAD strategy (no Claude API needed — pure data)
+        from config.settings import PEAD_ENABLED, PEAD_TICKERS, PEAD_EARNINGS_CACHE_PATH
+        self._pead_enabled = PEAD_ENABLED
+        self._pead_tickers = set(t.upper() for t in PEAD_TICKERS)
+        self._pead_strategy = PEADStrategy(cache_path=PEAD_EARNINGS_CACHE_PATH)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -338,6 +349,70 @@ class Coordinator:
             })
         except Exception as exc:
             log.warning("Strategy result logging failed (non-fatal): %s", exc)
+
+    def _run_pead(self, ticker: str, *, session: str | None = None) -> dict | None:
+        """Run PEAD strategy for a ticker if eligible. Returns result dict or None."""
+        if not self._pead_enabled:
+            return None
+        if ticker.upper() not in self._pead_tickers:
+            return None
+        from datetime import date as _date
+
+        result = self._pead_strategy.generate_signal(ticker, _date.today())
+        if result is None:
+            return None
+        self._log_strategy_result(ticker, result, session=session)
+        log.info("[%s] PEAD signal: %s (%.0f%%)", ticker, result.signal, result.confidence)
+        return {
+            "signal": result.signal,
+            "confidence": result.confidence / 100.0,
+            "strategy_name": "PEAD",
+            "reasoning": result.reasoning,
+            "indicators": result.indicators,
+        }
+
+    @staticmethod
+    def _build_news_data(sentiment: dict) -> dict | None:
+        """Build *news_data* dict for NewsCatalystStrategy from a sentiment result.
+
+        Returns None when the sentiment result has no scored headlines.
+        """
+        avg = sentiment.get("avg_score", 0.0)
+        scored = sentiment.get("scored")
+        if not scored:
+            return None
+        return {
+            "news_score": (avg + 1) / 2,  # map -1..+1 to 0..1
+            "headline_count": len(scored),
+            "sentiment_direction": sentiment.get("signal", "HOLD"),
+        }
+
+    def _run_news_catalyst(
+        self,
+        ticker: str,
+        bars,
+        sentiment: dict,
+        *,
+        session: str | None = None,
+    ) -> StrategyResult | None:
+        """Run NewsCatalystStrategy and log the result. Never raises."""
+        try:
+            if bars is None or (hasattr(bars, "empty") and bars.empty):
+                return None
+            news_data = self._build_news_data(sentiment)
+            result = _news_catalyst.analyze(
+                ticker, bars, sentiment.get("signal", "HOLD"),
+                news_data=news_data,
+            )
+            log.info(
+                "[%s] NewsCatalyst → %s (%.0f%%)",
+                ticker, result.signal, result.confidence,
+            )
+            self._log_strategy_result(ticker, result, session=session)
+            return result
+        except Exception as exc:
+            log.warning("[%s] NewsCatalyst failed (non-fatal): %s", ticker, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
@@ -655,6 +730,10 @@ class Coordinator:
         # Log individual strategy result (all signals, including HOLD)
         if strategy_result is not None:
             self._log_strategy_result(ticker, strategy_result, session=session)
+
+        # --- NewsCatalyst (runs for every ticker alongside the TA strategy) ---
+        bars = technical.get("bars")
+        self._run_news_catalyst(ticker, bars, sentiment, session=session)
 
         # --- Fuse ---
         if strategy_result is not None:
@@ -1033,8 +1112,27 @@ class Coordinator:
         if strategy_result is not None:
             self._log_strategy_result(ticker, strategy_result, session=session)
 
+        # ── NewsCatalyst (runs for every ticker alongside the TA strategy) ──
+        bars = technical.get("bars")
+        sentiment_for_news = {
+            "avg_score": avg_score,
+            "scored": scored,
+            "signal": sentiment_signal,
+        }
+        self._run_news_catalyst(ticker, bars, sentiment_for_news, session=session)
+
+        # ── PEAD check (no API calls — pure data) ─────────────────────
+        pead_result = self._run_pead(ticker, session=session)
+
         # ── Fuse signals ───────────────────────────────────────────────
-        if strategy_result is not None:
+        if pead_result is not None and pead_result["signal"] == "BUY":
+            # PEAD BUY acts as a strong additional vote
+            combined_signal = self.combine_signals(sentiment_signal, "BUY")
+            conf = pead_result["confidence"]
+            strat_name = "PEAD"
+            log.info("[%s] PEAD overriding strategy: %s (%.0f%%)",
+                     ticker, combined_signal, conf * 100)
+        elif strategy_result is not None:
             _ss = strategy_result.signal.upper()
             if _ss in ("STRONG BUY", "BUY", "WEAK BUY"):
                 tech_for_fusion = "BUY"
