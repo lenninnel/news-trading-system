@@ -208,6 +208,12 @@ PEAD_TICKERS: list[str] = [
     # EU mid-caps (top Sharpe from IBKR cache run)
     "VNA.DE", "HOT.DE", "COFA.PA", "VIE.PA", "FNTN.DE", "LEG.DE",
 ]
+# ATR-based dynamic stop-loss / take-profit
+USE_ATR_STOPS: bool = os.environ.get("USE_ATR_STOPS", "true").lower() in ("true", "1", "yes")
+ATR_STOP_MULTIPLIER: float = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))
+ATR_TP_MULTIPLIER: float = float(os.environ.get("ATR_TP_MULTIPLIER", "3.0"))
+ACCOUNT_RISK_PCT: float = float(os.environ.get("ACCOUNT_RISK_PCT", "0.01"))
+
 PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
     "PEAD_EARNINGS_CACHE_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "walk-forward-backtest" / "data" / "ibkr_earnings_cache.json"),
