@@ -574,8 +574,8 @@ class DailyScheduler:
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
 
-        # Telegram: starting
-        if self._tg:
+        # Telegram: starting (suppress MIDDAY — too noisy)
+        if self._tg and session_type != "monitor":
             try:
                 self._tg._send(
                     f"\U0001f558 *{run_name}* ({session_type}) starting \u2014 {now_str} UTC\n"
@@ -624,8 +624,8 @@ class DailyScheduler:
             print(f"[scheduler] {run_name} done: {ok}/{total} in "
                   f"{elapsed:.1f}s", flush=True)
 
-            # Telegram: run summary
-            if self._tg:
+            # Telegram: run summary (suppress MIDDAY — too noisy)
+            if self._tg and session_type != "monitor":
                 try:
                     self._send_run_summary(run_name, batch, tickers)
                 except Exception as exc:
@@ -689,26 +689,6 @@ class DailyScheduler:
 
         if self._tg:
             self._tg._send("\n".join(lines))
-            # Send individual signal notifications with debate summaries
-            for r in results:
-                if r is None:
-                    continue
-                sig = r.get("combined_signal", "HOLD")
-                if sig in ("HOLD", "CONFLICTING"):
-                    continue
-                try:
-                    debate = r.get("debate")
-                    debate_summary = debate.debate_summary if debate else ""
-                    self._tg.send_signal(
-                        ticker=r.get("ticker", "?"),
-                        signal=sig,
-                        confidence=r.get("confidence", 0) * 100,
-                        reasoning=r.get("sentiment", {}).get("signal", sig),
-                        debate_summary=debate_summary,
-                    )
-                except Exception as exc:
-                    log.warning("Telegram signal notification failed for %s: %s",
-                                r.get("ticker", "?"), exc)
 
 
 # ── EOD summary (shared by daemon + track.py --eod) ──────────────────

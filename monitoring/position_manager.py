@@ -254,9 +254,7 @@ class PositionManager:
                 current_trailing = self._trailing_stops.get(ticker)
                 if current_trailing is None or new_stop > current_trailing:
                     self._trailing_stops[ticker] = new_stop
-                    msg = (f"\U0001f4c8 Trailing stop updated: "
-                           f"{ticker} \u2192 ${new_stop:.2f}")
-                    self._send_alert(msg)
+                    log.info("Trailing stop updated: %s → $%.2f", ticker, new_stop)
                     self._log_event(ticker, "HOLD", current_price,
                                     f"trailing_stop_updated to ${new_stop:.2f}")
                     return {"ticker": ticker, "action": "trailing_update",

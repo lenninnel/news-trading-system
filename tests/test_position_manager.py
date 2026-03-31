@@ -158,11 +158,8 @@ class TestTrailingStop:
         # No trade executed (not closing)
         trader.track_trade.assert_not_called()
 
-        # Trailing stop alert sent
-        notifier.send_price_alert.assert_called_once()
-        alert_msg = notifier.send_price_alert.call_args[0][0]
-        assert "Trailing stop updated" in alert_msg
-        assert "NVDA" in alert_msg
+        # Trailing stop update is logged but NOT sent to Telegram (noise reduction)
+        notifier.send_price_alert.assert_not_called()
 
         assert len(results) == 1
         assert results[0]["action"] == "trailing_update"
