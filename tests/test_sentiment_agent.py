@@ -252,6 +252,53 @@ class TestConfidenceScores:
 # 5. Integration tests (real API — skipped by default)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 5b. Prompt caching
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSentimentPromptCaching:
+
+    def test_sentiment_includes_cache_control_when_enabled(self):
+        """System prompt includes cache_control when ENABLE_PROMPT_CACHING=True."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_claude_response("bullish")
+
+        from agents.sentiment_agent import SentimentAgent, _SENTIMENT_SYSTEM
+        agent = SentimentAgent.__new__(SentimentAgent)
+        agent._client = mock_client
+
+        with patch("agents.sentiment_agent.ENABLE_PROMPT_CACHING", True):
+            agent._claude_classify("test headline", "AAPL")
+
+        call_kwargs = mock_client.messages.create.call_args[1]
+        system = call_kwargs["system"]
+        assert isinstance(system, list)
+        assert system[0]["type"] == "text"
+        assert system[0]["text"] == _SENTIMENT_SYSTEM
+        assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_sentiment_cache_control_disabled(self):
+        """System is a plain string when ENABLE_PROMPT_CACHING=False."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_claude_response("neutral")
+
+        from agents.sentiment_agent import SentimentAgent, _SENTIMENT_SYSTEM
+        agent = SentimentAgent.__new__(SentimentAgent)
+        agent._client = mock_client
+
+        with patch("agents.sentiment_agent.ENABLE_PROMPT_CACHING", False):
+            agent._claude_classify("test headline", "AAPL")
+
+        call_kwargs = mock_client.messages.create.call_args[1]
+        system = call_kwargs["system"]
+        assert isinstance(system, str)
+        assert system == _SENTIMENT_SYSTEM
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. Integration tests (real API — skipped by default)
+# ══════════════════════════════════════════════════════════════════════════════
+
 @pytest.mark.integration
 class TestLiveClaudeCall:
     """

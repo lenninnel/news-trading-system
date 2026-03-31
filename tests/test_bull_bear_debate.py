@@ -20,6 +20,8 @@ from agents.bull_bear_debate import (
     BullBearDebate,
     BullResearcher,
     DebateResult,
+    _BULL_SYSTEM,
+    _BEAR_SYSTEM,
 )
 
 
@@ -416,3 +418,38 @@ class TestDynamicDebateAdjustment:
         )
         r_bear = debate_bear.run("AAPL", "WEAK BUY", 0.50, {}, {})
         assert r_bear.debate_adjustment >= -0.15
+
+
+# ── Prompt caching tests ────────────────────────────────────────────────────
+
+
+class TestPromptCaching:
+    """Verify cache_control is added to system prompts when enabled."""
+
+    def test_debate_includes_cache_control_when_enabled(self):
+        """BullResearcher and BearResearcher pass cache_control in system param."""
+        client = _mock_client({"bull_case": "OK.", "confidence_boost": 0.0})
+        bull = BullResearcher(client=client)
+
+        with patch("agents.bull_bear_debate.ENABLE_PROMPT_CACHING", True):
+            bull.analyze("AAPL", "BUY", 0.5, {}, {})
+
+        call_kwargs = client.messages.create.call_args[1]
+        system = call_kwargs["system"]
+        assert isinstance(system, list)
+        assert system[0]["type"] == "text"
+        assert system[0]["text"] == _BULL_SYSTEM
+        assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_cache_control_disabled_when_flag_false(self):
+        """When ENABLE_PROMPT_CACHING=False, system is a plain string."""
+        client = _mock_client({"bear_case": "OK.", "confidence_penalty": 0.0})
+        bear = BearResearcher(client=client)
+
+        with patch("agents.bull_bear_debate.ENABLE_PROMPT_CACHING", False):
+            bear.analyze("AAPL", "BUY", 0.5, {}, {})
+
+        call_kwargs = client.messages.create.call_args[1]
+        system = call_kwargs["system"]
+        assert isinstance(system, str)
+        assert system == _BEAR_SYSTEM
