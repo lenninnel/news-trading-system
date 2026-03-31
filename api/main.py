@@ -320,6 +320,37 @@ def _try_alpaca_portfolio() -> dict | None:
         return None
 
 
+@app.get("/api/trades")
+def trades(limit: int = Query(default=50, ge=1, le=200)) -> dict:
+    """Return closed trade history from the trade_history table."""
+    rows = _query(
+        "SELECT ticker, action, shares, price, stop_loss, take_profit, pnl, created_at "
+        "FROM trade_history ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    trade_list = []
+    for r in rows:
+        shares = r.get("shares", 0)
+        price = r.get("price", 0)
+        value = shares * price if shares and price else 0
+        # Calculate pnl_pct: find the matching BUY for this SELL
+        pnl = r.get("pnl", 0) or 0
+        pnl_pct = (pnl / value * 100) if value and pnl else 0
+        trade_list.append({
+            "ticker": r.get("ticker"),
+            "action": r.get("action"),
+            "shares": shares,
+            "price": round(price, 2),
+            "value": round(value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 1),
+            "stop_loss": r.get("stop_loss"),
+            "take_profit": r.get("take_profit"),
+            "timestamp": r.get("created_at"),
+        })
+    return {"trades": trade_list}
+
+
 @app.get("/api/performance")
 def performance() -> dict:
     today_str = date.today().isoformat()
