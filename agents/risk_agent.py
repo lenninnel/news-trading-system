@@ -64,7 +64,13 @@ import numpy as np
 import yfinance as yf
 
 from agents.base_agent import BaseAgent
-from config.settings import DRAWDOWN_HALT_THRESHOLD
+from config.settings import (
+    ACCOUNT_RISK_PCT,
+    ATR_STOP_MULTIPLIER,
+    ATR_TP_MULTIPLIER,
+    DRAWDOWN_HALT_THRESHOLD,
+    USE_ATR_STOPS,
+)
 from data.events_feed import get_days_to_earnings
 from storage.database import Database
 
@@ -272,43 +278,81 @@ class RiskAgent(BaseAgent):
             result["regime"] = regime
             return result
 
-        # -- 2. Stop-loss percentage ----------------------------------------
-        stop_pct = _STOP_PCT[strength]
+        # -- 2. ATR-based or fixed stops ------------------------------------
+        atr_result = None
+        if USE_ATR_STOPS:
+            atr_result = self.calculate_atr_stops(
+                ticker, current_price, direction=direction,
+                account_balance=account_balance,
+            )
 
-        # -- 3. Kelly Criterion sizing --------------------------------------
-        # Use historical win rate when ≥10 outcomes exist; otherwise fall
-        # back to the confidence-based estimate (2 % risk budget still
-        # applies via _MAX_RISK_FRACTION regardless).
-        historical_kelly = self.calculate_kelly_position(
-            ticker, signal, confidence, account_balance,
-        )
-        kelly = historical_kelly if historical_kelly is not None else _kelly_fraction(confidence)
+        if atr_result and atr_result.get("atr_available") and atr_result.get("shares", 0) > 0:
+            # ATR-based sizing and stops
+            stop_loss = atr_result["stop_loss"]
+            take_profit = atr_result["take_profit"]
+            shares = atr_result["shares"]
+            stop_pct = atr_result["stop_distance"] / current_price if current_price > 0 else 0.02
+            kelly = atr_result.get("position_size_pct", 0.0)
 
-        max_by_kelly     = account_balance * kelly
-        max_by_portfolio = account_balance * _MAX_PORTFOLIO_FRACTION
-        max_by_risk      = (account_balance * _MAX_RISK_FRACTION) / stop_pct
+            # Cap at portfolio max (10%)
+            max_shares_by_portfolio = int((account_balance * _MAX_PORTFOLIO_FRACTION) / current_price)
+            shares = min(shares, max_shares_by_portfolio)
 
-        position_raw = min(max_by_kelly, max_by_portfolio, max_by_risk)
+            # Apply regime and earnings adjustments to ATR-based position
+            multiplier = 1.0
+            if regime and regime in _REGIME_MULTIPLIER:
+                multiplier *= _REGIME_MULTIPLIER[regime]
+            if event_risk_flag == "earnings_imminent":
+                multiplier *= 0.25
+            elif event_risk_flag == "earnings_week":
+                multiplier *= 0.50
+            if multiplier < 1.0:
+                shares = max(0, int(shares * multiplier))
 
-        # -- 3b. Regime adjustment ------------------------------------------
-        if regime and regime in _REGIME_MULTIPLIER:
-            position_raw *= _REGIME_MULTIPLIER[regime]
+            position_size_usd = shares * current_price
+            risk_amount = atr_result["stop_distance"] * shares
+        else:
+            # Fixed percentage stops (fallback)
+            stop_pct = _STOP_PCT[strength]
 
-        # -- 3c. Earnings cap on position -----------------------------------
-        if event_risk_flag == "earnings_imminent":
-            position_raw *= 0.25
-        elif event_risk_flag == "earnings_week":
-            position_raw *= 0.50
+            # -- 3. Kelly Criterion sizing ----------------------------------
+            historical_kelly = self.calculate_kelly_position(
+                ticker, signal, confidence, account_balance,
+            )
+            kelly = historical_kelly if historical_kelly is not None else _kelly_fraction(confidence)
 
-        # -- 4. Deduct transaction cost ------------------------------------
-        position_after_cost = position_raw * (1.0 - _TRANSACTION_COST)
+            max_by_kelly     = account_balance * kelly
+            max_by_portfolio = account_balance * _MAX_PORTFOLIO_FRACTION
+            max_by_risk      = (account_balance * _MAX_RISK_FRACTION) / stop_pct
 
-        # -- 5. Round down to whole shares ---------------------------------
-        shares = int(position_after_cost / current_price)
+            position_raw = min(max_by_kelly, max_by_portfolio, max_by_risk)
+
+            # Regime adjustment
+            if regime and regime in _REGIME_MULTIPLIER:
+                position_raw *= _REGIME_MULTIPLIER[regime]
+
+            # Earnings cap
+            if event_risk_flag == "earnings_imminent":
+                position_raw *= 0.25
+            elif event_risk_flag == "earnings_week":
+                position_raw *= 0.50
+
+            position_after_cost = position_raw * (1.0 - _TRANSACTION_COST)
+            shares = int(position_after_cost / current_price)
+
+            if shares > 0:
+                position_size_usd = shares * current_price
+                risk_amount = position_size_usd * stop_pct
+                if direction == "BUY":
+                    stop_loss   = round(current_price * (1.0 - stop_pct), 4)
+                    take_profit = round(current_price * (1.0 + stop_pct * _REWARD_RISK_RATIO), 4)
+                else:
+                    stop_loss   = round(current_price * (1.0 + stop_pct), 4)
+                    take_profit = round(current_price * (1.0 - stop_pct * _REWARD_RISK_RATIO), 4)
+
         if shares == 0:
             skip_reason = (
-                f"Price ${current_price:.2f} exceeds affordable position "
-                f"(budget: ${position_after_cost:.2f})"
+                f"Price ${current_price:.2f} exceeds affordable position"
             )
             result = self._no_position(ticker, signal, confidence, current_price,
                                        account_balance, skip_reason)
@@ -316,18 +360,6 @@ class RiskAgent(BaseAgent):
             result["days_to_earnings"] = days_to_earn
             result["regime"] = regime
             return result
-
-        # Recalculate on whole-share basis
-        position_size_usd = shares * current_price
-        risk_amount       = position_size_usd * stop_pct
-
-        # -- 6. Price targets ----------------------------------------------
-        if direction == "BUY":
-            stop_loss   = round(current_price * (1.0 - stop_pct), 4)
-            take_profit = round(current_price * (1.0 + stop_pct * _REWARD_RISK_RATIO), 4)
-        else:  # SELL / short
-            stop_loss   = round(current_price * (1.0 + stop_pct), 4)
-            take_profit = round(current_price * (1.0 - stop_pct * _REWARD_RISK_RATIO), 4)
 
         result = {
             "ticker":           ticker,
@@ -421,6 +453,112 @@ class RiskAgent(BaseAgent):
             "days_to_earnings": days_to_earnings,
             "regime":           regime,
         }
+
+    # ------------------------------------------------------------------
+    # ATR-based dynamic stops
+    # ------------------------------------------------------------------
+
+    def calculate_atr_stops(
+        self,
+        ticker: str,
+        entry_price: float,
+        direction: str = "BUY",
+        atr_stop_multiplier: float = ATR_STOP_MULTIPLIER,
+        atr_tp_multiplier: float = ATR_TP_MULTIPLIER,
+        account_risk_pct: float = ACCOUNT_RISK_PCT,
+        account_balance: float = 10_000.0,
+        prices: "pd.Series | None" = None,
+    ) -> dict:
+        """
+        ATR-based stop-loss and take-profit calculation.
+
+        Args:
+            ticker:              Stock ticker symbol.
+            entry_price:         Entry price per share.
+            direction:           "BUY" or "SELL".
+            atr_stop_multiplier: ATR multiplier for stop distance (default 1.5).
+            atr_tp_multiplier:   ATR multiplier for take-profit (default 3.0).
+            account_risk_pct:    Fraction of account risked per trade (default 0.01).
+            account_balance:     Account value in USD.
+            prices:              Optional pre-fetched close prices (avoids API call).
+
+        Returns:
+            dict with stop_loss, take_profit, atr, stop_distance, rr_ratio,
+            position_size_pct, shares.  Returns None values on failure.
+        """
+        import pandas as pd
+
+        atr = self._fetch_atr(ticker, prices)
+        if atr is None or atr <= 0:
+            log.debug("[%s] ATR unavailable — falling back to fixed stops", ticker)
+            return {"atr": None, "atr_available": False}
+
+        stop_distance = atr * atr_stop_multiplier
+        tp_distance = atr * atr_tp_multiplier
+
+        # Enforce minimum 2:1 reward/risk
+        if tp_distance < 2.0 * stop_distance:
+            tp_distance = 2.0 * stop_distance
+
+        rr_ratio = tp_distance / stop_distance if stop_distance > 0 else 0.0
+
+        if direction == "BUY":
+            stop_loss = round(entry_price - stop_distance, 4)
+            take_profit = round(entry_price + tp_distance, 4)
+        else:
+            stop_loss = round(entry_price + stop_distance, 4)
+            take_profit = round(entry_price - tp_distance, 4)
+
+        # Position sizing: risk budget / stop distance
+        risk_budget = account_balance * account_risk_pct
+        shares = int(risk_budget / stop_distance) if stop_distance > 0 else 0
+        position_size_usd = shares * entry_price
+        position_size_pct = position_size_usd / account_balance if account_balance > 0 else 0
+
+        log.info(
+            "[%s] ATR stop: $%.2f (%.1f× ATR $%.2f), TP: $%.2f (%.1f× ATR), R:R %.1f:1",
+            ticker, stop_loss, atr_stop_multiplier, atr,
+            take_profit, atr_tp_multiplier, rr_ratio,
+        )
+
+        return {
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "atr": round(atr, 4),
+            "stop_distance": round(stop_distance, 4),
+            "tp_distance": round(tp_distance, 4),
+            "rr_ratio": round(rr_ratio, 2),
+            "position_size_pct": round(position_size_pct, 4),
+            "shares": shares,
+            "position_size_usd": round(position_size_usd, 2),
+            "atr_available": True,
+        }
+
+    def _fetch_atr(
+        self, ticker: str, prices: "pd.Series | None" = None,
+    ) -> float | None:
+        """Compute ATR(14) from price data. Fetches via yfinance if needed."""
+        import pandas as pd
+
+        try:
+            if prices is not None and len(prices) >= 15:
+                close = prices
+            else:
+                yf_ticker = self._yf_ticker(ticker)
+                data = yf.download(yf_ticker, period="1mo", interval="1d", progress=False)
+                if data.empty or len(data) < 15:
+                    return None
+                close = data["Close"].squeeze()
+
+            # ATR approximation using close-to-close (no High/Low needed)
+            daily_range = close.pct_change().abs().dropna()
+            if len(daily_range) < 14:
+                return None
+            atr_pct = float(daily_range.rolling(14).mean().iloc[-1])
+            return atr_pct * float(close.iloc[-1])
+        except Exception as exc:
+            log.debug("[%s] ATR fetch failed: %s", ticker, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Historical Kelly Criterion

@@ -39,7 +39,8 @@ def make_agent() -> RiskAgent:
 
 def run(agent, **overrides) -> dict:
     """Call agent.run() with sensible defaults, overriding specific fields.
-    Mocks get_days_to_earnings to return None (no earnings) by default."""
+    Mocks get_days_to_earnings to return None (no earnings) by default.
+    Disables ATR stops to test the fixed-percentage stop logic."""
     defaults = dict(
         ticker="TEST",
         signal="STRONG BUY",
@@ -48,7 +49,8 @@ def run(agent, **overrides) -> dict:
         account_balance=10_000.0,
     )
     defaults.update(overrides)
-    with patch("agents.risk_agent.get_days_to_earnings", return_value=None):
+    with patch("agents.risk_agent.get_days_to_earnings", return_value=None), \
+         patch("agents.risk_agent.USE_ATR_STOPS", False):
         return agent.run(**defaults)
 
 
