@@ -35,7 +35,7 @@ import re
 
 import anthropic
 
-from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL, ENABLE_PROMPT_CACHING
 from utils.api_recovery import APIRecovery
 
 log = logging.getLogger(__name__)
@@ -61,32 +61,34 @@ class DebateResult:
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
-_BULL_PROMPT = (
+# Static system prompts (cached across calls — same for every ticker)
+_BULL_SYSTEM = (
     "You are a bullish equity analyst making the strongest possible case "
-    "FOR taking a {signal} position in {ticker}.\n\n"
-    "Current data:\n"
-    "- Combined signal: {signal}\n"
-    "- Confidence: {confidence:.0%}\n"
-    "- Technical indicators: {technical}\n"
-    "- Sentiment summary: {sentiment}\n\n"
-    "Argue convincingly why this trade SHOULD be taken. Cite the data above.\n\n"
+    "FOR taking a trade position. Argue convincingly why the trade SHOULD "
+    "be taken. Cite the data provided.\n\n"
     "Respond with ONLY valid JSON:\n"
-    '{{"bull_case": "<2-3 sentences>", "confidence_boost": <float -0.2 to 0.2>}}'
+    '{"bull_case": "<2-3 sentences>", "confidence_boost": <float -0.2 to 0.2>}'
 )
 
-_BEAR_PROMPT = (
+_BEAR_SYSTEM = (
     "You are a skeptical risk manager making the strongest possible case "
-    "AGAINST taking a {signal} position in {ticker}.\n\n"
-    "Current data:\n"
-    "- Combined signal: {signal}\n"
-    "- Confidence: {confidence:.0%}\n"
-    "- Technical indicators: {technical}\n"
-    "- Sentiment summary: {sentiment}\n\n"
-    "Argue convincingly why this trade is RISKY and should NOT be taken. "
-    "Identify weaknesses, contrary indicators, and potential traps.\n\n"
+    "AGAINST taking a trade position. Argue convincingly why the trade is "
+    "RISKY and should NOT be taken. Identify weaknesses, contrary "
+    "indicators, and potential traps.\n\n"
     "Respond with ONLY valid JSON:\n"
-    '{{"bear_case": "<2-3 sentences>", "confidence_penalty": <float -0.2 to 0.0>}}'
+    '{"bear_case": "<2-3 sentences>", "confidence_penalty": <float -0.2 to 0.0>}'
 )
+
+# Dynamic user message template (changes per ticker)
+_BULL_USER = (
+    "Ticker: {ticker}\n"
+    "Signal: {signal}\n"
+    "Confidence: {confidence:.0%}\n"
+    "Technical indicators: {technical}\n"
+    "Sentiment summary: {sentiment}"
+)
+
+_BEAR_USER = _BULL_USER  # same data, different system prompt role
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
@@ -96,6 +98,22 @@ def _strip_fences(text: str) -> str:
     """Remove markdown code fences wrapping JSON output from Claude."""
     m = _FENCE_RE.search(text)
     return m.group(1).strip() if m else text.strip()
+
+
+def _log_cache_usage(msg: Any, caller: str) -> None:
+    """Log prompt cache hit/miss from Anthropic response usage."""
+    try:
+        usage = getattr(msg, "usage", None)
+        if usage is None:
+            return
+        cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        cache_create = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        if cache_read > 0:
+            log.debug("%s cache HIT: %d tokens read from cache", caller, cache_read)
+        elif cache_create > 0:
+            log.debug("%s cache WRITE: %d tokens cached", caller, cache_create)
+    except (TypeError, ValueError):
+        pass  # mock objects or unexpected types — skip logging
 
 
 # ── Individual researchers ───────────────────────────────────────────────────
@@ -115,7 +133,7 @@ class BullResearcher:
         technical_data: dict,
         sentiment_data: dict,
     ) -> dict:
-        prompt = _BULL_PROMPT.format(
+        user_msg = _BULL_USER.format(
             ticker=ticker,
             signal=signal,
             confidence=confidence,
@@ -124,11 +142,22 @@ class BullResearcher:
         )
 
         def _call():
-            msg = self._client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            kwargs: dict = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": user_msg}],
+            }
+            if ENABLE_PROMPT_CACHING:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": _BULL_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kwargs["system"] = _BULL_SYSTEM
+
+            msg = self._client.messages.create(**kwargs)
+            _log_cache_usage(msg, "BullResearcher")
             return json.loads(_strip_fences(msg.content[0].text))
 
         try:
@@ -156,7 +185,7 @@ class BearResearcher:
         technical_data: dict,
         sentiment_data: dict,
     ) -> dict:
-        prompt = _BEAR_PROMPT.format(
+        user_msg = _BEAR_USER.format(
             ticker=ticker,
             signal=signal,
             confidence=confidence,
@@ -165,11 +194,22 @@ class BearResearcher:
         )
 
         def _call():
-            msg = self._client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            kwargs: dict = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": user_msg}],
+            }
+            if ENABLE_PROMPT_CACHING:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": _BEAR_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kwargs["system"] = _BEAR_SYSTEM
+
+            msg = self._client.messages.create(**kwargs)
+            _log_cache_usage(msg, "BearResearcher")
             return json.loads(_strip_fences(msg.content[0].text))
 
         try:

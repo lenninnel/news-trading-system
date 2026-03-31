@@ -47,20 +47,23 @@ from typing import Any
 import anthropic
 
 from agents.base_agent import BaseAgent
-from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL, SCORE_MAP
+from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL, ENABLE_PROMPT_CACHING, SCORE_MAP
 from utils.api_recovery import APIRecovery, CircuitOpenError, UnauthorizedError
 
 log = logging.getLogger(__name__)
 
 _LEXICON_PATH = Path(__file__).resolve().parent.parent / "data" / "sentiment_lexicon.json"
 
-_PROMPT_TEMPLATE = (
-    'You are a financial sentiment analyst. For the stock ticker "{ticker}", '
-    "classify the following headline as exactly one of: bullish, bearish, or neutral.\n\n"
-    'Headline: "{headline}"\n\n'
+# Static system prompt (cached across all ticker/headline calls)
+_SENTIMENT_SYSTEM = (
+    "You are a financial sentiment analyst. Classify news headlines as "
+    "exactly one of: bullish, bearish, or neutral.\n\n"
     "Respond with ONLY valid JSON (no markdown) in this format:\n"
-    '{{"sentiment": "bullish|bearish|neutral", "reason": "<one sentence>"}}'
+    '{"sentiment": "bullish|bearish|neutral", "reason": "<one sentence>"}'
 )
+
+# Dynamic user message (changes per call)
+_SENTIMENT_USER = 'Ticker: {ticker}\nHeadline: "{headline}"'
 
 # Confidence constants
 _CONFIDENCE_CLAUDE     = 0.85
@@ -282,12 +285,34 @@ class SentimentAgent(BaseAgent):
 
     def _claude_classify(self, headline: str, ticker: str) -> dict:
         """Raw Claude API call; raises on any error."""
-        prompt = _PROMPT_TEMPLATE.format(ticker=ticker, headline=headline)
-        message = self._client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        user_msg = _SENTIMENT_USER.format(ticker=ticker, headline=headline)
+
+        kwargs: dict = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": 150,
+            "messages": [{"role": "user", "content": user_msg}],
+        }
+        if ENABLE_PROMPT_CACHING:
+            kwargs["system"] = [{
+                "type": "text",
+                "text": _SENTIMENT_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        else:
+            kwargs["system"] = _SENTIMENT_SYSTEM
+
+        message = self._client.messages.create(**kwargs)
+
+        # Log cache usage
+        try:
+            usage = getattr(message, "usage", None)
+            if usage:
+                cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+                if cache_read > 0:
+                    log.debug("SentimentAgent cache HIT: %d tokens", cache_read)
+        except (TypeError, ValueError):
+            pass
+
         if not message.content:
             raise ValueError("Claude returned empty response content")
         text: str    = message.content[0].text.strip()

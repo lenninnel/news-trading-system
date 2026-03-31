@@ -649,6 +649,22 @@ class DailyScheduler:
                 except Exception as exc:
                     log.warning("EOD outcome tracker failed (non-fatal): %s", exc)
 
+                # Nightly per-strategy performance tracker
+                try:
+                    from analytics.strategy_performance import StrategyPerformanceTracker
+                    perf = StrategyPerformanceTracker()
+                    metrics = perf.compute()
+                    parts = []
+                    for name, m in sorted(metrics.items()):
+                        sr = f"SR={m.sharpe_30d:.2f}" if m.sharpe_30d is not None else "SR=N/A"
+                        wr = f"WR={m.win_rate_30d:.0%}" if m.win_rate_30d is not None else "WR=N/A"
+                        parts.append(f"{name} {sr}, {wr}")
+                    log.info("Strategy performance: %s", " | ".join(parts))
+                    print(f"[scheduler] Strategy performance: {' | '.join(parts)}",
+                          flush=True)
+                except Exception as exc:
+                    log.warning("Strategy performance tracker failed (non-fatal): %s", exc)
+
         except Exception as exc:
             log.error("Scheduler error in %s: %s", run_name, exc)
             print(f"[scheduler] ERROR in {run_name}: {exc}", flush=True)

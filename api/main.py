@@ -374,6 +374,19 @@ def performance() -> dict:
     }
 
 
+@app.get("/api/strategy-performance")
+def get_strategy_performance() -> list[dict]:
+    """Return the latest per-strategy performance metrics."""
+    rows = _query(
+        "SELECT strategy_name, run_date, sharpe_30d, win_rate_30d, avg_rr, "
+        "signal_count, avg_confidence "
+        "FROM strategy_perf_daily "
+        "WHERE run_date = (SELECT MAX(run_date) FROM strategy_perf_daily) "
+        "ORDER BY strategy_name"
+    )
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Streamlit reverse proxy (catch-all — must be last route)
 # ---------------------------------------------------------------------------

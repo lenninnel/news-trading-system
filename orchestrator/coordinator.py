@@ -42,12 +42,14 @@ log = logging.getLogger(__name__)
 
 from agents.bull_bear_debate import BullBearDebate
 from agents.regime_agent import RegimeAgent
+from agents.regime_detector import RegimeDetector
 from agents.risk_agent import RiskAgent
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from analytics.signal_logger import SignalLogger
 from config.settings import (
     BUY_THRESHOLD,
+    ENABLE_REGIME_FILTER,
     SELL_THRESHOLD,
     SOURCE_WEIGHTS,
     SOURCE_WEIGHTS_NO_NEWSAPI,
@@ -131,6 +133,7 @@ class Coordinator:
         self.technical_agent = technical_agent or TechnicalAgent(db=self.db)
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
         self.regime_agent = regime_agent or RegimeAgent()
+        self.regime_detector = RegimeDetector()
         self.debate_agent = debate_agent or BullBearDebate()
         self.paper_trader = paper_trader or create_trader(db=self.db)
         self.reddit_feed = reddit_feed or RedditFeed()
@@ -315,7 +318,7 @@ class Coordinator:
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
 
-    def _log_strategy_result(self, ticker: str, strategy_result, *, session: str | None = None) -> None:
+    def _log_strategy_result(self, ticker: str, strategy_result, *, session: str | None = None, regime: str | None = None) -> None:
         """Log an individual strategy result to signal_events. Never raises.
 
         Every strategy result is logged regardless of signal type or
@@ -342,6 +345,7 @@ class Coordinator:
                 "social_score": None,
                 "bull_case": None,
                 "bear_case": None,
+                "regime": regime,
                 "debate_outcome": None,
                 "price_at_signal": price,
                 "trade_executed": 0,
@@ -698,6 +702,24 @@ class Coordinator:
             fmt_r = f"{r:.1f}" if r is not None else "N/A"
             print(f"  Price: {fmt_p}  RSI: {fmt_r}  →  {technical['signal']}")
 
+        # --- Per-ticker regime detection ---
+        ticker_regime = None
+        if ENABLE_REGIME_FILTER:
+            try:
+                bars_for_regime = technical.get("bars")
+                vix_val = regime_info.get("vix")
+                if bars_for_regime is not None and not bars_for_regime.empty:
+                    ticker_regime = self.regime_detector.detect(
+                        ticker, bars_for_regime, vix=vix_val,
+                    )
+                    if verbose:
+                        print(f"  Regime: {ticker_regime.regime} "
+                              f"(ADX={ticker_regime.adx}, VIX={ticker_regime.vix}, "
+                              f"ATR_pct={ticker_regime.atr_percentile:.0f}, "
+                              f"size={ticker_regime.size_multiplier:.0%})")
+            except Exception as exc:
+                log.warning("[%s] Regime detection failed: %s", ticker, exc)
+
         # --- Strategy override ---
         strategy = get_strategy(ticker)
         strat_name = strategy_label(ticker)
@@ -728,8 +750,9 @@ class Coordinator:
                 )
 
         # Log individual strategy result (all signals, including HOLD)
+        _regime_name = ticker_regime.regime if ticker_regime else None
         if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result, session=session)
+            self._log_strategy_result(ticker, strategy_result, session=session, regime=_regime_name)
 
         # --- NewsCatalyst (runs for every ticker alongside the TA strategy) ---
         bars = technical.get("bars")
@@ -846,13 +869,16 @@ class Coordinator:
             elif combined_signal == "STRONG SELL":
                 sizing_signal = "WEAK SELL"
 
+        # Use per-ticker regime when available, fall back to broad market
+        _effective_regime = (ticker_regime.regime if ticker_regime
+                             else regime_info.get("regime"))
         risk = self.risk_agent.run(
             ticker=ticker,
             signal=sizing_signal,
             confidence=conf * 100,          # convert 0–1 → 0–100
             current_price=price,
             account_balance=account_balance,
-            regime=regime_info.get("regime"),
+            regime=_effective_regime,
         )
 
         # Override SL/TP with strategy-specific values when available
@@ -1083,6 +1109,19 @@ class Coordinator:
                 self.technical_agent.run, ticker,
             )
 
+        # ── Per-ticker regime detection ────────────────────────────────
+        ticker_regime = None
+        if ENABLE_REGIME_FILTER:
+            try:
+                bars_for_regime = technical.get("bars")
+                vix_val = regime_info.get("vix")
+                if bars_for_regime is not None and not bars_for_regime.empty:
+                    ticker_regime = self.regime_detector.detect(
+                        ticker, bars_for_regime, vix=vix_val,
+                    )
+            except Exception as exc:
+                log.warning("[%s] Regime detection failed: %s", ticker, exc)
+
         # ── Strategy override ────────────────────────────────────────
         strategy = get_strategy(ticker)
         strat_name = strategy_label(ticker)
@@ -1109,8 +1148,9 @@ class Coordinator:
                 )
 
         # Log individual strategy result (all signals, including HOLD)
+        _regime_name = ticker_regime.regime if ticker_regime else None
         if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result, session=session)
+            self._log_strategy_result(ticker, strategy_result, session=session, regime=_regime_name)
 
         # ── NewsCatalyst (runs for every ticker alongside the TA strategy) ──
         bars = technical.get("bars")

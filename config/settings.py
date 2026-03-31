@@ -200,6 +200,12 @@ ADANOS_ENABLED: bool = os.environ.get("ADANOS_ENABLED", "false").lower() in ("tr
 # Pre-market sessions (XETRA_PRE, US_PRE) — lightweight signal refresh
 ENABLE_PRE_SESSIONS: bool = os.environ.get("ENABLE_PRE_SESSIONS", "true").lower() in ("true", "1", "yes")
 
+# Per-ticker regime detection (ADX/VIX/ATR) — controls strategy activation + sizing
+ENABLE_REGIME_FILTER: bool = os.environ.get("ENABLE_REGIME_FILTER", "true").lower() in ("true", "1", "yes")
+
+# Prompt caching — reduces Anthropic API costs 60-80% on repeated system prompts
+ENABLE_PROMPT_CACHING: bool = os.environ.get("ENABLE_PROMPT_CACHING", "true").lower() in ("true", "1", "yes")
+
 # PEAD (Post-Earnings Announcement Drift) strategy
 PEAD_ENABLED: bool = os.environ.get("PEAD_ENABLED", "true").lower() in ("true", "1", "yes")
 PEAD_TICKERS: list[str] = [

@@ -99,6 +99,11 @@ _REGIME_MULTIPLIER: dict[str, float] = {
     "TRENDING_BEAR": 0.7,
     "RANGING":       0.8,
     "HIGH_VOL":      0.5,
+    # Per-ticker regimes (from RegimeDetector)
+    "TRENDING_UP":       1.0,
+    "TRENDING_DOWN":     0.7,
+    "HIGH_VOLATILITY":   0.5,
+    "TRANSITIONAL":      0.75,
 }
 
 # Stop-loss percentages keyed by signal strength
