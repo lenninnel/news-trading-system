@@ -95,6 +95,11 @@ class SignalLogger:
             with self._db._connect() as conn:
                 conn.executescript(_CREATE_TABLE)
                 conn.executescript(_CREATE_FORWARD_TABLE)
+                # Add regime column if missing (migration for existing DBs)
+                try:
+                    conn.execute("ALTER TABLE signal_events ADD COLUMN regime TEXT")
+                except Exception:
+                    pass  # column already exists
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -113,8 +118,9 @@ class SignalLogger:
                          confidence, rsi, sma_ratio, volume_ratio,
                          sentiment_score, news_score, social_score,
                          bull_case, bear_case, debate_outcome,
-                         price_at_signal, trade_executed, trade_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         price_at_signal, trade_executed, trade_id,
+                         regime)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -135,6 +141,7 @@ class SignalLogger:
                         signal_data.get("price_at_signal"),
                         int(signal_data.get("trade_executed", 0)),
                         signal_data.get("trade_id"),
+                        signal_data.get("regime"),
                     ),
                 )
         except Exception as exc:
