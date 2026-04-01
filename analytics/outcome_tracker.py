@@ -45,7 +45,7 @@ def _fetch_price(ticker: str, target_date: datetime) -> float | None:
             timeframe="1Day",
         )
         if bars is not None and not bars.empty:
-            return float(bars["Close"].iloc[-1])
+            return float(bars["Close"].squeeze().iloc[-1])
     except Exception as exc:
         log.debug("Alpaca price fetch failed for %s: %s", ticker, exc)
 
@@ -60,7 +60,7 @@ def _fetch_price(ticker: str, target_date: datetime) -> float | None:
             progress=False,
         )
         if data is not None and not data.empty:
-            return float(data["Close"].iloc[-1])
+            return float(data["Close"].squeeze().iloc[-1])
     except Exception as exc:
         log.debug("yfinance price fetch failed for %s: %s", ticker, exc)
 
