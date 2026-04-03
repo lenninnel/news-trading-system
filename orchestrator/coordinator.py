@@ -279,7 +279,9 @@ class Coordinator:
             social_score = (sum(social_scores) / len(social_scores) + 1) / 2 if social_scores else None
 
             avg = sentiment.get("avg_score", 0)
-            sentiment_score = (avg + 1) / 2  # map -1..1 to 0..1
+            # PEAD signals have no sentiment — show null instead of 0.5 default
+            is_pead = result.get("strategy_name") == "PEAD"
+            sentiment_score = None if is_pead else (avg + 1) / 2  # map -1..1 to 0..1
 
             execution = result.get("execution") or {}
 
@@ -374,6 +376,116 @@ class Coordinator:
             "reasoning": result.reasoning,
             "indicators": result.indicators,
         }
+
+    async def _run_pead_only_async(
+        self,
+        ticker: str,
+        *,
+        account_balance: float = 10_000.0,
+        execute: bool = False,
+        data_semaphore: asyncio.Semaphore,
+        db_lock: asyncio.Lock,
+        session: str | None = None,
+    ) -> dict:
+        """PEAD-only fast path — skips news/sentiment/technical pipeline."""
+        t0 = _time.monotonic()
+        ticker = ticker.upper()
+
+        pead_result = self._run_pead(ticker, session=session)
+
+        if pead_result is None or pead_result["signal"] != "BUY":
+            elapsed = _time.monotonic() - t0
+            return {
+                "ticker": ticker,
+                "combined_signal": "HOLD",
+                "confidence": 0.0,
+                "strategy_name": "PEAD",
+                "sentiment": {"signal": "N/A", "avg_score": 0.0},
+                "technical": {"signal": "N/A", "indicators": {}},
+                "risk": {"skipped": True},
+                "execution": None,
+                "debate": None,
+                "elapsed_s": round(elapsed, 2),
+            }
+
+        combined_signal = "BUY"
+        conf = pead_result["confidence"]
+
+        # Fetch price for risk sizing
+        market: dict = {}
+        async with data_semaphore:
+            try:
+                market = await asyncio.to_thread(self.market_data.fetch, ticker)
+            except Exception as exc:
+                log.warning("[%s] PEAD market data fetch failed: %s", ticker, exc)
+
+        price = (market or {}).get("price")
+        price_is_live = bool(price) and not (market or {}).get("degraded")
+
+        # Risk sizing
+        async with db_lock:
+            risk = self.risk_agent.run(
+                ticker=ticker,
+                signal=combined_signal,
+                confidence=conf * 100,
+                current_price=price,
+                account_balance=account_balance,
+            )
+
+        # Execution
+        execution = None
+        if execute and not risk["skipped"] and price and price > 0 and price_is_live:
+            if risk.get("stop_loss") and risk["stop_loss"] > 0 \
+                    and risk.get("take_profit") and risk["take_profit"] > 0:
+                async with db_lock:
+                    if risk["direction"] == "BUY" and (
+                        self._has_alpaca_position(ticker)
+                        or self.db.get_portfolio_position(ticker)
+                    ):
+                        log.info("[%s] PEAD duplicate BUY blocked", ticker)
+                    else:
+                        execution = self.paper_trader.track_trade(
+                            ticker=ticker,
+                            action=risk["direction"],
+                            shares=risk["shares"],
+                            price=price,
+                            stop_loss=risk["stop_loss"],
+                            take_profit=risk["take_profit"],
+                        )
+
+        # Store forward signal for execution session
+        if combined_signal not in ("HOLD", "CONFLICTING"):
+            try:
+                self.signal_logger.store_forward_signal({
+                    "source_session": session or "PEAD_OPEN",
+                    "target_session": "US_OPEN",
+                    "ticker": ticker,
+                    "signal": combined_signal,
+                    "confidence": conf,
+                    "price_at_signal": price,
+                    "strategy_name": "PEAD",
+                    "stop_loss": risk.get("stop_loss") if not risk.get("skipped") else None,
+                    "take_profit": risk.get("take_profit") if not risk.get("skipped") else None,
+                })
+            except Exception as exc:
+                log.warning("[%s] PEAD forward signal storage failed: %s", ticker, exc)
+
+        elapsed = _time.monotonic() - t0
+
+        final_result = {
+            "ticker": ticker,
+            "combined_signal": combined_signal,
+            "confidence": conf,
+            "strategy_name": "PEAD",
+            "sentiment": {"signal": "PEAD", "avg_score": 0.0},
+            "technical": {"signal": "N/A", "indicators": {}},
+            "risk": risk,
+            "execution": execution,
+            "debate": None,
+            "elapsed_s": round(elapsed, 2),
+        }
+        self._log_signal_event(final_result, session=session)
+        return final_result
 
     @staticmethod
     def _build_news_data(sentiment: dict) -> dict | None:
@@ -780,9 +892,10 @@ class Coordinator:
                 technical_confidence=technical.get("adjusted_confidence"),
             )
 
-        # --- Bull/Bear Debate (optional) ---
+        # --- Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ---
         debate_result = None
-        if self.debate_agent.is_enabled():
+        is_pead = strat_name == "PEAD"
+        if self.debate_agent.is_enabled() and not is_pead:
             if verbose:
                 print(f"\n  [DEBATE] Running bull/bear debate for {ticker}...")
             debate_result = self.debate_agent.run(
@@ -1032,6 +1145,15 @@ class Coordinator:
                 db_lock=db_lock,
                 session=session,
             )
+        if session_type == "pead":
+            return await self._run_pead_only_async(
+                ticker,
+                account_balance=account_balance,
+                execute=execute,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                session=session,
+            )
 
         t0 = _time.monotonic()
         ticker = ticker.upper()
@@ -1194,9 +1316,10 @@ class Coordinator:
                 technical_confidence=technical.get("adjusted_confidence"),
             )
 
-        # ── Bull/Bear Debate (optional) ──────────────────────────────
+        # ── Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ──
         debate_result = None
-        if self.debate_agent.is_enabled():
+        is_pead = strat_name == "PEAD"
+        if self.debate_agent.is_enabled() and not is_pead:
             async with api_semaphore:
                 debate_result = await self.debate_agent.run_async(
                     ticker=ticker,
