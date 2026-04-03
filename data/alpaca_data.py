@@ -138,6 +138,7 @@ class AlpacaDataClient:
         limit: int = 252,
         start: str | None = None,
         end: str | None = None,
+        min_bars: int = 20,
     ) -> pd.DataFrame:
         """
         Fetch historical OHLCV bars for *ticker*.
@@ -189,9 +190,9 @@ class AlpacaDataClient:
                         f"Alpaca bars for {ticker} missing '{col}' column"
                     )
 
-            if len(df) < 20:
+            if len(df) < min_bars:
                 raise ValueError(
-                    f"Alpaca returned only {len(df)} bars for {ticker} (need >= 20)"
+                    f"Alpaca returned only {len(df)} bars for {ticker} (need >= {min_bars})"
                 )
 
             log.debug(
