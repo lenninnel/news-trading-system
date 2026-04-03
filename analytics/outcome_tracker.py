@@ -43,6 +43,7 @@ def _fetch_price(ticker: str, target_date: datetime) -> float | None:
             start=start.strftime("%Y-%m-%d"),
             end=(target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
             timeframe="1Day",
+            min_bars=1,
         )
         if bars is not None and not bars.empty:
             return float(bars["Close"].squeeze().iloc[-1])
