@@ -64,9 +64,10 @@ class TestScheduleSessionTypes:
         xetra_pre = next(r for r in SCHEDULE if r["name"] == "XETRA_PRE")
         assert xetra_pre["session_type"] == "pre_signal"
 
-    def test_us_pre_is_pre_signal_type(self):
+    def test_us_pre_is_full_signal_type(self):
+        """US_PRE runs full pipeline so US_OPEN can use cached signals."""
         us_pre = next(r for r in SCHEDULE if r["name"] == "US_PRE")
-        assert us_pre["session_type"] == "pre_signal"
+        assert us_pre["session_type"] == "signal"
 
     def test_pead_open_is_signal_type(self):
         pead = next(r for r in SCHEDULE if r["name"] == "PEAD_OPEN")
@@ -383,6 +384,7 @@ class TestSessionTypePipeline:
 
         async def fake_analyse(ticker, *, account_balance, execute,
                                api_semaphore, data_semaphore, db_lock,
+                               debate_semaphore=None,
                                session, session_type="signal"):
             captured[ticker] = session_type
             return {
@@ -415,6 +417,7 @@ class TestSessionTypePipeline:
 
         async def fake_analyse(ticker, *, account_balance, execute,
                                api_semaphore, data_semaphore, db_lock,
+                               debate_semaphore=None,
                                session, session_type="signal"):
             captured[ticker] = session_type
             return {

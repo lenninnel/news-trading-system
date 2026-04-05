@@ -1256,6 +1256,49 @@ class Database:
     # Generic SQL helper
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Signal cache (US_PRE → US_OPEN fast path)
+    # ------------------------------------------------------------------
+
+    def get_cached_signal(self, ticker: str, *, max_age_minutes: int = 90) -> "dict | None":
+        """Return the latest signal_events row for *ticker* if fresh enough.
+
+        Returns ``None`` when no row exists or the cached signal is older
+        than *max_age_minutes*.
+        """
+        from datetime import datetime as _dt, timedelta, timezone as _tz
+
+        cutoff = (_dt.now(_tz.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM signal_events
+                    WHERE ticker = ? AND timestamp >= ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (ticker.upper(), cutoff),
+                ).fetchone()
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.warning("get_cached_signal(%s) failed: %s", ticker, exc)
+            return None
+
+    @staticmethod
+    def is_price_stale(
+        current_price: float,
+        cached_price: float,
+        threshold: float = 0.02,
+    ) -> bool:
+        """Return True if *current_price* moved more than *threshold* from *cached_price*.
+
+        Both prices must be positive; returns True (stale) on bad input so
+        the caller falls through to a full re-computation.
+        """
+        if not cached_price or cached_price <= 0 or not current_price or current_price <= 0:
+            return True
+        return abs(current_price - cached_price) / cached_price > threshold
+
     def _select(self, sql: str, params: tuple = ()) -> list[dict]:
         """Run a raw SELECT and return rows as dicts."""
         with self._connect() as conn:

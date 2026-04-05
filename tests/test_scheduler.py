@@ -226,11 +226,12 @@ class TestScheduleConstants:
         assert SCHEDULE[-1]["eod"] is True
         assert all(not r["eod"] for r in SCHEDULE[:-1])
 
-    def test_pre_sessions_are_pre_signal_type(self):
-        pre_sessions = [r for r in SCHEDULE if r["name"].endswith("_PRE")]
+    def test_pre_sessions_types(self):
+        """US_PRE runs full pipeline (signal); XETRA_PRE is lightweight (pre_signal)."""
+        pre_sessions = {r["name"]: r for r in SCHEDULE if r["name"].endswith("_PRE")}
         assert len(pre_sessions) == 2
-        for s in pre_sessions:
-            assert s["session_type"] == "pre_signal"
+        assert pre_sessions["XETRA_PRE"]["session_type"] == "pre_signal"
+        assert pre_sessions["US_PRE"]["session_type"] == "signal"
 
 
 # ── XETRA ticker filtering ──────────────────────────────────────────
