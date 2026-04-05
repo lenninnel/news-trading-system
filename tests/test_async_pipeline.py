@@ -297,6 +297,7 @@ class TestSemaphoreLimits:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
@@ -332,6 +333,7 @@ class TestErrorResilience:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
@@ -369,6 +371,7 @@ class TestErrorResilience:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
@@ -405,6 +408,7 @@ class TestProgressTracking:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
@@ -434,6 +438,7 @@ class TestProgressTracking:
                 api_semaphore=api_sem,
                 data_semaphore=data_sem,
                 db_lock=db_lock,
+                debate_semaphore=asyncio.Semaphore(4),
                 worker_semaphore=worker_sem,
                 tracker=tracker,
             )
@@ -460,6 +465,7 @@ class TestProgressTracking:
                 api_semaphore=api_sem,
                 data_semaphore=data_sem,
                 db_lock=db_lock,
+                debate_semaphore=asyncio.Semaphore(4),
                 worker_semaphore=worker_sem,
                 tracker=tracker,
             )
@@ -486,6 +492,7 @@ class TestProgressTracking:
                 api_semaphore=api_sem,
                 data_semaphore=data_sem,
                 db_lock=db_lock,
+                debate_semaphore=asyncio.Semaphore(4),
                 worker_semaphore=worker_sem,
                 tracker=tracker,
             )
@@ -556,6 +563,7 @@ class TestRunBatch:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
@@ -608,6 +616,7 @@ class TestRunBatch:
                     api_semaphore=api_sem,
                     data_semaphore=data_sem,
                     db_lock=db_lock,
+                    debate_semaphore=asyncio.Semaphore(4),
                     worker_semaphore=worker_sem,
                     tracker=tracker,
                 )
