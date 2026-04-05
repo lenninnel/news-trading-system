@@ -40,7 +40,7 @@ import time as _time
 
 log = logging.getLogger(__name__)
 
-from agents.bull_bear_debate import BullBearDebate
+from agents.bull_bear_debate import BullBearDebate, DebateResult
 from agents.regime_agent import RegimeAgent
 from agents.regime_detector import RegimeDetector
 from agents.risk_agent import RiskAgent
@@ -896,15 +896,26 @@ class Coordinator:
         debate_result = None
         is_pead = strat_name == "PEAD"
         if self.debate_agent.is_enabled() and not is_pead:
-            if verbose:
-                print(f"\n  [DEBATE] Running bull/bear debate for {ticker}...")
-            debate_result = self.debate_agent.run(
-                ticker=ticker,
-                signal=combined_signal,
-                confidence=conf,
-                technical_data=technical.get("indicators", {}),
-                sentiment_data={"signal": sentiment["signal"], "avg_score": sentiment["avg_score"]},
-            )
+            if combined_signal == "HOLD" and conf < 0.35:
+                log.info("[%s] Debate skipped — HOLD signal", ticker)
+                debate_result = DebateResult(
+                    ticker=ticker,
+                    original_signal=combined_signal,
+                    original_confidence=conf,
+                    final_signal=combined_signal,
+                    adjusted_confidence=conf,
+                    debate_summary="Debate skipped — HOLD signal.",
+                )
+            else:
+                if verbose:
+                    print(f"\n  [DEBATE] Running bull/bear debate for {ticker}...")
+                debate_result = self.debate_agent.run(
+                    ticker=ticker,
+                    signal=combined_signal,
+                    confidence=conf,
+                    technical_data=technical.get("indicators", {}),
+                    sentiment_data={"signal": sentiment["signal"], "avg_score": sentiment["avg_score"]},
+                )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
 
@@ -1091,6 +1102,7 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
+        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
         session_type: str = "signal",
     ) -> dict:
@@ -1135,6 +1147,7 @@ class Coordinator:
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
+                debate_semaphore=debate_semaphore,
                 session=session,
             )
         if session_type == "pre_signal":
@@ -1143,6 +1156,7 @@ class Coordinator:
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
+                debate_semaphore=debate_semaphore,
                 session=session,
             )
         if session_type == "pead":
@@ -1320,14 +1334,26 @@ class Coordinator:
         debate_result = None
         is_pead = strat_name == "PEAD"
         if self.debate_agent.is_enabled() and not is_pead:
-            async with api_semaphore:
-                debate_result = await self.debate_agent.run_async(
+            if combined_signal == "HOLD" and conf < 0.35:
+                log.info("[%s] Debate skipped — HOLD signal", ticker)
+                debate_result = DebateResult(
                     ticker=ticker,
-                    signal=combined_signal,
-                    confidence=conf,
-                    technical_data=technical.get("indicators", {}),
-                    sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                    original_signal=combined_signal,
+                    original_confidence=conf,
+                    final_signal=combined_signal,
+                    adjusted_confidence=conf,
+                    debate_summary="Debate skipped — HOLD signal.",
                 )
+            else:
+                _dsem = debate_semaphore or api_semaphore
+                async with _dsem:
+                    debate_result = await self.debate_agent.run_async(
+                        ticker=ticker,
+                        signal=combined_signal,
+                        confidence=conf,
+                        technical_data=technical.get("indicators", {}),
+                        sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                    )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
 
@@ -1595,6 +1621,7 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
+        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
     ) -> dict:
         """
@@ -1651,14 +1678,26 @@ class Coordinator:
         # ── Bull/Bear Debate (optional) ───────────────────────────────
         debate_result = None
         if self.debate_agent.is_enabled():
-            async with api_semaphore:
-                debate_result = await self.debate_agent.run_async(
+            if combined_signal == "HOLD" and conf < 0.35:
+                log.info("[%s] Debate skipped — HOLD signal", ticker)
+                debate_result = DebateResult(
                     ticker=ticker,
-                    signal=combined_signal,
-                    confidence=conf,
-                    technical_data={},
-                    sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                    original_signal=combined_signal,
+                    original_confidence=conf,
+                    final_signal=combined_signal,
+                    adjusted_confidence=conf,
+                    debate_summary="Debate skipped — HOLD signal.",
                 )
+            else:
+                _dsem = debate_semaphore or api_semaphore
+                async with _dsem:
+                    debate_result = await self.debate_agent.run_async(
+                        ticker=ticker,
+                        signal=combined_signal,
+                        confidence=conf,
+                        technical_data={},
+                        sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                    )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
 
@@ -1742,23 +1781,56 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
+        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
     ) -> dict:
         """
-        Validate pending forward signals and execute if conditions hold.
+        Execute trades using cached US_PRE signals (fast path).
 
-        Also runs the standard signal pipeline for gap plays.
+        1. Read cached signal from signal_events (max 90 min old).
+        2. Fetch current price.
+        3. If price moved >2% since cache, re-run debate only.
+        4. Execute trade based on cached/refreshed signal.
+
+        Falls back to the full pipeline only when no cached signal exists.
         """
+        from storage.database import Database
+
         t0 = _time.monotonic()
         ticker = ticker.upper()
 
-        # Load pending forward signals for this ticker
-        pending = self.signal_logger.get_pending_forward_signals(
-            target_session="US_OPEN",
-            ticker=ticker,
+        # ── Step 1: Try cached US_PRE signal ─────────────────────────────
+        cached = self.db.get_cached_signal(ticker, max_age_minutes=90)
+
+        if not cached or not cached.get("signal"):
+            log.info("[%s] No cached signal — falling back to full pipeline", ticker)
+            fallback = await self.analyse_ticker_async(
+                ticker,
+                account_balance=account_balance,
+                execute=execute,
+                api_semaphore=api_semaphore,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                debate_semaphore=debate_semaphore,
+                session=session,
+                session_type="signal",
+            )
+            fallback["session_type"] = "execution"
+            fallback["cache_status"] = "miss"
+            fallback["elapsed_s"] = round(_time.monotonic() - t0, 2)
+            return fallback
+
+        cached_signal = cached["signal"]
+        cached_conf = cached.get("confidence") or 0.5
+        cached_price = cached.get("price_at_signal")
+
+        log.info(
+            "[%s] Cached signal: %s (%.0f%%) @ $%.2f",
+            ticker, cached_signal, cached_conf * 100,
+            cached_price or 0,
         )
 
-        # Fetch current price
+        # ── Step 2: Fetch current price ──────────────────────────────────
         current_price = None
         async with data_semaphore:
             try:
@@ -1767,14 +1839,61 @@ class Coordinator:
             except Exception as exc:
                 log.warning("[%s] Execution mode price fetch failed: %s", ticker, exc)
 
-        forward_results: list[dict] = []
+        if not current_price or current_price <= 0:
+            return {
+                "ticker": ticker,
+                "session_type": "execution",
+                "combined_signal": cached_signal,
+                "confidence": cached_conf,
+                "cache_status": "used_no_price",
+                "execution": None,
+                "elapsed_s": round(_time.monotonic() - t0, 2),
+            }
 
+        # ── Step 3: Staleness check — re-run debate if >2% drift ────────
+        combined_signal = cached_signal
+        conf = cached_conf
+        debate_refreshed = False
+
+        if Database.is_price_stale(current_price, cached_price or 0, threshold=0.02):
+            log.info(
+                "[%s] Price stale: cached $%.2f → current $%.2f (>2%%) — refreshing debate",
+                ticker, cached_price or 0, current_price,
+            )
+            if self.debate_agent.is_enabled() and cached_signal not in ("HOLD",):
+                _dsem = debate_semaphore or api_semaphore
+                async with _dsem:
+                    debate_result = await self.debate_agent.run_async(
+                        ticker=ticker,
+                        signal=cached_signal,
+                        confidence=cached_conf,
+                        technical_data={},
+                        sentiment_data={
+                            "signal": cached_signal,
+                            "avg_score": cached.get("sentiment_score", 0),
+                        },
+                    )
+                combined_signal = debate_result.final_signal
+                conf = debate_result.adjusted_confidence
+                debate_refreshed = True
+                log.info(
+                    "[%s] Debate refresh: %s %.0f%% → %s %.0f%%",
+                    ticker, cached_signal, cached_conf * 100,
+                    combined_signal, conf * 100,
+                )
+            else:
+                log.info("[%s] Debate disabled or HOLD — using cached signal as-is", ticker)
+
+        # ── Step 4: Process pending forward signals ──────────────────────
+        pending = self.signal_logger.get_pending_forward_signals(
+            target_session="US_OPEN", ticker=ticker,
+        )
+        forward_results: list[dict] = []
         for fwd in pending:
             fwd_id = fwd["id"]
             signal_price = fwd.get("price_at_signal")
             fwd_signal = fwd.get("signal", "")
 
-            # Validate: need current price and signal price
             if not current_price or not signal_price:
                 self.signal_logger.update_forward_signal(
                     fwd_id, "invalidated", "no price data available",
@@ -1782,7 +1901,6 @@ class Coordinator:
                 forward_results.append({"id": fwd_id, "status": "invalidated", "reason": "no_price"})
                 continue
 
-            # Direction-specific adverse drift check
             is_buy = "BUY" in fwd_signal.upper()
             if is_buy:
                 adverse_drift = (signal_price - current_price) / signal_price * 100
@@ -1799,62 +1917,71 @@ class Coordinator:
                 forward_results.append({"id": fwd_id, "status": "invalidated", "reason": reason})
                 continue
 
-            # Confirmed — proceed to execution
             self.signal_logger.update_forward_signal(fwd_id, "confirmed")
             forward_results.append({"id": fwd_id, "status": "confirmed"})
 
-            if execute:
-                async with db_lock:
-                    risk = self.risk_agent.run(
-                        ticker=ticker,
-                        signal=fwd_signal,
-                        confidence=(fwd.get("confidence") or 0.5) * 100,
-                        current_price=current_price,
-                        account_balance=account_balance,
-                    )
+        # ── Step 5: Execute trade based on cached/refreshed signal ───────
+        execution = None
+        risk = {"skipped": True, "skip_reason": "no actionable signal"}
 
-                if not risk["skipped"]:
+        if combined_signal not in ("HOLD", "CONFLICTING") and execute:
+            async with db_lock:
+                risk = self.risk_agent.run(
+                    ticker=ticker,
+                    signal=combined_signal,
+                    confidence=conf * 100,
+                    current_price=current_price,
+                    account_balance=account_balance,
+                )
+
+            if not risk["skipped"]:
+                # Use forward signal SL/TP if available
+                for fwd in pending:
                     if fwd.get("stop_loss"):
                         risk["stop_loss"] = fwd["stop_loss"]
                     if fwd.get("take_profit"):
                         risk["take_profit"] = fwd["take_profit"]
+                    break  # use first matching forward signal
 
-                    if (risk.get("stop_loss") and risk["stop_loss"] > 0
-                            and risk.get("take_profit") and risk["take_profit"] > 0):
-                        async with db_lock:
-                            if risk["direction"] == "BUY" and (
-                                self._has_alpaca_position(ticker)
-                                or self.db.get_portfolio_position(ticker)
-                            ):
-                                log.info("[%s] Forward BUY blocked — position open", ticker)
-                            else:
-                                self.paper_trader.track_trade(
-                                    ticker=ticker,
-                                    action=risk["direction"],
-                                    shares=risk["shares"],
-                                    price=current_price,
-                                    stop_loss=risk["stop_loss"],
-                                    take_profit=risk["take_profit"],
-                                )
-                                self.signal_logger.update_forward_signal(fwd_id, "executed")
-                                log.info(
-                                    "[%s] Forward signal executed: %s %d shares @ %.2f",
-                                    ticker, risk["direction"], risk["shares"], current_price,
-                                )
+                if (risk.get("stop_loss") and risk["stop_loss"] > 0
+                        and risk.get("take_profit") and risk["take_profit"] > 0):
+                    async with db_lock:
+                        if risk["direction"] == "BUY" and (
+                            self._has_alpaca_position(ticker)
+                            or self.db.get_portfolio_position(ticker)
+                        ):
+                            log.info("[%s] BUY blocked — position already open", ticker)
+                        else:
+                            execution = self.paper_trader.track_trade(
+                                ticker=ticker,
+                                action=risk["direction"],
+                                shares=risk["shares"],
+                                price=current_price,
+                                stop_loss=risk["stop_loss"],
+                                take_profit=risk["take_profit"],
+                            )
+                            log.info(
+                                "[%s] Cached signal executed: %s %d shares @ %.2f",
+                                ticker, risk["direction"], risk["shares"], current_price,
+                            )
+                            for fr in forward_results:
+                                if fr["status"] == "confirmed":
+                                    self.signal_logger.update_forward_signal(
+                                        fr["id"], "executed",
+                                    )
 
-        # Also run the standard signal pipeline for gap plays
-        gap_result = await self.analyse_ticker_async(
-            ticker,
-            account_balance=account_balance,
-            execute=execute,
-            api_semaphore=api_semaphore,
-            data_semaphore=data_semaphore,
-            db_lock=db_lock,
-            session=session,
-            session_type="signal",  # standard pipeline
-        )
+        elapsed = _time.monotonic() - t0
 
-        gap_result["session_type"] = "execution"
-        gap_result["forward_signals"] = forward_results
-        gap_result["elapsed_s"] = round(_time.monotonic() - t0, 2)
-        return gap_result
+        return {
+            "ticker": ticker,
+            "session_type": "execution",
+            "combined_signal": combined_signal,
+            "confidence": conf,
+            "risk": risk,
+            "execution": execution,
+            "forward_signals": forward_results,
+            "cache_status": "refreshed" if debate_refreshed else "hit",
+            "cached_price": cached_price,
+            "current_price": current_price,
+            "elapsed_s": round(elapsed, 2),
+        }

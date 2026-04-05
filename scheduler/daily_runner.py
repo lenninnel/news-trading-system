@@ -95,6 +95,7 @@ async def _process_ticker(
     api_semaphore: asyncio.Semaphore,
     data_semaphore: asyncio.Semaphore,
     db_lock: asyncio.Lock,
+    debate_semaphore: asyncio.Semaphore,
     worker_semaphore: asyncio.Semaphore,
     tracker: _ProgressTracker,
     session: str | None = None,
@@ -110,6 +111,7 @@ async def _process_ticker(
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
+                debate_semaphore=debate_semaphore,
                 session=session,
                 session_type=session_type,
             )
@@ -147,6 +149,7 @@ async def run_batch(
     """
     api_semaphore = asyncio.Semaphore(5)
     data_semaphore = asyncio.Semaphore(10)
+    debate_semaphore = asyncio.Semaphore(4)  # cap concurrent debates (rate limit safety)
     db_lock = asyncio.Lock()
     worker_semaphore = asyncio.Semaphore(workers)
     tracker = _ProgressTracker(len(tickers))
@@ -164,6 +167,7 @@ async def run_batch(
             api_semaphore=api_semaphore,
             data_semaphore=data_semaphore,
             db_lock=db_lock,
+            debate_semaphore=debate_semaphore,
             worker_semaphore=worker_semaphore,
             tracker=tracker,
             session=session,
@@ -244,7 +248,7 @@ _XETRA_TICKERS = ["SAP.XETRA", "SIE.XETRA"]
 SCHEDULE = [
     {"name": "XETRA_PRE",  "hour": 6,  "minute": 45, "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
     {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
-    {"name": "US_PRE",     "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "pre_signal"},
+    {"name": "US_PRE",     "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
     {"name": "PEAD_OPEN",  "hour": 13, "minute": 45, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
     {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
     {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
