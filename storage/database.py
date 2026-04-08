@@ -1260,26 +1260,86 @@ class Database:
     # Signal cache (US_PRE → US_OPEN fast path)
     # ------------------------------------------------------------------
 
-    def get_cached_signal(self, ticker: str, *, max_age_minutes: int = 90) -> "dict | None":
+    def get_cached_signal(
+        self,
+        ticker: str,
+        *,
+        max_age_minutes: int = 90,
+        valid_sessions: tuple[str, ...] = ("US_PRE", "XETRA_PRE"),
+    ) -> "dict | None":
         """Return the latest signal_events row for *ticker* if fresh enough.
 
-        Returns ``None`` when no row exists or the cached signal is older
-        than *max_age_minutes*.
+        A cached signal is only considered valid when **all** of the
+        following hold:
+
+        * its ``session`` is in *valid_sessions* (defaults to the pre-signal
+          sessions — never EOD/MIDDAY/US_OPEN);
+        * its ``timestamp`` falls on today's UTC date (no overnight reuse);
+        * its ``timestamp`` is within *max_age_minutes* of now.
+
+        Returns ``None`` when no row qualifies. When a row exists but is
+        rejected, the reason is logged at INFO level so callers can see
+        why the cache missed.
         """
         from datetime import datetime as _dt, timedelta, timezone as _tz
 
-        cutoff = (_dt.now(_tz.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        ticker = ticker.upper()
+        now_utc = _dt.now(_tz.utc)
+        today_str = now_utc.date().isoformat()  # e.g. "2026-04-08"
+        cutoff = (now_utc - timedelta(minutes=max_age_minutes)).isoformat()
+
         try:
             with self._connect() as conn:
-                row = conn.execute(
+                # Diagnostic: latest row for this ticker, any session/date.
+                # Used purely for the rejection-reason log below.
+                latest = conn.execute(
                     """
-                    SELECT * FROM signal_events
-                    WHERE ticker = ? AND timestamp >= ?
+                    SELECT id, timestamp, session, signal
+                    FROM signal_events
+                    WHERE ticker = ?
                     ORDER BY id DESC LIMIT 1
                     """,
-                    (ticker.upper(), cutoff),
+                    (ticker,),
                 ).fetchone()
-            return dict(row) if row else None
+
+                placeholders = ",".join("?" * len(valid_sessions))
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM signal_events
+                    WHERE ticker = ?
+                      AND session IN ({placeholders})
+                      AND substr(timestamp, 1, 10) = ?
+                      AND timestamp >= ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (ticker, *valid_sessions, today_str, cutoff),
+                ).fetchone()
+
+            if row:
+                return dict(row)
+
+            # No valid cache — log why if there's anything at all to diagnose.
+            if latest:
+                lat = dict(latest)
+                ts = lat.get("timestamp") or ""
+                sess = lat.get("session") or "<none>"
+                row_date = ts[:10] if len(ts) >= 10 else "unknown"
+                if row_date != today_str:
+                    logger.info(
+                        "[%s] Cached signal rejected: from previous day (%s)",
+                        ticker, row_date,
+                    )
+                elif sess not in valid_sessions:
+                    logger.info(
+                        "[%s] Cached signal rejected: session=%s not in %s",
+                        ticker, sess, list(valid_sessions),
+                    )
+                elif ts < cutoff:
+                    logger.info(
+                        "[%s] Cached signal rejected: older than %d min (ts=%s)",
+                        ticker, max_age_minutes, ts,
+                    )
+            return None
         except Exception as exc:
             logger.warning("get_cached_signal(%s) failed: %s", ticker, exc)
             return None

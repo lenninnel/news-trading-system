@@ -95,9 +95,9 @@ async def _process_ticker(
     api_semaphore: asyncio.Semaphore,
     data_semaphore: asyncio.Semaphore,
     db_lock: asyncio.Lock,
-    debate_semaphore: asyncio.Semaphore,
     worker_semaphore: asyncio.Semaphore,
     tracker: _ProgressTracker,
+    debate_semaphore: asyncio.Semaphore | None = None,
     session: str | None = None,
     session_type: str = "signal",
 ) -> dict | None:
