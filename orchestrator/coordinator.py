@@ -1803,7 +1803,10 @@ class Coordinator:
         cached = self.db.get_cached_signal(ticker, max_age_minutes=90)
 
         if not cached or not cached.get("signal"):
-            log.info("[%s] No cached signal — falling back to full pipeline", ticker)
+            log.info(
+                "[%s] No valid US_PRE cache — running full pipeline as fallback",
+                ticker,
+            )
             fallback = await self.analyse_ticker_async(
                 ticker,
                 account_balance=account_balance,
