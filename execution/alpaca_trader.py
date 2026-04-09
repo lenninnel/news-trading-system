@@ -167,6 +167,47 @@ class AlpacaTrader:
                 f"(got SL={stop_loss}, TP={take_profit}) — trade aborted"
             )
 
+        # Reconcile against Alpaca before sending a SELL. If Alpaca has 0
+        # shares but the local DB still thinks we own the position, the
+        # order would fail with "insufficient qty available for order"
+        # (e.g. NBIS today). Treat this as a ghost position: clean it from
+        # the local portfolio table and skip the order entirely.
+        if action == "SELL":
+            alpaca_qty = self._get_alpaca_position_qty(ticker)
+            if alpaca_qty == 0:
+                local_pos = None
+                try:
+                    local_pos = self._db.get_portfolio_position(ticker)
+                except Exception:
+                    pass
+                local_shares = (local_pos or {}).get("shares", 0) if local_pos else 0
+                log.critical(
+                    "[%s] Position mismatch \u2014 local DB shows %d shares, "
+                    "Alpaca shows 0. Cleaning ghost position.",
+                    ticker, local_shares,
+                )
+                try:
+                    self._db.delete_portfolio_position(ticker)
+                except Exception as exc:
+                    log.warning("[%s] Failed to delete ghost position: %s", ticker, exc)
+                self._notify_ghost_cleaned(ticker, local_shares)
+                return {
+                    "trade_id": None,
+                    "ticker": ticker,
+                    "action": action,
+                    "shares": shares,
+                    "price": price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "pnl": 0.0,
+                    "total_value": 0.0,
+                    "skipped": True,
+                    "skip_reason": (
+                        f"{ticker} ghost position (local={local_shares} sh, Alpaca=0) — "
+                        f"cleaned local DB"
+                    ),
+                }
+
         # Belt-and-suspenders: fetch live quote and reject if >15% divergence
         try:
             quote = self._api.get_latest_trade(ticker)
@@ -281,6 +322,57 @@ class AlpacaTrader:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _get_alpaca_position_qty(self, ticker: str) -> "int | None":
+        """
+        Return the current Alpaca position size for *ticker*.
+
+        Three possible return values:
+          * Positive int  -> Alpaca confirms a non-zero position.
+          * 0             -> Alpaca definitively has no position (404 / "does
+                             not exist"). The caller should treat this as a
+                             ghost position and refuse to sell.
+          * None          -> Lookup failed for an unrelated reason (network,
+                             auth, parsing). Caller should fail OPEN and let
+                             the original sell attempt proceed so a transient
+                             outage never blocks a real exit.
+        """
+        try:
+            position = self._api.get_position(ticker)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if (
+                "position does not exist" in msg
+                or "not found" in msg
+                or "404" in msg
+            ):
+                return 0
+            log.warning(
+                "[%s] Could not fetch Alpaca position (failing open): %s",
+                ticker, exc,
+            )
+            return None
+
+        try:
+            qty = int(float(position.qty))
+        except Exception as exc:
+            log.warning("[%s] Unparseable Alpaca qty: %s", ticker, exc)
+            return None
+        return qty
+
+    def _notify_ghost_cleaned(self, ticker: str, local_shares: int) -> None:
+        """Send a Telegram heads-up when a ghost position is cleaned."""
+        try:
+            tg = self._get_telegram()
+            if tg is None:
+                return
+            tg._send(
+                f"\u26a0\ufe0f *Ghost position cleaned* \u2014 `{ticker}`\n"
+                f"Local DB had {local_shares} shares but Alpaca shows 0.\n"
+                f"Local row removed; sell order skipped."
+            )
+        except Exception as exc:
+            log.debug("Telegram ghost notification failed (non-fatal): %s", exc)
 
     def _wait_for_fill(self, order_id: str) -> "float | None":
         """Poll Alpaca until the order fills or we time out."""

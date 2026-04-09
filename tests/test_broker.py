@@ -49,9 +49,20 @@ def _mock_api():
     api.submit_order.return_value = order
     api.get_order.return_value = order
     api.list_positions.return_value = [_make_position()]
+    # SELL pre-check (track_trade) calls get_position(ticker) — return a
+    # plausible non-zero position so existing happy-path SELL tests don't
+    # trip the ghost-cleanup branch.
+    api.get_position.return_value = _make_position()
     # Live-price divergence check expects a realistic quote
     api.get_latest_trade.return_value = SimpleNamespace(price=243.75)
     return api
+
+
+def _alpaca_not_found_error():
+    """Build the exception alpaca_trade_api raises when a position is missing."""
+    class _APIError(Exception):
+        pass
+    return _APIError("position does not exist")
 
 
 # Force-inject a fake alpaca_trade_api module to prevent real API connections.
@@ -279,6 +290,96 @@ class TestUnsupportedTickers:
         trader, api = self._make_trader()
         result = trader.track_trade("AAPL", "BUY", 10, 243.00,
                                     stop_loss=238.0, take_profit=253.0)
+        assert result.get("skipped") is not True
+        api.submit_order.assert_called_once()
+
+
+# ── Ghost-position reconciliation (BUG: NBIS sell hit Alpaca with 0 shares) ──
+
+
+class TestGhostPositionReconciliation:
+    """SELL must be aborted if Alpaca shows zero shares for the ticker.
+
+    Local DB can drift out of sync with Alpaca after a bracket exit
+    (Alpaca's stop-loss closed the position but the local position row
+    is still around). The next stop-loss tick on our side would then ask
+    Alpaca to sell shares it no longer holds, which fails with
+    "insufficient qty available for order". The fix: pre-check via
+    get_position(); if Alpaca says 0, clean the local row and skip.
+    """
+
+    def _make_trader(self, *, position_qty: "str | None" = "8"):
+        api = _mock_api()
+        if position_qty is None:
+            api.get_position.side_effect = _alpaca_not_found_error()
+        else:
+            api.get_position.return_value = _make_position(
+                symbol="NBIS", qty=position_qty, avg_entry_price="55.00",
+                market_value=str(float(position_qty) * 55.00),
+            )
+        db = Database(db_path=tempfile.mktemp(suffix=".db"))
+        # Pre-seed the local DB with a fake NBIS position so we can prove
+        # the ghost cleaner deletes it.
+        db.set_portfolio_position(
+            ticker="NBIS", shares=8, avg_price=55.00, current_value=440.00,
+        )
+        return AlpacaTrader(db=db, api=api), api, db
+
+    def test_sell_with_zero_alpaca_qty_skips_and_cleans_local(self):
+        trader, api, db = self._make_trader(position_qty=None)
+
+        result = trader.track_trade("NBIS", "SELL", 8, 55.00)
+
+        assert result["skipped"] is True
+        assert "ghost position" in result["skip_reason"].lower()
+        assert result["trade_id"] is None
+        assert result["pnl"] == 0.0
+        # No Alpaca order should have been sent
+        api.submit_order.assert_not_called()
+        # Local row should be gone
+        assert db.get_portfolio_position("NBIS") is None
+
+    def test_sell_with_nonzero_alpaca_qty_proceeds(self):
+        trader, api, db = self._make_trader(position_qty="8")
+
+        # Configure submit_order / get_order for the SELL fill
+        sell_order = _make_order(filled_avg_price="55.50")
+        api.submit_order.return_value = sell_order
+        api.get_order.return_value = sell_order
+        api.get_latest_trade.return_value = SimpleNamespace(price=55.50)
+
+        result = trader.track_trade("NBIS", "SELL", 8, 55.50)
+
+        assert result.get("skipped") is not True
+        api.submit_order.assert_called_once()
+        # Local row should be cleaned by the normal sync (shares=0)
+        assert db.get_portfolio_position("NBIS") is None
+
+    def test_get_alpaca_position_qty_returns_zero_on_not_found(self):
+        api = _mock_api()
+        api.get_position.side_effect = Exception("position does not exist")
+        db = Database(db_path=tempfile.mktemp(suffix=".db"))
+        trader = AlpacaTrader(db=db, api=api)
+        assert trader._get_alpaca_position_qty("NBIS") == 0
+
+    def test_get_alpaca_position_qty_fails_open_on_other_errors(self):
+        """Network / auth errors must NOT be treated as 'no position'."""
+        api = _mock_api()
+        api.get_position.side_effect = Exception("connection refused")
+        db = Database(db_path=tempfile.mktemp(suffix=".db"))
+        trader = AlpacaTrader(db=db, api=api)
+        # None means "unknown" — caller should fall through to normal sell
+        assert trader._get_alpaca_position_qty("NBIS") is None
+
+    def test_ghost_cleanup_does_not_block_other_tickers(self):
+        """A ghost on NBIS must not affect a BUY/SELL on a different ticker."""
+        trader, api, _ = self._make_trader(position_qty="10")  # AAPL has 10
+        api.get_position.return_value = _make_position()  # AAPL position OK
+
+        result = trader.track_trade(
+            "AAPL", "BUY", 5, 243.00,
+            stop_loss=238.0, take_profit=253.0,
+        )
         assert result.get("skipped") is not True
         api.submit_order.assert_called_once()
 
