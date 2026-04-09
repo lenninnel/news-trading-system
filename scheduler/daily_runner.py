@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -355,6 +356,73 @@ class DailyScheduler:
         return _XETRA_TICKERS
 
     @staticmethod
+    def _claim_session_slot(session_name: str) -> bool:
+        """Atomically claim today's slot for *session_name*.
+
+        Returns True if this caller is the first to run the session today
+        (and should proceed), False if another runner already claimed it.
+
+        Uses an ``INSERT OR IGNORE`` against a tiny ``session_runs`` table
+        in the shared SQLite database. SQLite serialises writes with file
+        locks, so two daemons sharing /data on Railway will see exactly
+        one INSERT succeed — the loser's INSERT no-ops with rowcount 0.
+
+        On any DB error this fails OPEN (returns True) so we never block
+        a real run because of a transient connectivity issue.
+        """
+        try:
+            from storage.database import _resolve_db_path
+            db_path = _resolve_db_path()
+        except Exception as exc:
+            log.warning("Could not resolve DB path for slot claim: %s", exc)
+            return True
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        started_at = datetime.now(timezone.utc).isoformat()
+        runner_id = (
+            os.environ.get("RAILWAY_REPLICA_ID")
+            or os.environ.get("RAILWAY_DEPLOYMENT_ID")
+            or os.environ.get("HOSTNAME")
+            or f"pid-{os.getpid()}"
+        )
+
+        try:
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS session_runs ("
+                    " session TEXT NOT NULL,"
+                    " run_date TEXT NOT NULL,"
+                    " started_at TEXT NOT NULL,"
+                    " runner_id TEXT,"
+                    " PRIMARY KEY (session, run_date)"
+                    ")"
+                )
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO session_runs "
+                    "(session, run_date, started_at, runner_id) VALUES (?, ?, ?, ?)",
+                    (session_name, today, started_at, runner_id),
+                )
+                conn.commit()
+                claimed = cursor.rowcount > 0
+            if claimed:
+                log.info(
+                    "[%s] Claimed session slot for %s (runner=%s)",
+                    session_name, today, runner_id,
+                )
+            else:
+                log.info(
+                    "[%s] Slot for %s already claimed (this runner=%s)",
+                    session_name, today, runner_id,
+                )
+            return claimed
+        except Exception as exc:
+            log.warning(
+                "[%s] Slot claim failed (%s) — failing open",
+                session_name, exc,
+            )
+            return True
+
+    @staticmethod
     def _build_telegram():
         try:
             from notifications.telegram_bot import TelegramNotifier
@@ -592,6 +660,34 @@ class DailyScheduler:
                 print(f"[scheduler] Skipping {run_name} — PRE sessions disabled",
                       flush=True)
                 return
+
+        # Idempotency: prevent the same session from firing twice on the
+        # same UTC day. This protects against deployment overlap (Railway
+        # rolling deploys leave the old container alive briefly, so both
+        # the old and new daemon would otherwise fire US_OPEN at 14:30,
+        # each loading whichever watchlist.yaml is baked into its image).
+        # The claim is atomic via SQLite INSERT OR IGNORE so any second
+        # caller — same process or different container sharing /data —
+        # sees the row already exists and bails out cleanly.
+        if not self._claim_session_slot(run_name):
+            log.warning(
+                "[%s] Skipping — session already claimed today by another runner",
+                run_name,
+            )
+            print(
+                f"[scheduler] Skipping {run_name} — already ran today "
+                f"(duplicate runner / deploy overlap)",
+                flush=True,
+            )
+            if self._tg:
+                try:
+                    self._tg._send(
+                        f"\u26a0\ufe0f Skipped duplicate *{run_name}* run "
+                        f"(another daemon already executed it today)."
+                    )
+                except Exception:
+                    pass
+            return
 
         # Resolve ticker list based on session
         if run_name in ("XETRA_OPEN", "XETRA_PRE"):
