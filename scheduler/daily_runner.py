@@ -278,6 +278,21 @@ _WINDOW_START = (6, 45)   # 06:45 (XETRA_PRE)
 _WINDOW_END   = (22, 30)  # 22:30
 
 
+def _runner_id() -> str:
+    """Stable identifier for *this* daemon process.
+
+    Used in logs / Telegram so that two daemons firing the same session
+    after a Railway rolling deploy can be told apart at a glance.
+    """
+    return (
+        os.environ.get("RAILWAY_REPLICA_ID")
+        or os.environ.get("RAILWAY_DEPLOYMENT_ID")
+        or os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")[:7]
+        or os.environ.get("HOSTNAME")
+        or f"pid-{os.getpid()}"
+    )
+
+
 def _is_execution_allowed() -> tuple[bool, str]:
     """
     Check whether trade execution is allowed based on environment.
@@ -379,12 +394,7 @@ class DailyScheduler:
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         started_at = datetime.now(timezone.utc).isoformat()
-        runner_id = (
-            os.environ.get("RAILWAY_REPLICA_ID")
-            or os.environ.get("RAILWAY_DEPLOYMENT_ID")
-            or os.environ.get("HOSTNAME")
-            or f"pid-{os.getpid()}"
-        )
+        runner_id = _runner_id()
 
         try:
             with sqlite3.connect(db_path, timeout=10) as conn:
@@ -712,21 +722,29 @@ class DailyScheduler:
 
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
+        runner_id = _runner_id()
 
-        # Telegram: starting
+        # Telegram: starting. Include runner_id + ticker count + first three
+        # tickers so a stale daemon firing an old watchlist is obvious in
+        # real-time (two messages with two different runner ids = deploy
+        # overlap, two messages with different ticker counts = stale yaml).
         if self._tg:
             try:
+                preview = ", ".join(tickers[:3])
+                if len(tickers) > 3:
+                    preview += f", \u2026 (+{len(tickers) - 3})"
                 self._tg._send(
                     f"\U0001f558 *{run_name}* ({session_type}) starting \u2014 {now_str} UTC\n"
-                    f"Tickers: {', '.join(tickers)}"
+                    f"Runner: `{runner_id}`\n"
+                    f"Tickers ({len(tickers)}): {preview}"
                 )
             except Exception as exc:
                 log.warning("Telegram session-start notification failed: %s", exc)
 
-        log.info("Starting %s [%s]: %d tickers, %d workers",
-                 run_name, session_type, len(tickers), workers)
-        print(f"[scheduler] Running {run_name} [{session_type}]: {', '.join(tickers)} "
-              f"({workers} workers)", flush=True)
+        log.info("Starting %s [%s]: %d tickers, %d workers (runner=%s)",
+                 run_name, session_type, len(tickers), workers, runner_id)
+        print(f"[scheduler] Running {run_name} [{session_type}] (runner={runner_id}): "
+              f"{', '.join(tickers)} ({workers} workers)", flush=True)
 
         execute, reason = _is_execution_allowed()
         if not execute:
