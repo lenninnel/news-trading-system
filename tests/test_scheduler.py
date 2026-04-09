@@ -75,29 +75,31 @@ class TestNextRunTime:
 
 
 class TestWeekendSkip:
-    def test_friday_after_eod_skips_to_monday(self, scheduler):
-        """Friday 23:00 UTC → next run is Monday XETRA_PRE at 06:45."""
+    def test_friday_after_eod_runs_sunday_sector_correlation(self, scheduler):
+        """Friday 23:00 UTC → next run is the Sunday sector-correlation job at 06:00."""
         # 2026-03-20 is a Friday
         friday_late = datetime(2026, 3, 20, 23, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=friday_late)
-        assert nrt.weekday() == 0  # Monday
-        assert nrt.day == 23
+        assert nrt.weekday() == 6  # Sunday
+        assert nrt.day == 22
         assert nrt.hour == 6
-        assert nrt.minute == 45
+        assert nrt.minute == 0
 
-    def test_saturday_skips_to_monday(self, scheduler):
-        """Saturday 12:00 UTC → next run is Monday XETRA_PRE at 06:45."""
+    def test_saturday_runs_sunday_sector_correlation(self, scheduler):
+        """Saturday 12:00 UTC → next run is the Sunday sector-correlation job at 06:00."""
         saturday = datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=saturday)
-        assert nrt.weekday() == 0
+        assert nrt.weekday() == 6  # Sunday
         assert nrt.hour == 6
+        assert nrt.minute == 0
 
-    def test_sunday_skips_to_monday(self, scheduler):
+    def test_sunday_after_weekly_skips_to_monday(self, scheduler):
         """Sunday 18:00 UTC → next run is Monday XETRA_PRE at 06:45."""
         sunday = datetime(2026, 3, 22, 18, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=sunday)
         assert nrt.weekday() == 0
         assert nrt.hour == 6
+        assert nrt.minute == 45
 
 
 # ── current_session ───────────────────────────────────────────────────
@@ -238,13 +240,21 @@ class TestScheduleConstants:
 
 
 class TestXetraTickerFiltering:
-    """XETRA tickers must only appear in XETRA_OPEN, never in US sessions."""
+    """XETRA tickers must only appear in XETRA_OPEN, never in US sessions.
+
+    XETRA tickers were removed from the live watchlist on 2026-04-09. The
+    scheduler routing logic still needs to work in case they are re-added,
+    so these tests stub the loaders to inject XETRA + US tickers explicitly.
+    """
+
+    _STUB_US = ["NVDA", "META", "JPM"]
+    _STUB_XETRA = ["SAP.XETRA", "SIE.XETRA"]
 
     @pytest.fixture
     def mixed_scheduler(self):
         """Scheduler whose full watchlist includes both US and XETRA tickers."""
         return DailyScheduler(
-            full_watchlist=["AAPL", "MSFT", "SAP.XETRA", "SIE.XETRA"]
+            full_watchlist=self._STUB_US + self._STUB_XETRA
         )
 
     def _captured_tickers(self, scheduler, session_name):
@@ -263,7 +273,9 @@ class TestXetraTickerFiltering:
             }
 
         with patch("scheduler.daily_runner.run_batch", side_effect=fake_run_batch), \
-             patch("scheduler.daily_runner._is_execution_allowed", return_value=(False, "test")):
+             patch("scheduler.daily_runner._is_execution_allowed", return_value=(False, "test")), \
+             patch.object(DailyScheduler, "_load_us_tickers", return_value=list(self._STUB_US)), \
+             patch.object(DailyScheduler, "_load_xetra_tickers", return_value=list(self._STUB_XETRA)):
             scheduler._execute_run(run)
 
         return captured.get("tickers")
@@ -280,24 +292,24 @@ class TestXetraTickerFiltering:
 
     def test_us_pre_excludes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "US_PRE")
-        assert "AAPL" in tickers
+        assert "NVDA" in tickers
         assert "SAP.XETRA" not in tickers
 
     def test_us_open_excludes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "US_OPEN")
-        assert "AAPL" in tickers
-        assert "MSFT" in tickers
+        assert "NVDA" in tickers
+        assert "META" in tickers
         assert "SAP.XETRA" not in tickers
         assert "SIE.XETRA" not in tickers
 
     def test_midday_excludes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "MIDDAY")
-        assert "AAPL" in tickers
+        assert "NVDA" in tickers
         assert "SAP.XETRA" not in tickers
         assert "SIE.XETRA" not in tickers
 
     def test_eod_excludes_xetra_tickers(self, mixed_scheduler):
         tickers = self._captured_tickers(mixed_scheduler, "EOD")
-        assert "AAPL" in tickers
+        assert "NVDA" in tickers
         assert "SAP.XETRA" not in tickers
         assert "SIE.XETRA" not in tickers

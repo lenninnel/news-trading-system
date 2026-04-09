@@ -2,50 +2,56 @@
 # News Trading System — daily scheduler configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Tickers to analyse every day (validated via walk-forward backtest 2026-03-20)
-# MOMENTUM: META, JPM  — passed Sharpe > 0.5 + win rate > 45%
-# PULLBACK: AAPL, MSFT, AMZN, XOM, CVX, BAC, PFE, TSLA — pullback edge confirmed
-# REMOVED:  NVDA, DELL, GOOGL, CEG, VST — failed backtest validation
+# Core watchlist (18 tickers) — covers AI/data centre power, crypto exposure,
+# mega-cap tech, financials, energy, healthcare, consumer staples.
+# REMOVED 2026-04-09: SAP.XETRA, SIE.XETRA, AAPL, MSFT
+# ADDED   2026-04-09: NVDA, COIN, MSTR, SMCI, VRT, AXON, UNH, COST, BE, NBIS
 
 # ── Ticker lists by exchange ─────────────────────────────────────────────────
 # US_OPEN / MIDDAY / EOD sessions run us_tickers only.
-# XETRA_OPEN runs xetra_tickers only.
 # The combined "watchlist" key is the union (kept for backward compat).
 
 us_tickers:
-  # --- Momentum strategy tickers ---
   - META
   - JPM
-  # --- Pullback strategy tickers ---
-  - AAPL
-  - MSFT
   - AMZN
   - XOM
   - CVX
   - BAC
   - PFE
   - TSLA
+  - NVDA
+  - COIN
+  - MSTR
+  - SMCI
+  - VRT
+  - AXON
+  - UNH
+  - COST
+  - BE
+  - NBIS
 
-xetra_tickers:
-  - SAP.XETRA
-  - SIE.XETRA
+xetra_tickers: []
 
 watchlist:
-  # --- Momentum strategy tickers ---
   - META
   - JPM
-  # --- Pullback strategy tickers ---
-  - AAPL
-  - MSFT
   - AMZN
   - XOM
   - CVX
   - BAC
   - PFE
   - TSLA
-  # --- German/EODHD (separate validation) ---
-  - SAP.XETRA
-  - SIE.XETRA
+  - NVDA
+  - COIN
+  - MSTR
+  - SMCI
+  - VRT
+  - AXON
+  - UNH
+  - COST
+  - BE
+  - NBIS
 
 # ── Account ───────────────────────────────────────────────────────────────────
 account:
