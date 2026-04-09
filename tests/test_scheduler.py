@@ -275,7 +275,8 @@ class TestXetraTickerFiltering:
         with patch("scheduler.daily_runner.run_batch", side_effect=fake_run_batch), \
              patch("scheduler.daily_runner._is_execution_allowed", return_value=(False, "test")), \
              patch.object(DailyScheduler, "_load_us_tickers", return_value=list(self._STUB_US)), \
-             patch.object(DailyScheduler, "_load_xetra_tickers", return_value=list(self._STUB_XETRA)):
+             patch.object(DailyScheduler, "_load_xetra_tickers", return_value=list(self._STUB_XETRA)), \
+             patch.object(DailyScheduler, "_claim_session_slot", return_value=True):
             scheduler._execute_run(run)
 
         return captured.get("tickers")
@@ -313,3 +314,67 @@ class TestXetraTickerFiltering:
         assert "NVDA" in tickers
         assert "SAP.XETRA" not in tickers
         assert "SIE.XETRA" not in tickers
+
+
+# ── Slot-claim idempotency (deploy-overlap protection) ───────────────
+
+
+class TestSessionSlotClaim:
+    """The daemon must not let the same session fire twice on the same UTC day.
+
+    On Railway a rolling deploy can leave the old container alive while the
+    new one starts; both daemons would otherwise call _execute_run for the
+    same session and fire two batches with two different watchlist.yaml
+    contents (each baked into its own image). The slot claim sits in the
+    shared SQLite DB so the second caller sees the row already exists.
+    """
+
+    @pytest.fixture
+    def isolated_db(self, tmp_path, monkeypatch):
+        """Point _resolve_db_path at a throwaway file."""
+        db_file = tmp_path / "slot_claim.db"
+        monkeypatch.setattr(
+            "storage.database._resolve_db_path",
+            lambda default=None: str(db_file),
+        )
+        return db_file
+
+    def test_first_claim_returns_true(self, isolated_db):
+        assert DailyScheduler._claim_session_slot("US_OPEN") is True
+
+    def test_second_claim_same_day_returns_false(self, isolated_db):
+        assert DailyScheduler._claim_session_slot("US_OPEN") is True
+        assert DailyScheduler._claim_session_slot("US_OPEN") is False
+
+    def test_different_sessions_independent(self, isolated_db):
+        assert DailyScheduler._claim_session_slot("US_OPEN") is True
+        assert DailyScheduler._claim_session_slot("MIDDAY") is True
+        assert DailyScheduler._claim_session_slot("EOD") is True
+
+    def test_failure_to_open_db_fails_open(self, monkeypatch):
+        """If we cannot reach the DB, the slot claim must NOT block real runs."""
+        def boom(*a, **kw):
+            raise RuntimeError("simulated DB outage")
+        monkeypatch.setattr(
+            "storage.database._resolve_db_path",
+            lambda default=None: "/no/such/path/forbidden.db",
+        )
+        monkeypatch.setattr("sqlite3.connect", boom)
+        assert DailyScheduler._claim_session_slot("US_OPEN") is True
+
+    def test_execute_run_skips_when_claim_lost(self):
+        """_execute_run must early-return when the claim returns False."""
+        sched = DailyScheduler(full_watchlist=["NVDA", "META"])
+        run = {
+            "name": "US_OPEN",
+            "hour": 14,
+            "minute": 30,
+            "tickers": None,
+            "workers": 3,
+            "eod": False,
+            "session_type": "execution",
+        }
+        with patch.object(DailyScheduler, "_claim_session_slot", return_value=False), \
+             patch("scheduler.daily_runner.run_batch") as mock_run_batch:
+            sched._execute_run(run)
+        mock_run_batch.assert_not_called()
