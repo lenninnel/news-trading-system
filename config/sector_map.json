@@ -1,0 +1,348 @@
+{
+  "AMZN": {
+    "industry": "internet_retail",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "META",
+      "TOL",
+      "COIN"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "AXON": {
+    "industry": "aerospace_and_defense",
+    "market_cap_bucket": "large",
+    "peers": [],
+    "region": "US",
+    "sector": "industrials"
+  },
+  "BAC": {
+    "industry": "banks___diversified",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "JPM",
+      "META",
+      "NVDA"
+    ],
+    "region": "US",
+    "sector": "financial_services"
+  },
+  "BE": {
+    "industry": "electrical_equipment_and_parts",
+    "market_cap_bucket": "large",
+    "peers": [
+      "VRT",
+      "NVDA",
+      "NBIS"
+    ],
+    "region": "US",
+    "sector": "industrials"
+  },
+  "CACI": {
+    "industry": "information_technology_services",
+    "market_cap_bucket": "large",
+    "peers": [],
+    "region": "US",
+    "sector": "technology"
+  },
+  "CASY": {
+    "industry": "specialty_retail",
+    "market_cap_bucket": "large",
+    "peers": [
+      "TOL",
+      "VIE.PA",
+      "AMZN"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "COFA.PA": {
+    "industry": "insurance___reinsurance",
+    "market_cap_bucket": "mid",
+    "peers": [
+      "VIE.PA",
+      "PFE",
+      "LEG.DE"
+    ],
+    "region": "FR",
+    "sector": "financial_services"
+  },
+  "COIN": {
+    "industry": "financial_data_and_stock_exchanges",
+    "market_cap_bucket": "large",
+    "peers": [
+      "MSTR",
+      "AMZN",
+      "NVDA"
+    ],
+    "region": "US",
+    "sector": "financial_services"
+  },
+  "COST": {
+    "industry": "discount_stores",
+    "market_cap_bucket": "mega",
+    "peers": [],
+    "region": "US",
+    "sector": "consumer_defensive"
+  },
+  "CVX": {
+    "industry": "oil_and_gas_integrated",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "XOM",
+      "TRGP",
+      "PBR"
+    ],
+    "region": "US",
+    "sector": "energy"
+  },
+  "DECK": {
+    "industry": "footwear_and_accessories",
+    "market_cap_bucket": "large",
+    "peers": [
+      "UFPI",
+      "TOL",
+      "META"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "FNTN.DE": {
+    "industry": "telecom_services",
+    "market_cap_bucket": "mid",
+    "peers": [
+      "VIE.PA",
+      "LEG.DE",
+      "VNA.DE"
+    ],
+    "region": "DE",
+    "sector": "communication_services"
+  },
+  "HOT.DE": {
+    "industry": "engineering_and_construction",
+    "market_cap_bucket": "large",
+    "peers": [
+      "META",
+      "VIE.PA",
+      "AMZN"
+    ],
+    "region": "DE",
+    "sector": "industrials"
+  },
+  "JPM": {
+    "industry": "banks___diversified",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "BAC",
+      "UFPI",
+      "META"
+    ],
+    "region": "US",
+    "sector": "financial_services"
+  },
+  "LEG.DE": {
+    "industry": "real_estate_services",
+    "market_cap_bucket": "mid",
+    "peers": [
+      "VNA.DE",
+      "VIE.PA",
+      "FNTN.DE"
+    ],
+    "region": "DE",
+    "sector": "real_estate"
+  },
+  "MEDP": {
+    "industry": "diagnostics_and_research",
+    "market_cap_bucket": "large",
+    "peers": [
+      "JPM",
+      "UNH"
+    ],
+    "region": "US",
+    "sector": "healthcare"
+  },
+  "META": {
+    "industry": "internet_content_and_information",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "NVDA",
+      "AMZN",
+      "JPM"
+    ],
+    "region": "US",
+    "sector": "communication_services"
+  },
+  "MSTR": {
+    "industry": "software___application",
+    "market_cap_bucket": "large",
+    "peers": [
+      "COIN",
+      "AMZN",
+      "NVDA"
+    ],
+    "region": "US",
+    "sector": "technology"
+  },
+  "NBIS": {
+    "industry": "internet_content_and_information",
+    "market_cap_bucket": "large",
+    "peers": [
+      "NVDA",
+      "BE",
+      "MSTR"
+    ],
+    "region": "NL",
+    "sector": "communication_services"
+  },
+  "NVDA": {
+    "industry": "semiconductors",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "META",
+      "BE",
+      "VRT"
+    ],
+    "region": "US",
+    "sector": "technology"
+  },
+  "PBR": {
+    "industry": "oil_and_gas_integrated",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "CVX",
+      "XOM"
+    ],
+    "region": "BR",
+    "sector": "energy"
+  },
+  "PFE": {
+    "industry": "drug_manufacturers___general",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "COFA.PA",
+      "VIE.PA",
+      "FNTN.DE"
+    ],
+    "region": "US",
+    "sector": "healthcare"
+  },
+  "SMCI": {
+    "industry": "computer_hardware",
+    "market_cap_bucket": "large",
+    "peers": [
+      "NVDA",
+      "VRT",
+      "BE"
+    ],
+    "region": "US",
+    "sector": "technology"
+  },
+  "TOL": {
+    "industry": "residential_construction",
+    "market_cap_bucket": "large",
+    "peers": [
+      "DECK",
+      "JPM",
+      "AMZN"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "TRGP": {
+    "industry": "oil_and_gas_midstream",
+    "market_cap_bucket": "large",
+    "peers": [
+      "XOM",
+      "CVX"
+    ],
+    "region": "US",
+    "sector": "energy"
+  },
+  "TSLA": {
+    "industry": "auto_manufacturers",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "NVDA",
+      "AMZN",
+      "META"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "TXRH": {
+    "industry": "restaurants",
+    "market_cap_bucket": "large",
+    "peers": [
+      "JPM",
+      "BAC",
+      "META"
+    ],
+    "region": "US",
+    "sector": "consumer_cyclical"
+  },
+  "UFPI": {
+    "industry": "lumber_and_wood_production",
+    "market_cap_bucket": "mid",
+    "peers": [
+      "JPM",
+      "DECK",
+      "TOL"
+    ],
+    "region": "US",
+    "sector": "basic_materials"
+  },
+  "UNH": {
+    "industry": "healthcare_plans",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "MEDP"
+    ],
+    "region": "US",
+    "sector": "healthcare"
+  },
+  "VIE.PA": {
+    "industry": "waste_management",
+    "market_cap_bucket": "large",
+    "peers": [
+      "COFA.PA",
+      "LEG.DE",
+      "VNA.DE"
+    ],
+    "region": "FR",
+    "sector": "industrials"
+  },
+  "VNA.DE": {
+    "industry": "real_estate_services",
+    "market_cap_bucket": "large",
+    "peers": [
+      "LEG.DE",
+      "VIE.PA",
+      "FNTN.DE"
+    ],
+    "region": "DE",
+    "sector": "real_estate"
+  },
+  "VRT": {
+    "industry": "electrical_equipment_and_parts",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "BE",
+      "NVDA",
+      "META"
+    ],
+    "region": "US",
+    "sector": "industrials"
+  },
+  "XOM": {
+    "industry": "oil_and_gas_integrated",
+    "market_cap_bucket": "mega",
+    "peers": [
+      "CVX",
+      "TRGP",
+      "PBR"
+    ],
+    "region": "US",
+    "sector": "energy"
+  }
+}

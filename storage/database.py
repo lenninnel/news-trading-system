@@ -1364,3 +1364,49 @@ class Database:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sector / peer lookups (sourced from config/sector_map.json)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SECTOR_MAP_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config",
+    "sector_map.json",
+)
+_SECTOR_MAP_CACHE: dict | None = None
+_SECTOR_MAP_MTIME: float | None = None
+
+
+def _load_sector_map() -> dict:
+    """Load (and memoise) the sector map. Reloads when the file changes on disk."""
+    global _SECTOR_MAP_CACHE, _SECTOR_MAP_MTIME
+    try:
+        mtime = os.path.getmtime(_SECTOR_MAP_PATH)
+    except OSError:
+        _SECTOR_MAP_CACHE = {}
+        _SECTOR_MAP_MTIME = None
+        return _SECTOR_MAP_CACHE
+    if _SECTOR_MAP_CACHE is None or mtime != _SECTOR_MAP_MTIME:
+        try:
+            with open(_SECTOR_MAP_PATH) as fh:
+                _SECTOR_MAP_CACHE = json.load(fh) or {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("could not read sector_map.json: %s", exc)
+            _SECTOR_MAP_CACHE = {}
+        _SECTOR_MAP_MTIME = mtime
+    return _SECTOR_MAP_CACHE
+
+
+def get_peers(ticker: str) -> list[str]:
+    """Return the list of correlated peers for *ticker* (empty if none)."""
+    entry = _load_sector_map().get(ticker.upper(), {})
+    peers = entry.get("peers") or []
+    return list(peers)
+
+
+def get_sector(ticker: str) -> str | None:
+    """Return the sector slug for *ticker*, or ``None`` if unknown."""
+    entry = _load_sector_map().get(ticker.upper(), {})
+    return entry.get("sector")

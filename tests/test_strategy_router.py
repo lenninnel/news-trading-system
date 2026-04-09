@@ -173,32 +173,39 @@ class TestPreferredTickersAlignment:
 
 
 class TestWatchlistConsistency:
-    """Verify the watchlist.yaml contains all routed tickers."""
+    """Verify the watchlist.yaml is in sync with the active universe (18 tickers)."""
+
+    # Subset of PULLBACK_TICKERS that survived the 2026-04-09 watchlist refresh.
+    # AAPL and MSFT are still routed to PullbackStrategy if encountered, but
+    # are no longer in the active scanning watchlist.
+    _ACTIVE_PULLBACK = {"AMZN", "XOM", "CVX", "BAC", "PFE", "TSLA"}
 
     def test_all_momentum_in_watchlist(self):
         wl = _load_watchlist()
         for t in MOMENTUM_TICKERS:
             assert t in wl, f"Momentum ticker {t} missing from watchlist"
 
-    def test_all_pullback_in_watchlist(self):
+    def test_active_pullback_in_watchlist(self):
         wl = _load_watchlist()
-        for t in PULLBACK_TICKERS:
+        for t in self._ACTIVE_PULLBACK:
             assert t in wl, f"Pullback ticker {t} missing from watchlist"
 
     def test_removed_tickers_not_in_watchlist(self):
         wl = _load_watchlist()
-        for t in ["NVDA", "DELL", "GOOGL", "CEG", "VST"]:
+        # Tickers explicitly dropped from the active universe
+        for t in ["AAPL", "MSFT", "SAP.XETRA", "SIE.XETRA", "DELL", "GOOGL", "CEG", "VST"]:
             assert t not in wl, f"Removed ticker {t} still in watchlist"
 
-    def test_german_tickers_in_watchlist(self):
+    def test_new_tickers_in_watchlist(self):
         wl = _load_watchlist()
-        assert "SAP.XETRA" in wl
-        assert "SIE.XETRA" in wl
+        # Added 2026-04-09
+        for t in ["NVDA", "COIN", "MSTR", "SMCI", "VRT", "AXON", "UNH", "COST", "BE", "NBIS"]:
+            assert t in wl, f"New ticker {t} missing from watchlist"
 
     def test_watchlist_total_count(self):
         wl = _load_watchlist()
-        # 2 momentum + 8 pullback + 2 German = 12
-        assert len(wl) == 12
+        # 18 core US tickers (2026-04-09 refresh)
+        assert len(wl) == 18
 
 
 class TestStopLossValues:

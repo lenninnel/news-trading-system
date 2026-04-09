@@ -44,12 +44,12 @@ from orchestrator.coordinator import Coordinator
 
 log = logging.getLogger(__name__)
 
-# Default watchlist — popular US large-caps across sectors
+# Default watchlist — 18 core US tickers (synced with config/watchlist.yaml)
 DEFAULT_WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
-    "META", "TSLA", "JPM", "V", "UNH",
-    "JNJ", "WMT", "PG", "MA", "HD",
-    "BAC", "XOM", "PFE", "COST", "ABBV",
+    "META", "JPM", "AMZN", "XOM", "CVX",
+    "BAC", "PFE", "TSLA", "NVDA", "COIN",
+    "MSTR", "SMCI", "VRT", "AXON", "UNH",
+    "COST", "BE", "NBIS",
 ]
 
 
@@ -235,8 +235,11 @@ def run_batch_sync(
 
 # ── Daemon scheduler ─────────────────────────────────────────────────
 
-# Session-specific watchlists (fallback — prefer YAML config)
-_XETRA_TICKERS = ["SAP.XETRA", "SIE.XETRA"]
+# Session-specific watchlists (fallback — prefer YAML config).
+# XETRA tickers are dropped from the live watchlist as of 2026-04-09; the
+# scheduler entries below stay in place but resolve to an empty ticker list,
+# making the XETRA sessions effective no-ops until tickers are re-added.
+_XETRA_TICKERS: list[str] = []
 
 # Session types:
 #   "signal"    — full signal generation, store forward signals for next session
@@ -253,6 +256,20 @@ SCHEDULE = [
     {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
     {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
     {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
+]
+
+# ── Weekly jobs ──────────────────────────────────────────────────────────────
+# Cron-style entries that fire on a specific weekday rather than every weekday.
+# Entries here are dispatched by ``_execute_weekly_run`` (not _execute_run) and
+# DO NOT participate in the ticker pipeline.
+WEEKLY_JOBS: list[dict] = [
+    {
+        "name": "SECTOR_CORRELATION",
+        "weekday": 6,   # Sunday (Mon=0 .. Sun=6)
+        "hour": 6,
+        "minute": 0,
+        "kind": "weekly",
+    },
 ]
 
 # Trading window (UTC)
@@ -355,28 +372,32 @@ class DailyScheduler:
     # ── Helper methods ────────────────────────────────────────────────
 
     def next_run_time(self, after: datetime | None = None) -> datetime:
-        """Return the next scheduled run time (UTC) after *after*."""
+        """Return the next scheduled run time (UTC) strictly after *after*.
+
+        Considers both the weekday SCHEDULE and any WEEKLY_JOBS (e.g. the
+        Sunday sector-correlation refresh) and returns whichever fires first.
+        """
         now = after or datetime.now(timezone.utc)
+        candidates: list[datetime] = []
 
-        # Check remaining runs today if it's a weekday
-        if now.weekday() < 5:
-            for run in SCHEDULE:
-                run_time = now.replace(
-                    hour=run["hour"], minute=run["minute"],
-                    second=0, microsecond=0,
-                )
-                if run_time > now:
-                    return run_time
+        # Look at the next 8 days — enough to cover any weekend skip + first
+        # Sunday weekly job after a Friday EOD.
+        for offset in range(8):
+            day = (now + timedelta(days=offset)).replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+            if day.weekday() < 5:
+                for run in SCHEDULE:
+                    t = day.replace(hour=run["hour"], minute=run["minute"])
+                    if t > now:
+                        candidates.append(t)
+            for job in WEEKLY_JOBS:
+                if day.weekday() == job["weekday"]:
+                    t = day.replace(hour=job["hour"], minute=job["minute"])
+                    if t > now:
+                        candidates.append(t)
 
-        # Advance to next weekday's first run
-        next_day = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0,
-        )
-        while next_day.weekday() >= 5:
-            next_day += timedelta(days=1)
-
-        first = SCHEDULE[0]
-        return next_day.replace(hour=first["hour"], minute=first["minute"])
+        return min(candidates)
 
     def seconds_until_next_run(self) -> int:
         """Seconds from now until the next scheduled run."""
@@ -508,7 +529,10 @@ class DailyScheduler:
                     time.sleep(wait_s)
 
                     if run_info:
-                        self._execute_run(run_info)
+                        if run_info.get("kind") == "weekly":
+                            self._execute_weekly_run(run_info)
+                        else:
+                            self._execute_run(run_info)
                         last_executed = run_info["name"]
 
                 except KeyboardInterrupt:
@@ -534,9 +558,19 @@ class DailyScheduler:
     # ── Execution ─────────────────────────────────────────────────────
 
     def _run_for_time(self, dt: datetime) -> dict | None:
-        for run in SCHEDULE:
-            if dt.hour == run["hour"] and dt.minute == run["minute"]:
-                return run
+        # Daily runs only fire on weekdays
+        if dt.weekday() < 5:
+            for run in SCHEDULE:
+                if dt.hour == run["hour"] and dt.minute == run["minute"]:
+                    return run
+        # Weekly jobs are weekday-specific
+        for job in WEEKLY_JOBS:
+            if (
+                dt.weekday() == job["weekday"]
+                and dt.hour == job["hour"]
+                and dt.minute == job["minute"]
+            ):
+                return job
         return None
 
     def _run_for_session(self, session_name: str) -> dict | None:
@@ -562,6 +596,11 @@ class DailyScheduler:
         # Resolve ticker list based on session
         if run_name in ("XETRA_OPEN", "XETRA_PRE"):
             tickers = run["tickers"] or self._load_xetra_tickers()
+            if not tickers:
+                log.info("Skipping %s — no XETRA tickers configured", run_name)
+                print(f"[scheduler] Skipping {run_name} — no XETRA tickers",
+                      flush=True)
+                return
         elif run_name == "PEAD_OPEN":
             from config.settings import PEAD_ENABLED, PEAD_TICKERS
             if not PEAD_ENABLED:
@@ -680,6 +719,43 @@ class DailyScheduler:
                     )
                 except Exception as tg_exc:
                     log.warning("Telegram error notification failed: %s", tg_exc)
+
+    # ── Weekly job dispatch ───────────────────────────────────────────
+
+    def _execute_weekly_run(self, job: dict) -> None:
+        """Run a weekly maintenance job (e.g. sector correlation refresh)."""
+        name = job["name"]
+        log.info("Starting weekly job %s", name)
+        print(f"[scheduler] Running weekly job {name}", flush=True)
+
+        if name == "SECTOR_CORRELATION":
+            try:
+                from scripts.sector_correlation import run as run_sector_correlation
+                summary = run_sector_correlation()
+                log.info("%s complete: %s", name, summary)
+                print(f"[scheduler] {name} done: {summary}", flush=True)
+                if self._tg:
+                    try:
+                        self._tg._send(
+                            f"\U0001f4ca *Sector correlation refresh*\n"
+                            f"Universe: {summary.get('universe_size')} tickers\n"
+                            f"Static refreshed: {summary.get('static_refreshed')}\n"
+                            f"Matrix refreshed: {summary.get('matrix_refreshed')}"
+                        )
+                    except Exception as exc:
+                        log.warning("Telegram weekly notification failed: %s", exc)
+            except Exception as exc:
+                log.error("Weekly job %s failed: %s", name, exc, exc_info=True)
+                print(f"[scheduler] ERROR in weekly job {name}: {exc}", flush=True)
+                if self._tg:
+                    try:
+                        self._tg._send(
+                            f"\U0001f6a8 *Weekly job {name} crashed:*\n{str(exc)[:300]}"
+                        )
+                    except Exception:
+                        pass
+        else:
+            log.warning("Unknown weekly job: %s", name)
 
     def _send_run_summary(self, run_name: str, batch: dict,
                           tickers: list[str]) -> None:
