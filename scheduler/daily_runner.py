@@ -689,7 +689,9 @@ class DailyScheduler:
                 f"(duplicate runner / deploy overlap)",
                 flush=True,
             )
-            if self._tg:
+            # Only send Telegram for non-XETRA duplicates (XETRA overlaps
+            # are common during deploys and just create noise).
+            if self._tg and run_name not in ("XETRA_OPEN", "XETRA_PRE"):
                 try:
                     self._tg._send(
                         f"\u26a0\ufe0f Skipped duplicate *{run_name}* run "

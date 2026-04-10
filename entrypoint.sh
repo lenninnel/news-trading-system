@@ -2,6 +2,30 @@
 echo "[entrypoint] /data check: exists=$(test -d /data && echo yes || echo no) writable=$(test -w /data && echo yes || echo no)"
 ls -la /data/ 2>/dev/null || echo "[entrypoint] /data not accessible"
 
+# ── Deploy overlap guard ────────────────────────────────────────
+# If a previous container is still draining, wait for it to die.
+LOCKFILE="/data/daemon.lock"
+if [ -f "$LOCKFILE" ]; then
+    OLD_PID=$(head -1 "$LOCKFILE" 2>/dev/null)
+    echo "[entrypoint] Lock file exists (old PID=$OLD_PID). Waiting up to 30s for old container to die..."
+    waited=0
+    while [ $waited -lt 30 ]; do
+        if ! kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "[entrypoint] Old process gone after ${waited}s"
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [ $waited -ge 30 ]; then
+        echo "[entrypoint] Timeout waiting for old process — continuing anyway"
+    fi
+fi
+# Write our PID + timestamp
+echo "$$" > "$LOCKFILE"
+date -u '+%Y-%m-%dT%H:%M:%SZ' >> "$LOCKFILE"
+echo "[entrypoint] Lock written (PID=$$)"
+
 echo "[entrypoint] Initialising database tables..."
 python3 -c "from storage.database import Database; db=Database(); print(f'[entrypoint] DB path: {db.db_path}')"
 
