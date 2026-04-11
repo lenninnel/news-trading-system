@@ -53,9 +53,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # ── Constants ────────────────────────────────────────────────────────────
 
-# Default SSE port chosen so it doesn't collide with the existing FastAPI
-# (8001) or Streamlit (8501) on the Hetzner box.
-DEFAULT_SSE_PORT = 8002
+# Default SSE port. 8000 → nts-api uvicorn (8001), proprietary-data-pipeline
+# (8002), then us. Streamlit takes 8501. Keep this in sync with
+# deployment/nts-mcp.service.
+DEFAULT_SSE_PORT = 8003
 
 # Session schedule mirrored from scheduler/daily_runner.py. Only the subset
 # needed for get_status — see that module for the canonical list. Updated
