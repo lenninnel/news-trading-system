@@ -1,0 +1,16 @@
+[Unit]
+Description=NTS MCP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/trading/news-trading-system
+EnvironmentFile=/home/trading/news-trading-system/.env
+ExecStart=/home/trading/news-trading-system/.venv/bin/python3 -m mcp_server.nts_mcp
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
