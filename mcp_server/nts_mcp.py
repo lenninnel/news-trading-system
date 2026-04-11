@@ -425,6 +425,20 @@ def _db_available() -> bool:
 # ── Tool: get_signal_detail ──────────────────────────────────────────────
 
 
+def _signal_events_has_column(column: str) -> bool:
+    """Return True iff signal_events has *column*. Cheap PRAGMA probe.
+
+    Used so get_signal_detail can degrade gracefully against an older DB
+    that's missing columns added by recent migrations (currently
+    ``macro_context_used`` from the MacroContextAgent rollout).
+    """
+    try:
+        rows = _query(f"PRAGMA table_info(signal_events)")
+        return any((r.get("name") or "") == column for r in rows)
+    except Exception:
+        return False
+
+
 @server.tool()
 async def get_signal_detail(ticker: str) -> str:
     """Last 10 signals for a ticker, including bull/bear debate cases.
@@ -437,12 +451,24 @@ async def get_signal_detail(ticker: str) -> str:
         return "Error: ticker argument is required."
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    rows = _query(
-        "SELECT timestamp, session, strategy, signal, confidence, "
+
+    # macro_context_used was added in a migration alongside
+    # MacroContextAgent. A DB that hasn't seen the migration yet (e.g.
+    # the MCP server pointed at a stale file) will raise
+    # OperationalError on the bare SELECT. Probe first and leave it off
+    # the projection if absent — the tool still renders everything else.
+    has_macro_col = _signal_events_has_column("macro_context_used")
+    columns = (
+        "timestamp, session, strategy, signal, confidence, "
         "rsi, sentiment_score, news_score, social_score, "
         "bull_case, bear_case, debate_outcome, price_at_signal, "
-        "outcome_3d_pct, outcome_5d_pct, outcome_10d_pct, trade_executed, "
-        "macro_context_used "
+        "outcome_3d_pct, outcome_5d_pct, outcome_10d_pct, trade_executed"
+    )
+    if has_macro_col:
+        columns += ", macro_context_used"
+
+    rows = _query(
+        f"SELECT {columns} "
         "FROM signal_events "
         "WHERE ticker = ? AND timestamp >= ? "
         "ORDER BY id DESC LIMIT 10",

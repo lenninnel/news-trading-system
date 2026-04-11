@@ -337,6 +337,68 @@ def test_get_signal_detail_is_case_insensitive(fixture_db):
     assert "Signal Detail: AAPL" in output
 
 
+def test_get_signal_detail_degrades_without_macro_column(tmp_path, monkeypatch):
+    """Older DBs without the macro_context_used column must still work.
+
+    The task ran into this on first Hetzner deploy: nts-trading had not
+    been restarted after the MacroContextAgent migration shipped, so
+    SignalLogger's ALTER TABLE had not run, so the column was absent.
+    Hard-coding it in the SELECT made the whole tool return "no signals".
+    Fix: probe the schema and omit the column if missing.
+    """
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(path))
+    # Minimal signal_events schema WITHOUT macro_context_used
+    conn.execute("""
+        CREATE TABLE signal_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            session TEXT,
+            ticker TEXT NOT NULL,
+            strategy TEXT,
+            signal TEXT NOT NULL,
+            confidence REAL,
+            rsi REAL,
+            sma_ratio REAL,
+            volume_ratio REAL,
+            sentiment_score REAL,
+            news_score REAL,
+            social_score REAL,
+            bull_case TEXT,
+            bear_case TEXT,
+            debate_outcome TEXT,
+            price_at_signal REAL,
+            trade_executed INTEGER DEFAULT 0,
+            trade_id TEXT,
+            outcome_3d_pct REAL,
+            outcome_5d_pct REAL,
+            outcome_10d_pct REAL
+        )
+    """)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO signal_events ("
+        "timestamp, session, ticker, strategy, signal, confidence, "
+        "bull_case, bear_case, debate_outcome, price_at_signal"
+        ") VALUES (?, 'US_OPEN', 'TSLA', 'Combined', 'BUY', 0.7, "
+        "'Legacy bull case', 'Legacy bear case', 'agree', 240.0)",
+        ((now - timedelta(hours=1)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("DB_PATH", str(path))
+
+    # The probe must confirm the column is missing before we query
+    assert nts_mcp._signal_events_has_column("macro_context_used") is False
+
+    output = asyncio.run(nts_mcp.get_signal_detail("TSLA"))
+    assert "Signal Detail: TSLA" in output
+    assert "Legacy bull case" in output
+    assert "Legacy bear case" in output
+    # "Macro context: used" line must NOT appear
+    assert "Macro context" not in output
+
+
 # ── Error handling: DB missing / schema broken ───────────────────────────
 
 
