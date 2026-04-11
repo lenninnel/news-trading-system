@@ -76,7 +76,9 @@ class TestScheduleSessionTypes:
     def test_all_sessions_have_session_type(self):
         for run in SCHEDULE:
             assert "session_type" in run, f"{run['name']} missing session_type"
-            assert run["session_type"] in ("signal", "pre_signal", "execution", "monitor")
+            assert run["session_type"] in (
+                "signal", "pre_signal", "execution", "monitor", "scanner",
+            )
 
 
 # ── Forward signals storage ──────────────────────────────────────────

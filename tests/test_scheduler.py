@@ -39,11 +39,11 @@ class TestNextRunTime:
         assert nrt.day == 16
 
     def test_between_runs_returns_next(self, scheduler):
-        """Monday 10:00 UTC → next run is US_PRE at 13:15."""
+        """Monday 10:00 UTC → next run is PREMARKET_SCAN at 13:00."""
         monday_10am = datetime(2026, 3, 16, 10, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_10am)
         assert nrt.hour == 13
-        assert nrt.minute == 15
+        assert nrt.minute == 0
 
     def test_after_midday_returns_eod(self, scheduler):
         """Monday 20:00 UTC → next run is EOD at 22:15."""
@@ -60,15 +60,19 @@ class TestNextRunTime:
         assert nrt.hour == 6
         assert nrt.minute == 45
 
-    def test_all_seven_runs_fire_on_weekday(self, scheduler):
-        """Starting from Monday 00:00, iterating should hit all 7 run times."""
+    def test_all_eight_runs_fire_on_weekday(self, scheduler):
+        """Starting from Monday 00:00, iterating should hit all 8 run times
+        (7 session runs + the D9 PREMARKET_SCAN at 13:00)."""
         t = datetime(2026, 3, 16, 0, 0, 0, tzinfo=timezone.utc)
         run_hours = []
-        for _ in range(7):
+        for _ in range(8):
             t = scheduler.next_run_time(after=t)
             run_hours.append((t.hour, t.minute))
             t = t.replace(second=1)
-        assert run_hours == [(6, 45), (7, 0), (13, 15), (13, 45), (14, 30), (18, 0), (22, 15)]
+        assert run_hours == [
+            (6, 45), (7, 0), (13, 0), (13, 15), (13, 45),
+            (14, 30), (18, 0), (22, 15),
+        ]
 
 
 # ── Weekend skip ──────────────────────────────────────────────────────
@@ -213,12 +217,16 @@ class TestEodSummary:
 
 
 class TestScheduleConstants:
-    def test_seven_runs_defined(self):
-        assert len(SCHEDULE) == 7
+    def test_eight_runs_defined(self):
+        # 7 ticker-batch sessions + D9 PREMARKET_SCAN (scanner)
+        assert len(SCHEDULE) == 8
 
     def test_run_names(self):
         names = [r["name"] for r in SCHEDULE]
-        assert names == ["XETRA_PRE", "XETRA_OPEN", "US_PRE", "PEAD_OPEN", "US_OPEN", "MIDDAY", "EOD"]
+        assert names == [
+            "XETRA_PRE", "XETRA_OPEN", "PREMARKET_SCAN", "US_PRE",
+            "PEAD_OPEN", "US_OPEN", "MIDDAY", "EOD",
+        ]
 
     def test_runs_are_chronological(self):
         minutes = [r["hour"] * 60 + r["minute"] for r in SCHEDULE]

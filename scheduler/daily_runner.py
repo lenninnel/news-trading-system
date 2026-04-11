@@ -250,13 +250,14 @@ _XETRA_TICKERS: list[str] = []
 #
 # Schedule: 7 runs per weekday, all times UTC
 SCHEDULE = [
-    {"name": "XETRA_PRE",  "hour": 6,  "minute": 45, "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
-    {"name": "XETRA_OPEN", "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
-    {"name": "US_PRE",     "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
-    {"name": "PEAD_OPEN",  "hour": 13, "minute": 45, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
-    {"name": "US_OPEN",    "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
-    {"name": "MIDDAY",     "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
-    {"name": "EOD",        "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
+    {"name": "XETRA_PRE",     "hour": 6,  "minute": 45, "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
+    {"name": "XETRA_OPEN",    "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
+    {"name": "PREMARKET_SCAN","hour": 13, "minute": 0,  "tickers": None,            "workers": 1, "eod": False, "session_type": "scanner"},
+    {"name": "US_PRE",        "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
+    {"name": "PEAD_OPEN",     "hour": 13, "minute": 45, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
+    {"name": "US_OPEN",       "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
+    {"name": "MIDDAY",        "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
+    {"name": "EOD",           "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
 ]
 
 # ── Weekly jobs ──────────────────────────────────────────────────────────────
@@ -342,8 +343,13 @@ class DailyScheduler:
             return DEFAULT_WATCHLIST
 
     @staticmethod
-    def _load_us_tickers() -> list[str]:
-        """Load US-only tickers from watchlist.yaml (us_tickers key)."""
+    def _load_us_tickers_core() -> list[str]:
+        """Load raw US core watchlist — no scanner layering.
+
+        Used by the scanner itself (to avoid infinite recursion) and as the
+        safety-floor fallback when the scanner is disabled or has no fresh
+        output.
+        """
         path = Path(__file__).resolve().parent.parent / "config" / "watchlist.yaml"
         try:
             with open(path) as fh:
@@ -355,6 +361,23 @@ class DailyScheduler:
             pass
         # Fallback: full watchlist minus XETRA
         return [t for t in DEFAULT_WATCHLIST if not t.endswith(".XETRA")]
+
+    @staticmethod
+    def _load_us_tickers() -> list[str]:
+        """Load US tickers for today's sessions.
+
+        When ENABLE_PREMARKET_SCANNER=true and a fresh scanner_output.json
+        exists, returns the scanner's expanded list (union with the core
+        watchlist). Otherwise returns the raw core watchlist — preserving
+        legacy behaviour.
+        """
+        core = DailyScheduler._load_us_tickers_core()
+        try:
+            from scripts.premarket_scanner import resolve_us_tickers
+            return resolve_us_tickers(core)
+        except Exception as exc:
+            log.warning("Scanner resolve failed (falling back to core): %s", exc)
+            return core
 
     @staticmethod
     def _load_xetra_tickers() -> list[str]:
@@ -699,6 +722,40 @@ class DailyScheduler:
                     )
                 except Exception:
                     pass
+            return
+
+        # D9 pre-market scanner — no ticker batch, just builds today's
+        # scanner_output.json. Subsequent US_PRE/US_OPEN sessions read it via
+        # _load_us_tickers() when ENABLE_PREMARKET_SCANNER=true.
+        if session_type == "scanner":
+            try:
+                from scripts.premarket_scanner import main as run_scanner_main
+                out = run_scanner_main(core_watchlist=self._load_us_tickers_core())
+                stats = out.get("stats", {})
+                log.info(
+                    "[%s] scanner complete — final=%d (universe=%d, liquid=%d, "
+                    "earnings=%d, momentum=%d, sentiment=%d)",
+                    run_name, stats.get("final_count", 0),
+                    stats.get("universe_size", 0), stats.get("post_liquidity", 0),
+                    stats.get("earnings_flagged", 0), stats.get("momentum_flagged", 0),
+                    stats.get("sentiment_flagged", 0),
+                )
+                if self._tg:
+                    try:
+                        self._tg._send(
+                            f"\U0001f50d *{run_name}* complete — {stats.get('final_count', 0)} "
+                            f"tickers picked (universe={stats.get('universe_size', 0)}, "
+                            f"earnings={stats.get('earnings_flagged', 0)}, "
+                            f"momentum={stats.get('momentum_flagged', 0)}, "
+                            f"sentiment={stats.get('sentiment_flagged', 0)})"
+                        )
+                    except Exception as exc:
+                        log.warning("Telegram scanner summary failed: %s", exc)
+            except Exception as exc:
+                log.warning("[%s] scanner failed (non-fatal, falls back to core watchlist): %s",
+                            run_name, exc)
+                print(f"[scheduler] {run_name} ERROR (fallback to core): {exc}",
+                      flush=True)
             return
 
         # Resolve ticker list based on session
