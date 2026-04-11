@@ -1,15 +1,21 @@
 """
-Tests for mcp_server/nts_mcp.py — direct-SQLite MCP server.
+Tests for mcp_server/nts_mcp.py — dual-mode (SQLite + HTTP) MCP server.
 
 Covers:
-    * DB_PATH resolution (env override, config fallback)
-    * Each of the 5 tools produces correct schema / text output
-    * Empty DB (no rows) is handled gracefully
-    * Missing DB file is handled gracefully (never raises)
-    * Schema errors (missing table) return empty, not exception
+    * Mode detection (NTS_API_URL presence flips the switch)
+    * SQLite path: all 5 tools produce correct output from a fixture DB
+    * HTTP path: all 5 tools route through httpx when NTS_API_URL is set
+    * HTTP failure modes: connect error, timeout, non-200 → friendly
+      single-line "Error: ..." strings (never raise into MCP client)
+    * DB_PATH resolution fallback
+    * Empty DB / schema missing columns / empty ticker all handled
     * Transparency: @server.tool() decorated functions are still directly
       callable as async coroutines (required by the task's verification
       step which does ``from mcp_server.nts_mcp import get_portfolio``).
+
+An autouse fixture clears ``NTS_API_URL`` from every test, so tests
+default to SQLite mode. HTTP-mode tests explicitly re-set the env var
+AND monkeypatch ``httpx.AsyncClient`` to avoid real network calls.
 """
 
 from __future__ import annotations
@@ -17,10 +23,19 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from mcp_server import nts_mcp
+
+
+@pytest.fixture(autouse=True)
+def _default_sqlite_mode(monkeypatch):
+    """Every test runs in SQLite mode unless it opts into HTTP explicitly."""
+    monkeypatch.delenv("NTS_API_URL", raising=False)
 
 
 # ── Schema & fixture helpers ─────────────────────────────────────────────
@@ -466,3 +481,306 @@ def test_parse_args_stdio_flag():
 def test_parse_args_port_override():
     args = nts_mcp._parse_args(["--port", "9000"])
     assert args.port == 9000
+
+
+# ── Mode detection ───────────────────────────────────────────────────────
+
+
+def test_http_mode_off_when_env_unset(monkeypatch):
+    monkeypatch.delenv("NTS_API_URL", raising=False)
+    assert nts_mcp._http_mode() is False
+
+
+def test_http_mode_on_when_env_set(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://example.test:8001")
+    assert nts_mcp._http_mode() is True
+    assert nts_mcp._api_base() == "http://example.test:8001"
+
+
+def test_http_mode_ignores_whitespace_only(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "   ")
+    assert nts_mcp._http_mode() is False
+
+
+def test_api_base_strips_trailing_slash(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://example.test:8001/")
+    assert nts_mcp._api_base() == "http://example.test:8001"
+
+
+# ── HTTP-mode tests ──────────────────────────────────────────────────────
+#
+# Pattern: set NTS_API_URL, then monkeypatch httpx.AsyncClient with a
+# factory that returns a stub whose .get() yields a canned response. No
+# real network I/O.
+
+
+def _fake_http_client(responses: dict[str, Any]):
+    """Return a factory function compatible with ``httpx.AsyncClient(...)``.
+
+    The returned factory yields an async context manager whose ``.get()``
+    method inspects the requested URL, looks it up in ``responses``, and
+    returns a stub Response whose ``.json()`` returns the mapped payload.
+    Unmapped paths raise httpx.ConnectError to make missing-stub cases
+    loud in tests.
+    """
+
+    class _StubResponse:
+        def __init__(self, payload: Any):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _StubClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, params=None):
+            for path_frag, payload in responses.items():
+                if path_frag in url:
+                    return _StubResponse(payload)
+            raise httpx.ConnectError(f"no stub for {url}")
+
+    return _StubClient
+
+
+def test_get_portfolio_http_mode(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    stub_payload = {
+        "value": 12345.67,
+        "cash": 5000.00,
+        "daily_pnl": 123.45,
+        "daily_pnl_pct": 1.01,
+        "positions": [
+            {"ticker": "NVDA", "shares": 10, "entry": 800.0,
+             "current": 820.0, "pnl_pct": 2.5},
+            {"ticker": "META", "shares": 5, "entry": 500.0,
+             "current": 510.0, "pnl_pct": 2.0},
+        ],
+    }
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/portfolio": stub_payload}),
+    )
+
+    output = asyncio.run(nts_mcp.get_portfolio())
+    assert "Portfolio Summary" in output
+    assert "$12,345.67" in output
+    assert "$5,000.00" in output
+    assert "NVDA" in output
+    assert "META" in output
+    assert "+2.5%" in output
+
+
+def test_get_signals_http_mode_filters_strategy_client_side(monkeypatch):
+    """FastAPI doesn't support strategy= — HTTP mode filters client-side."""
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    now = datetime.now(timezone.utc).isoformat()
+    payload = [
+        {"timestamp": now, "ticker": "AAPL", "strategy": "Combined",
+         "signal": "BUY", "confidence": 0.8, "price_at_signal": 180.0,
+         "debate_outcome": "agree", "outcome_3d_pct": None,
+         "trade_executed": False},
+        {"timestamp": now, "ticker": "MSFT", "strategy": "PEAD",
+         "signal": "WEAK BUY", "confidence": 0.5, "price_at_signal": 400.0,
+         "debate_outcome": "-", "outcome_3d_pct": None,
+         "trade_executed": False},
+    ]
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/signals": payload}),
+    )
+
+    # No filter → both
+    out = asyncio.run(nts_mcp.get_signals(days=7))
+    assert "AAPL" in out
+    assert "MSFT" in out
+    assert "Found 2 signal(s)" in out
+
+    # PEAD filter → MSFT only
+    out = asyncio.run(nts_mcp.get_signals(days=7, strategy="PEAD"))
+    assert "MSFT" in out
+    assert "AAPL" not in out
+    assert "Found 1 signal(s)" in out
+
+
+def test_get_performance_http_mode(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    payload = {
+        "total_trades": 7,
+        "win_rate": 71.4,
+        "signals_today": 3,
+        "sessions_today": 2,
+        # HTTP mode doesn't get the per-strategy breakdown
+    }
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/performance": payload}),
+    )
+    out = asyncio.run(nts_mcp.get_performance())
+    assert "Total trades:     7" in out
+    assert "71.4%" in out
+    assert "Signals today:    3" in out
+    # No strategy breakdown section when HTTP payload doesn't include it
+    assert "Strategy breakdown" not in out
+
+
+def test_get_status_http_mode(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    payload = {
+        "running": True,
+        "mode": "ibkr_paper",
+        "last_session": "US_PRE",
+        "last_run_at": "2026-04-11T13:15:00+00:00",
+        "next_session": "US_OPEN",
+        "next_run_at": "2026-04-11T14:30:00+00:00",
+        "watchlist": ["META", "JPM", "NVDA"],
+    }
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/status": payload}),
+    )
+    out = asyncio.run(nts_mcp.get_status())
+    assert "Running:       Yes" in out
+    assert "Mode:          ibkr_paper" in out
+    assert "Last session:  US_PRE" in out
+    assert "Next session:  US_OPEN" in out
+    assert "META, JPM, NVDA" in out
+
+
+def test_get_signal_detail_http_mode(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    now = datetime.now(timezone.utc).isoformat()
+    payload = [
+        {
+            "timestamp": now,
+            "session": "US_OPEN",
+            "strategy": "Combined",
+            "signal": "STRONG BUY",
+            "confidence": 0.82,
+            "rsi": 55.0,
+            "sentiment_score": 0.6,
+            "news_score": 0.65,
+            "social_score": 0.55,
+            "bull_case": "Remote bull case text.",
+            "bear_case": "Remote bear case text.",
+            "debate_outcome": "agree",
+            "price_at_signal": 185.50,
+            "outcome_3d_pct": 2.5,
+            "outcome_5d_pct": None,
+            "outcome_10d_pct": None,
+            "trade_executed": False,
+        },
+    ]
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/signals": payload}),
+    )
+    out = asyncio.run(nts_mcp.get_signal_detail("AAPL"))
+    assert "Signal Detail: AAPL" in out
+    assert "STRONG BUY" in out
+    assert "Remote bull case text." in out
+    assert "Remote bear case text." in out
+    assert "3d=+2.50%" in out
+
+
+# ── HTTP failure modes ───────────────────────────────────────────────────
+
+
+def _failing_http_client(exc: Exception):
+    class _StubClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, params=None):
+            raise exc
+
+    return _StubClient
+
+
+def test_http_mode_connect_error_returns_friendly_message(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _failing_http_client(httpx.ConnectError("refused")),
+    )
+    out = asyncio.run(nts_mcp.get_portfolio())
+    assert out.startswith("Error:")
+    assert "cannot reach" in out.lower()
+    assert "stub.test" in out
+
+
+def test_http_mode_timeout_returns_friendly_message(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _failing_http_client(httpx.ReadTimeout("slow")),
+    )
+    out = asyncio.run(nts_mcp.get_signals(days=7))
+    assert out.startswith("Error:")
+    assert "timed out" in out.lower()
+
+
+def test_http_mode_500_status_returns_friendly_message(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    fake_resp = MagicMock()
+    fake_resp.status_code = 500
+    status_error = httpx.HTTPStatusError(
+        "server error",
+        request=MagicMock(),
+        response=fake_resp,
+    )
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _failing_http_client(status_error),
+    )
+    out = asyncio.run(nts_mcp.get_performance())
+    assert out.startswith("Error:")
+    assert "500" in out
+
+
+# ── Mode switching within a single test ────────────────────────────────
+
+
+def test_fetch_functions_respect_current_mode(fixture_db, monkeypatch):
+    """Prove HTTP mode and SQLite mode can coexist in one process.
+
+    Without NTS_API_URL: SQLite path runs against the fixture DB.
+    Then set NTS_API_URL + stub httpx: HTTP path runs.
+    The module-level ``_http_mode()`` helper reads env on every call, so
+    no reload / restart is needed.
+    """
+    # SQLite mode first — fixture_db fixture has set DB_PATH, no env URL
+    sqlite_out = asyncio.run(nts_mcp.get_portfolio())
+    assert "AAPL" in sqlite_out  # from the fixture's positions
+
+    # Now flip to HTTP mode
+    monkeypatch.setenv("NTS_API_URL", "http://stub.test")
+    monkeypatch.setattr(
+        nts_mcp.httpx, "AsyncClient",
+        _fake_http_client({"/api/portfolio": {
+            "value": 99.0, "cash": 1.0,
+            "daily_pnl": 0.0, "daily_pnl_pct": 0.0,
+            "positions": [{"ticker": "REMOTE", "shares": 1,
+                          "entry": 99.0, "current": 99.0, "pnl_pct": 0.0}],
+        }}),
+    )
+    http_out = asyncio.run(nts_mcp.get_portfolio())
+    assert "REMOTE" in http_out
+    assert "AAPL" not in http_out
