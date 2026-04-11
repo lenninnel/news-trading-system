@@ -41,6 +41,7 @@ uvicorn[standard]
 # Test deps moved to requirements-test.txt — NEVER install in production.
 # pip install -r requirements-test.txt
 ib_insync
+nest_asyncio
 
 # ── MCP server (Claude integration) ─────────────────────────────────────────
 mcp

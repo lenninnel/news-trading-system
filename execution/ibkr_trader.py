@@ -20,9 +20,18 @@ import os
 import sys
 from typing import Any
 
+import nest_asyncio
 import pandas as pd
 
 from storage.database import Database
+
+# ib_insync's sync API (IB.connect, IB.placeOrder, ib.sleep) internally calls
+# util.run() which grabs the running event loop. When IBKRTrader is instantiated
+# inside asyncio.run(run_batch(...)) — as happens in every scheduled session —
+# there is already a running loop and the connect fails with
+# "This event loop is already running". nest_asyncio patches asyncio to allow
+# the nested use; it's a no-op when no loop is running (daemon startup path).
+nest_asyncio.apply()
 
 log = logging.getLogger(__name__)
 
