@@ -124,6 +124,7 @@ class Coordinator:
         apewisdom_feed: ApeWisdomFeed | None = None,
         adanos_feed: AdanosFeed | None = None,
         debate_agent: BullBearDebate | None = None,
+        macro_context: str = "",
     ) -> None:
         self.db = db or Database()
         self.news_feed = news_feed or NewsFeed()
@@ -142,6 +143,10 @@ class Coordinator:
         self.apewisdom_feed = apewisdom_feed or ApeWisdomFeed()
         self.adanos_feed = adanos_feed or AdanosFeed()
         self.signal_logger = SignalLogger(db=self.db)
+        # Once-per-session macro context injected by the scheduler. Empty
+        # string when ENABLE_MACRO_CONTEXT is off, the session is non-US,
+        # or the Haiku call failed — debate prompts stay legacy.
+        self.macro_context = macro_context or ""
 
         # PEAD strategy (no Claude API needed — pure data)
         from config.settings import PEAD_ENABLED, PEAD_TICKERS, PEAD_EARNINGS_CACHE_PATH
@@ -316,6 +321,10 @@ class Coordinator:
                 "price_at_signal": price,
                 "trade_executed": 1 if execution.get("trade_id") else 0,
                 "trade_id": execution.get("trade_id"),
+                # getattr fallback: some tests use Coordinator.__new__() to
+                # build a stub that skips __init__, so macro_context may not
+                # exist as an attribute. Default to empty/False.
+                "macro_context_used": bool(getattr(self, "macro_context", "")),
             })
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
@@ -915,6 +924,7 @@ class Coordinator:
                     confidence=conf,
                     technical_data=technical.get("indicators", {}),
                     sentiment_data={"signal": sentiment["signal"], "avg_score": sentiment["avg_score"]},
+                    macro_context=self.macro_context,
                 )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
@@ -1353,6 +1363,7 @@ class Coordinator:
                         confidence=conf,
                         technical_data=technical.get("indicators", {}),
                         sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                        macro_context=self.macro_context,
                     )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
@@ -1697,6 +1708,7 @@ class Coordinator:
                         confidence=conf,
                         technical_data={},
                         sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
+                        macro_context=self.macro_context,
                     )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
@@ -1875,6 +1887,7 @@ class Coordinator:
                             "signal": cached_signal,
                             "avg_score": cached.get("sentiment_score", 0),
                         },
+                        macro_context=self.macro_context,
                     )
                 combined_signal = debate_result.final_signal
                 conf = debate_result.adjusted_confidence

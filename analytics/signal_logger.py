@@ -100,6 +100,16 @@ class SignalLogger:
                     conn.execute("ALTER TABLE signal_events ADD COLUMN regime TEXT")
                 except Exception:
                     pass  # column already exists
+                # Add macro_context_used column if missing (MacroContextAgent
+                # measurement hook — future analytics can compare debate
+                # outcomes with vs without macro context).
+                try:
+                    conn.execute(
+                        "ALTER TABLE signal_events "
+                        "ADD COLUMN macro_context_used INTEGER DEFAULT 0"
+                    )
+                except Exception:
+                    pass  # column already exists
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -119,8 +129,8 @@ class SignalLogger:
                          sentiment_score, news_score, social_score,
                          bull_case, bear_case, debate_outcome,
                          price_at_signal, trade_executed, trade_id,
-                         regime)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         regime, macro_context_used)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -142,6 +152,7 @@ class SignalLogger:
                         int(signal_data.get("trade_executed", 0)),
                         signal_data.get("trade_id"),
                         signal_data.get("regime"),
+                        int(bool(signal_data.get("macro_context_used", 0))),
                     ),
                 )
         except Exception as exc:

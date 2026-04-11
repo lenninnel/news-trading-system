@@ -133,6 +133,7 @@ async def run_batch(
     execute: bool = False,
     session: str | None = None,
     session_type: str = "signal",
+    macro_context: str = "",
 ) -> dict:
     """
     Analyse a list of tickers concurrently.
@@ -144,6 +145,9 @@ async def run_batch(
         execute:         When True, execute trades via broker.
         session:         Trading session name (e.g. "US_OPEN").
         session_type:    "signal" | "execution" | "monitor".
+        macro_context:   Session-level macro block from MacroContextAgent,
+                         prepended to every bull/bear debate prompt. Empty
+                         string when the feature is off.
 
     Returns:
         dict with keys: results, elapsed_s, success_count, fail_count.
@@ -155,7 +159,7 @@ async def run_batch(
     worker_semaphore = asyncio.Semaphore(workers)
     tracker = _ProgressTracker(len(tickers))
 
-    coordinator = Coordinator()
+    coordinator = Coordinator(macro_context=macro_context)
 
     t0 = time.monotonic()
 
@@ -341,6 +345,25 @@ class DailyScheduler:
             return cfg.get("watchlist", DEFAULT_WATCHLIST)
         except Exception:
             return DEFAULT_WATCHLIST
+
+    @staticmethod
+    def _fetch_macro_context(session: str) -> str:
+        """Run ``MacroContextAgent.get_context`` in a fresh event loop.
+
+        This is called from the sync ``_execute_run`` path before
+        ``asyncio.run(run_batch(...))``. MacroContextAgent itself handles
+        the ENABLE_MACRO_CONTEXT feature flag, US-only session filter, and
+        timeout — returning an empty string on any failure. We just route
+        the call through a dedicated ``asyncio.run`` so the subsequent
+        ``run_batch`` call still starts with a clean loop.
+        """
+        try:
+            from agents.macro_context_agent import MacroContextAgent
+            agent = MacroContextAgent()
+            return asyncio.run(agent.get_context(session))
+        except Exception as exc:
+            log.warning("MacroContext fetch failed (non-fatal): %s", exc)
+            return ""
 
     @staticmethod
     def _load_us_tickers_core() -> list[str]:
@@ -783,6 +806,17 @@ class DailyScheduler:
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
         runner_id = _runner_id()
 
+        # Fetch session-level macro context BEFORE the Telegram start
+        # message so it can be included in the preview. The agent returns
+        # "" when ENABLE_MACRO_CONTEXT=false, the session is non-US, or
+        # anything goes wrong — so this call is always safe to make.
+        macro_context = self._fetch_macro_context(run_name)
+        macro_preview = ""
+        if macro_context:
+            # Collapse whitespace so Telegram doesn't render multiple lines
+            flat = " ".join(macro_context.split())
+            macro_preview = flat[:100] + ("…" if len(flat) > 100 else "")
+
         # Telegram: starting. Include runner_id + ticker count + first three
         # tickers so a stale daemon firing an old watchlist is obvious in
         # real-time (two messages with two different runner ids = deploy
@@ -793,11 +827,14 @@ class DailyScheduler:
                 preview = ", ".join(tickers[:3])
                 if len(tickers) > 3:
                     preview += f", \u2026 (+{len(tickers) - 3})"
-                self._tg._send(
+                message = (
                     f"\U0001f558 *{run_name}* ({session_type}) starting \u2014 {now_str} UTC\n"
                     f"Runner: `{runner_id}`\n"
                     f"Tickers ({len(tickers)}): {preview}"
                 )
+                if macro_preview:
+                    message += f"\nMacro: {macro_preview}"
+                self._tg._send(message)
             except Exception as exc:
                 log.warning("Telegram session-start notification failed: %s", exc)
 
@@ -831,6 +868,7 @@ class DailyScheduler:
                     execute=execute,
                     session=run_name,
                     session_type=session_type,
+                    macro_context=macro_context,
                 )
             )
 

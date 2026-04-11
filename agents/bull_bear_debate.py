@@ -132,6 +132,7 @@ class BullResearcher:
         confidence: float,
         technical_data: dict,
         sentiment_data: dict,
+        macro_context: str = "",
     ) -> dict:
         user_msg = _BULL_USER.format(
             ticker=ticker,
@@ -140,6 +141,12 @@ class BullResearcher:
             technical=json.dumps(technical_data, default=str),
             sentiment=json.dumps(sentiment_data, default=str),
         )
+        # Prepend session-level macro context to the *user* message so the
+        # cached system prompt stays stable across tickers (ephemeral cache
+        # is keyed on the system block). The separator makes it easy for
+        # Claude to treat it as orientation rather than ticker data.
+        if macro_context:
+            user_msg = f"{macro_context}\n\n---\n\n{user_msg}"
 
         def _call():
             kwargs: dict = {
@@ -184,6 +191,7 @@ class BearResearcher:
         confidence: float,
         technical_data: dict,
         sentiment_data: dict,
+        macro_context: str = "",
     ) -> dict:
         user_msg = _BEAR_USER.format(
             ticker=ticker,
@@ -192,6 +200,8 @@ class BearResearcher:
             technical=json.dumps(technical_data, default=str),
             sentiment=json.dumps(sentiment_data, default=str),
         )
+        if macro_context:
+            user_msg = f"{macro_context}\n\n---\n\n{user_msg}"
 
         def _call():
             kwargs: dict = {
@@ -251,6 +261,7 @@ class BullBearDebate:
         confidence: float,
         technical_data: dict,
         sentiment_data: dict,
+        macro_context: str = "",
     ) -> DebateResult:
         """Run bull/bear debate and return adjusted signal + confidence."""
 
@@ -271,6 +282,7 @@ class BullBearDebate:
             confidence=confidence,
             technical_data=technical_data,
             sentiment_data=sentiment_data,
+            macro_context=macro_context,
         )
 
         try:
@@ -300,6 +312,7 @@ class BullBearDebate:
         confidence: float,
         technical_data: dict,
         sentiment_data: dict,
+        macro_context: str = "",
     ) -> DebateResult:
         """Async version — runs bull and bear in parallel via asyncio."""
 
@@ -319,6 +332,7 @@ class BullBearDebate:
             confidence=confidence,
             technical_data=technical_data,
             sentiment_data=sentiment_data,
+            macro_context=macro_context,
         )
 
         try:
