@@ -346,6 +346,81 @@ class DailyScheduler:
         except Exception:
             return DEFAULT_WATCHLIST
 
+    def _run_post_session_review(
+        self,
+        session: str,
+        tickers: list[str],
+        batch: dict,
+    ) -> None:
+        """Run PostSessionReviewer and persist / deliver the result.
+
+        Fire-and-forget helper: the reviewer's own flag gating + fallback
+        to "" handles the disabled case. On any unexpected failure we log
+        and return — the session has already completed, nothing to roll
+        back.
+
+        Responsibilities split from the agent:
+            1. Extract a lightweight signals list from the batch results
+               (the agent doesn't touch the full Coordinator output).
+            2. Call the agent (async; wrap in asyncio.run since we're
+               on the sync _execute_run hot path).
+            3. Send the text via Telegram (self._tg).
+            4. Log the review to signal_events under strategy
+               "PostSessionReviewer" so the text is retrievable later.
+        """
+        # 1. Build the signals list the agent expects: one dict per
+        #    ticker with the fields the prompt / flags need.
+        signals: list[dict] = []
+        for r in (batch.get("results") or []):
+            if not r:
+                continue
+            execution = r.get("execution") or {}
+            signals.append({
+                "ticker": r.get("ticker"),
+                "signal": r.get("combined_signal") or r.get("signal"),
+                "confidence": r.get("confidence"),
+                "debate_outcome": (
+                    (r.get("debate") or {}).get("summary")
+                    if isinstance(r.get("debate"), dict)
+                    else None
+                ),
+                "trade_executed": bool(execution.get("trade_id")),
+            })
+
+        # 2. Run the agent. The reviewer has its own ENABLE flag check —
+        #    returns "" immediately if disabled or on any failure.
+        try:
+            from agents.post_session_reviewer import PostSessionReviewer
+            review_text = asyncio.run(
+                PostSessionReviewer().review(session, tickers, signals)
+            )
+        except Exception as exc:
+            log.warning("PostSessionReviewer: agent call failed: %s", exc)
+            review_text = ""
+
+        if not review_text:
+            return  # disabled or failed; nothing more to do
+
+        # 3. Telegram
+        if self._tg:
+            try:
+                self._tg._send(review_text)
+            except Exception as exc:
+                log.warning("PostSessionReviewer: Telegram send failed: %s", exc)
+
+        # 4. signal_events row for later retrieval
+        try:
+            from analytics.signal_logger import SignalLogger
+            SignalLogger().log({
+                "session": session,
+                "ticker": "SESSION",  # sentinel — not a real ticker
+                "strategy": "PostSessionReviewer",
+                "signal": "REVIEW",
+                "bull_case": review_text,
+            })
+        except Exception as exc:
+            log.warning("PostSessionReviewer: signal_events log failed: %s", exc)
+
     @staticmethod
     def _fetch_macro_context(session: str) -> str:
         """Run ``MacroContextAgent.get_context`` in a fresh event loop.
@@ -919,6 +994,23 @@ class DailyScheduler:
                           flush=True)
                 except Exception as exc:
                     log.warning("Strategy performance tracker failed (non-fatal): %s", exc)
+
+            # Post-session review (EOD always, US_OPEN only when a trade
+            # was actually executed during the session). Fire-and-forget —
+            # the reviewer has its own feature flag and never blocks if
+            # disabled or failing.
+            try:
+                any_trade = any(
+                    ((r or {}).get("execution") or {}).get("trade_id")
+                    for r in (batch.get("results") or [])
+                )
+                should_review = run["eod"] or (
+                    run_name == "US_OPEN" and any_trade
+                )
+                if should_review:
+                    self._run_post_session_review(run_name, tickers, batch)
+            except Exception as exc:
+                log.warning("PostSessionReviewer dispatch failed (non-fatal): %s", exc)
 
         except Exception as exc:
             log.error("Scheduler error in %s: %s", run_name, exc)
