@@ -389,10 +389,17 @@ class DailyScheduler:
 
         # 2. Run the agent. The reviewer has its own ENABLE flag check —
         #    returns "" immediately if disabled or on any failure.
+        reviewer = getattr(self, "_reviewer", None)
+        if reviewer is None:
+            try:
+                from agents.post_session_reviewer import PostSessionReviewer
+                reviewer = PostSessionReviewer()
+            except Exception as exc:
+                log.warning("PostSessionReviewer: could not create reviewer: %s", exc)
+                return
         try:
-            from agents.post_session_reviewer import PostSessionReviewer
             review_text = asyncio.run(
-                PostSessionReviewer().review(session, tickers, signals)
+                reviewer.review(session, tickers, signals)
             )
         except Exception as exc:
             log.warning("PostSessionReviewer: agent call failed: %s", exc)
@@ -676,6 +683,15 @@ class DailyScheduler:
                 )
             except Exception as exc:
                 log.warning("Telegram startup notification failed: %s", exc)
+
+        # Create PostSessionReviewer once at startup (reused across sessions)
+        self._reviewer = None
+        try:
+            from agents.post_session_reviewer import PostSessionReviewer
+            self._reviewer = PostSessionReviewer()
+            log.info("PostSessionReviewer initialised")
+        except Exception as exc:
+            log.warning("PostSessionReviewer init failed (non-fatal): %s", exc)
 
         # Start the intraday position manager (stop-loss / trailing-stop monitor)
         position_manager = None
@@ -1038,6 +1054,16 @@ class DailyScheduler:
                     )
                 except Exception as tg_exc:
                     log.warning("Telegram error notification failed: %s", tg_exc)
+        finally:
+            # Cleanly disconnect IBKR at end of every session so the next
+            # session reconnects to a fresh socket instead of inheriting a
+            # stale one that silently dropped between sessions.
+            if hasattr(self, '_position_manager_trader') and self._position_manager_trader is not None:
+                try:
+                    if hasattr(self._position_manager_trader, 'disconnect'):
+                        self._position_manager_trader.disconnect()
+                except Exception:
+                    pass
 
     # ── Weekly job dispatch ───────────────────────────────────────────
 

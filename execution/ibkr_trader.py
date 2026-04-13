@@ -139,6 +139,18 @@ class IBKRTrader:
             log.error("IBKR reconnect failed: %s", exc)
             return False
 
+    def disconnect(self) -> None:
+        """Cleanly sever the ib_async connection if one exists.
+
+        Called at the end of each trading session so the next session
+        starts with a fresh socket instead of inheriting a stale one.
+        """
+        try:
+            self._ib.disconnect()
+            log.info("IBKR disconnected cleanly")
+        except Exception:
+            pass
+
     def ensure_connected(self) -> bool:
         """Ensure connection is live, reconnect if needed."""
         if self.is_connected():
