@@ -679,10 +679,12 @@ class DailyScheduler:
 
         # Start the intraday position manager (stop-loss / trailing-stop monitor)
         position_manager = None
+        self._position_manager_trader = None
         try:
             from execution.broker_factory import create_trader
             from monitoring.position_manager import PositionManager
             trader = create_trader()
+            self._position_manager_trader = trader
             position_manager = PositionManager(
                 trader=trader, notifier=self._tg,
             )
@@ -933,6 +935,19 @@ class DailyScheduler:
                     log.info("Expired %d stale forward signals", expired)
             except Exception as exc:
                 log.warning("Forward signal expiry failed (non-fatal): %s", exc)
+
+        # Ensure IBKR connection is alive before running the batch.
+        # IB Gateway drops idle connections after a few hours; this
+        # reconnects transparently so the session doesn't fail with
+        # "Socket disconnect".
+        if hasattr(self, '_position_manager_trader'):
+            try:
+                if hasattr(self._position_manager_trader, 'ensure_connected'):
+                    if not self._position_manager_trader.ensure_connected():
+                        log.error("IBKR reconnect failed — session will run without execution")
+                        print("[scheduler] WARNING: IBKR reconnect failed", flush=True)
+            except Exception as exc:
+                log.warning("IBKR ensure_connected check failed (non-fatal): %s", exc)
 
         try:
             batch = asyncio.run(

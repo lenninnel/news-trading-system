@@ -82,6 +82,69 @@ class TestIBKRConnection:
                 raise ConnectionError(f"Cannot connect: {exc}") from exc
 
 
+# ── Reconnection ────────────────────────────────────────────────────────────
+
+class TestIBKRReconnection:
+
+    def test_is_connected_true(self):
+        """is_connected returns True when IB reports connected."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.return_value = True
+        assert trader.is_connected() is True
+
+    def test_is_connected_false_when_disconnected(self):
+        """is_connected returns False when IB reports disconnected."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.return_value = False
+        assert trader.is_connected() is False
+
+    def test_is_connected_false_on_exception(self):
+        """is_connected returns False when isConnected raises."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.side_effect = Exception("socket error")
+        assert trader.is_connected() is False
+
+    def test_reconnect_success(self):
+        """reconnect disconnects then reconnects successfully."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.connect.return_value = None
+        assert trader.reconnect() is True
+        mock_ib.disconnect.assert_called_once()
+        mock_ib.connect.assert_called_with(
+            trader._host, trader._port,
+            clientId=trader._client_id, timeout=10,
+        )
+
+    def test_reconnect_failure(self):
+        """reconnect returns False when connect raises."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.connect.side_effect = ConnectionRefusedError("refused")
+        assert trader.reconnect() is False
+
+    def test_ensure_connected_when_already_connected(self):
+        """ensure_connected returns True without reconnecting if alive."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.return_value = True
+        assert trader.ensure_connected() is True
+        # disconnect should NOT be called — no reconnect needed
+        mock_ib.disconnect.assert_not_called()
+
+    def test_ensure_connected_triggers_reconnect(self):
+        """ensure_connected triggers reconnect on stale connection."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.return_value = False
+        mock_ib.connect.return_value = None
+        assert trader.ensure_connected() is True
+        mock_ib.disconnect.assert_called_once()
+
+    def test_ensure_connected_graceful_failure(self):
+        """Session continues gracefully if reconnect fails."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.isConnected.return_value = False
+        mock_ib.connect.side_effect = ConnectionRefusedError("refused")
+        assert trader.ensure_connected() is False
+
+
 # ── Account & positions ──────────────────────────────────────────────────────
 
 class TestIBKRAccount:

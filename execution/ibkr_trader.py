@@ -31,6 +31,7 @@ from storage.database import Database
 # there is already a running loop and the connect fails with
 # "This event loop is already running". nest_asyncio patches asyncio to allow
 # the nested use; it's a no-op when no loop is running (daemon startup path).
+# Applied at module level so reconnect() also works inside async contexts.
 nest_asyncio.apply()
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,46 @@ class IBKRTrader:
             ) from exc
 
         log.info("Connected to IB Gateway (%s)", mode_label)
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def is_connected(self) -> bool:
+        """Check if IBKR connection is alive."""
+        try:
+            return self._ib.isConnected()
+        except Exception:
+            return False
+
+    def reconnect(self) -> bool:
+        """Disconnect and reconnect to IB Gateway."""
+        mode_label = "PAPER" if self._paper else "LIVE"
+        try:
+            self._ib.disconnect()
+        except Exception:
+            pass
+        try:
+            log.info(
+                "Reconnecting to IB Gateway (%s) at %s:%d ...",
+                mode_label, self._host, self._port,
+            )
+            self._ib.connect(
+                self._host, self._port,
+                clientId=self._client_id, timeout=10,
+            )
+            log.info("Reconnected to IB Gateway (%s)", mode_label)
+            return True
+        except Exception as exc:
+            log.error("IBKR reconnect failed: %s", exc)
+            return False
+
+    def ensure_connected(self) -> bool:
+        """Ensure connection is live, reconnect if needed."""
+        if self.is_connected():
+            return True
+        log.warning("IBKR connection lost — attempting reconnect")
+        return self.reconnect()
 
     # ------------------------------------------------------------------
     # Public API  (mirrors AlpacaTrader / PaperTrader)
