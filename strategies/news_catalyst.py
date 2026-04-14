@@ -112,18 +112,27 @@ class NewsCatalystStrategy(BaseStrategy):
             "headline_count": headline_count,
         }
 
+        # Confidence bonuses scale with the actual strength of each
+        # input (news_score magnitude, headline volume, price/volume
+        # reaction) instead of collapsing to a single constant per
+        # branch — otherwise every catalyst logs the same number.
+        news_bonus = min(10.0, max(0.0, (news_score - 0.70) * 33.0))   # 0-10
+        headline_bonus = min(5.0, max(0.0, (headline_count - 1) * 2.5))  # 0-5
+        rvol_bonus = min(5.0, max(0.0, (rvol - 1.3) * 5.0))             # 0-5
+
         # Signal output
         if conditions_met == 3:
-            # All conditions met
+            # All conditions met: 55-75% (scaled by input strength)
             if direction == "BUY":
                 signal = "BUY"
             elif direction == "SELL":
                 signal = "SELL"
             else:
                 signal = "HOLD"
+            confidence = min(75.0, 55.0 + news_bonus + headline_bonus + rvol_bonus)
             return StrategyResult(
                 signal=signal,
-                confidence=65.0,
+                confidence=confidence,
                 strategy_name=self.name,
                 indicators=indicators,
                 entry_price=close,
@@ -131,16 +140,18 @@ class NewsCatalystStrategy(BaseStrategy):
             )
 
         if conditions_met >= 1 and has_news:
-            # News present but no full confirmation
+            # News present but no full confirmation: 35-55%
             if direction == "BUY":
                 signal = "WEAK BUY"
             elif direction == "SELL":
                 signal = "WEAK SELL"
             else:
                 signal = "HOLD"
+            rvol_soft_bonus = min(5.0, max(0.0, (rvol - 1.0) * 5.0))
+            confidence = min(55.0, 35.0 + news_bonus + headline_bonus + rvol_soft_bonus)
             return StrategyResult(
                 signal=signal,
-                confidence=45.0,
+                confidence=confidence,
                 strategy_name=self.name,
                 indicators=indicators,
                 entry_price=close,

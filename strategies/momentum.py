@@ -175,7 +175,10 @@ class MomentumStrategy(BaseStrategy):
             sentiment_upper,
         )
 
-        # Signal and confidence based on conditions met
+        # Signal and confidence based on conditions met.
+        # Confidence varies within each band based on indicator *strength*,
+        # not just the branch count — otherwise every 3/4 BUY collapses to
+        # the same constant and the logged value looks like a default.
         if conditions_met >= 4:
             # Full alignment: 70-85% confidence
             # Scale within range based on RSI proximity to sweet-spot center (57.5)
@@ -183,8 +186,14 @@ class MomentumStrategy(BaseStrategy):
             confidence = 70.0 + rsi_bonus
             signal, confidence = "STRONG BUY", min(confidence, 85.0)
         elif conditions_met == 3:
-            # Strong setup missing one piece: 45-60%
-            confidence = 45.0 + conditions_met * 5.0
+            # Strong setup missing one piece: 45-60%, scaled by how
+            # strongly the triggered indicators cleared their thresholds.
+            rsi_bonus = max(0.0, 5.0 - abs(rsi - 57.5) * 0.33)       # 0-5
+            vol_bonus = min(5.0, max(0.0, (vol_ratio - 1.3) * 2.5))  # 0-5
+            trend_bonus = 0.0
+            if sma50 and sma50 > 0 and price:
+                trend_bonus = min(5.0, max(0.0, (price / sma50 - 1.0) * 50.0))  # 0-5
+            confidence = 45.0 + rsi_bonus + vol_bonus + trend_bonus
             signal, confidence = "BUY", min(confidence, 60.0)
         else:
             # 2 or fewer conditions — no actionable signal

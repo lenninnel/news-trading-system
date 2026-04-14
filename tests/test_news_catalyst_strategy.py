@@ -36,7 +36,7 @@ class TestNewsCatalystStrategy:
         news = {"news_score": 0.80, "headline_count": 3, "sentiment_direction": "BUY"}
         result = self.strategy.analyze("AAPL", bars, "BUY", news_data=news)
         assert result.signal == "BUY"
-        assert result.confidence == 65.0
+        assert 55.0 <= result.confidence <= 75.0
         assert result.strategy_name == "NewsCatalyst"
 
     def test_news_only_no_price_reaction(self):
@@ -44,7 +44,7 @@ class TestNewsCatalystStrategy:
         news = {"news_score": 0.80, "headline_count": 3, "sentiment_direction": "BUY"}
         result = self.strategy.analyze("AAPL", bars, "BUY", news_data=news)
         assert result.signal == "WEAK BUY"
-        assert result.confidence == 45.0
+        assert 35.0 <= result.confidence <= 55.0
 
     def test_no_news_data(self):
         bars = _make_bars()
@@ -57,7 +57,7 @@ class TestNewsCatalystStrategy:
         news = {"news_score": 0.80, "headline_count": 2, "sentiment_direction": "SELL"}
         result = self.strategy.analyze("AAPL", bars, "SELL", news_data=news)
         assert result.signal == "SELL"
-        assert result.confidence == 65.0
+        assert 55.0 <= result.confidence <= 75.0
 
     def test_missing_news_data_none(self):
         bars = _make_bars()

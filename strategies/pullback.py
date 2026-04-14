@@ -200,14 +200,27 @@ class PullbackStrategy(BaseStrategy):
             sma50_dist_pct if sma50_dist_pct is not None else 0.0,
         )
 
-        # Signal and confidence
+        # Signal and confidence. Bonuses scale with indicator strength
+        # (bounce magnitude, stochastic recovery, SMA50 proximity) so two
+        # 3/4 setups never produce the identical confidence — otherwise
+        # the logged value looks like a hard-coded default.
+        rsi_recovery = 0.0
+        if rsi_min_5 is not None:
+            rsi_recovery = min(5.0, max(0.0, (rsi - rsi_min_5) * 0.5))
+        stoch_recovery = 0.0
+        if stoch_k_min_5 is not None:
+            stoch_recovery = min(5.0, max(0.0, (stoch_k - stoch_k_min_5) * 0.2))
+        proximity_bonus = 0.0
+        if sma50_dist_pct is not None:
+            proximity_bonus = min(5.0, max(0.0, (3.0 - abs(sma50_dist_pct)) * 1.67))
+
         if conditions_met >= 4:
             # Perfect pullback setup: 65-80%
-            confidence = 65.0 + conditions_met * 3.75
+            confidence = 65.0 + rsi_recovery + stoch_recovery + proximity_bonus
             signal, confidence = "BUY", min(confidence, 80.0)
         elif conditions_met == 3:
             # Good setup missing one piece: 40-55%
-            confidence = 40.0 + conditions_met * 5.0
+            confidence = 40.0 + rsi_recovery + stoch_recovery + proximity_bonus
             signal, confidence = "WEAK BUY", min(confidence, 55.0)
         else:
             # 2 or fewer — no actionable signal
