@@ -62,6 +62,7 @@ class IBKRTrader:
         self,
         db: Database | None = None,
         ib: "IB | None" = None,
+        client_id: int | None = None,
     ) -> None:
         self._db = db or Database()
 
@@ -69,7 +70,8 @@ class IBKRTrader:
         host = os.environ.get("IBKR_HOST", "127.0.0.1")
         default_port = 4002 if paper else 4001
         port = int(os.environ.get("IBKR_PORT", str(default_port)))
-        client_id = int(os.environ.get("IBKR_CLIENT_ID", "1"))
+        if client_id is None:
+            client_id = int(os.environ.get("IBKR_CLIENT_ID", "1"))
 
         self._paper = paper
         self._host = host

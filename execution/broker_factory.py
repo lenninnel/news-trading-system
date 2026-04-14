@@ -41,12 +41,16 @@ def get_trading_mode() -> str:
     return mode
 
 
-def create_trader(db: Database | None = None):
+def create_trader(db: Database | None = None, client_id: int | None = None):
     """
     Instantiate and return the correct trader for the current TRADING_MODE.
 
     Args:
         db: Optional Database instance for dependency injection.
+        client_id: Optional IBKR clientId override. Only applies to
+            ``ibkr_paper`` / ``ibkr_live`` modes; ignored otherwise.
+            Used to segregate concurrent IBKR connections (e.g. the
+            PositionManager monitor vs. trading sessions).
 
     Returns:
         PaperTrader, AlpacaTrader, or IBKRTrader instance.
@@ -92,6 +96,6 @@ def create_trader(db: Database | None = None):
             os.environ["IBKR_PAPER"] = "true"
 
         from execution.ibkr_trader import IBKRTrader
-        return IBKRTrader(db=db)
+        return IBKRTrader(db=db, client_id=client_id)
 
     raise ValueError(f"Unhandled TRADING_MODE: {mode}")

@@ -699,7 +699,11 @@ class DailyScheduler:
         try:
             from execution.broker_factory import create_trader
             from monitoring.position_manager import PositionManager
-            trader = create_trader()
+            # clientId=10 so this persistent monitor connection never
+            # collides with per-session trading connections (which use
+            # clientId 1/2/3). IBKR rejects duplicate clientIds, so a
+            # shared id would block all trading sessions.
+            trader = create_trader(client_id=10)
             self._position_manager_trader = trader
             position_manager = PositionManager(
                 trader=trader, notifier=self._tg,
