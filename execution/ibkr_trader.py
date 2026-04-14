@@ -112,18 +112,44 @@ class IBKRTrader:
 
     def is_connected(self) -> bool:
         """Check if IBKR connection is alive."""
+        if self._ib is None:
+            return False
         try:
             return self._ib.isConnected()
         except Exception:
             return False
 
+    def _new_ib_client(self):
+        """Build a fresh ib_insync.IB() instance.
+
+        Extracted so the fresh-client path has a single seam that
+        tests can monkey-patch.
+        """
+        from ib_insync import IB
+        return IB()
+
     def reconnect(self) -> bool:
-        """Disconnect and reconnect to IB Gateway."""
+        """Create a fresh ib_async client and connect to IB Gateway.
+
+        After ``disconnect()`` the underlying ib_async client is in a
+        destroyed state that cannot be revived — calling ``connect()``
+        on it silently fails with "Socket disconnect". We therefore
+        discard the old client and build a new ``IB()`` instance on
+        every reconnect.
+        """
         mode_label = "PAPER" if self._paper else "LIVE"
+        # Tear down any existing client so its socket / event loop
+        # state is released before we replace it.
         try:
-            self._ib.disconnect()
+            if self._ib is not None:
+                self._ib.disconnect()
         except Exception:
             pass
+        try:
+            self._ib = self._new_ib_client()
+        except Exception as exc:
+            log.error("Could not create fresh IB client: %s", exc)
+            return False
         try:
             log.info(
                 "Reconnecting to IB Gateway (%s) at %s:%d ...",
@@ -144,15 +170,31 @@ class IBKRTrader:
 
         Called at the end of each trading session so the next session
         starts with a fresh socket instead of inheriting a stale one.
+
+        Sets ``self._ib = None`` so ``ensure_connected()`` knows to
+        build a fresh ``IB()`` instance on the next call. Reusing the
+        same client object after disconnect leaves it in a destroyed
+        state that silently fails on subsequent connect attempts.
         """
         try:
-            self._ib.disconnect()
-            log.info("IBKR disconnected cleanly")
+            if self._ib is not None:
+                self._ib.disconnect()
+                log.info("IBKR disconnected cleanly")
         except Exception:
             pass
+        self._ib = None
 
     def ensure_connected(self) -> bool:
-        """Ensure connection is live, reconnect if needed."""
+        """Ensure a live connection — build a fresh client if needed.
+
+        If ``self._ib`` is None (after ``disconnect()``) or the
+        existing client is in an unhealthy state, a new ``IB()`` is
+        created before connecting. Never tries to revive a dead
+        client.
+        """
+        if self._ib is None:
+            log.info("IBKR client is None — creating fresh instance")
+            return self.reconnect()
         if self.is_connected():
             return True
         log.warning("IBKR connection lost — attempting reconnect")
