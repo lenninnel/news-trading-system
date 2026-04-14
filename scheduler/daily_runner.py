@@ -467,22 +467,69 @@ class DailyScheduler:
         # Fallback: full watchlist minus XETRA
         return [t for t in DEFAULT_WATCHLIST if not t.endswith(".XETRA")]
 
+    # Safety cap on session ticker count to bound per-session API cost even
+    # when the scanner floods candidates on a volatile day.
+    _US_SESSION_TICKER_CAP = 30
+
     @staticmethod
     def _load_us_tickers() -> list[str]:
         """Load US tickers for today's sessions.
 
-        When ENABLE_PREMARKET_SCANNER=true and a fresh scanner_output.json
-        exists, returns the scanner's expanded list (union with the core
-        watchlist). Otherwise returns the raw core watchlist — preserving
-        legacy behaviour.
+        When ENABLE_PREMARKET_SCANNER=true and a fresh
+        premarket_candidates.json exists, merges the scanner's
+        high-confidence picks (conf ≥ 0.5) with the core watchlist —
+        deduplicated and capped at _US_SESSION_TICKER_CAP tickers so a
+        volatile day doesn't blow out API budget. Otherwise returns the
+        raw core watchlist — preserving legacy behaviour.
         """
         core = DailyScheduler._load_us_tickers_core()
+
         try:
-            from scripts.premarket_scanner import resolve_us_tickers
-            return resolve_us_tickers(core)
+            from scripts.premarket_scanner import (
+                _is_scanner_enabled,
+                load_premarket_candidates,
+            )
         except Exception as exc:
-            log.warning("Scanner resolve failed (falling back to core): %s", exc)
+            log.warning("Scanner module import failed (falling back to core): %s", exc)
             return core
+
+        if not _is_scanner_enabled():
+            return core
+
+        try:
+            candidates = load_premarket_candidates()
+        except Exception as exc:
+            log.warning("Candidates load failed (falling back to core): %s", exc)
+            return core
+
+        if not candidates:
+            return core
+
+        core_upper = {t.upper() for t in core}
+        # Preserve candidate order (ranked highest-confidence first) so the
+        # cap keeps the strongest picks.
+        added: list[str] = []
+        for c in candidates:
+            ticker = (c.get("ticker") or "").upper()
+            if not ticker or ticker in core_upper or ticker in added:
+                continue
+            added.append(ticker)
+
+        merged = list(core) + added
+        if len(merged) > DailyScheduler._US_SESSION_TICKER_CAP:
+            truncated = len(merged) - DailyScheduler._US_SESSION_TICKER_CAP
+            merged = merged[: DailyScheduler._US_SESSION_TICKER_CAP]
+            log.info("Capped session ticker list at %d (dropped %d)",
+                     DailyScheduler._US_SESSION_TICKER_CAP, truncated)
+
+        kept_added = [t for t in added if t in merged]
+        if kept_added:
+            log.info("Added %d pre-market candidates to session: %s",
+                     len(kept_added), ", ".join(kept_added))
+            print(f"[scheduler] Added {len(kept_added)} pre-market candidates: "
+                  f"{', '.join(kept_added)}", flush=True)
+
+        return merged
 
     @staticmethod
     def _load_xetra_tickers() -> list[str]:

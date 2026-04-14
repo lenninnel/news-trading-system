@@ -44,6 +44,13 @@ log = logging.getLogger(__name__)
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 DEFAULT_OUTPUT_PATH = Path("/home/trading/trading-data/scanner_output.json")
 
+# Lightweight top-candidates cache consumed by the daemon at US_PRE /
+# US_OPEN start. Distinct from scanner_output.json: only the high-
+# confidence picks (conf ≥ 0.5) end up here, so the session tickers can
+# be extended without pulling in every sector peer.
+DEFAULT_CANDIDATES_PATH = Path("/tmp/premarket_candidates.json")
+CANDIDATE_CONF_THRESHOLD = 0.5
+
 MIN_AVG_VOLUME = 500_000
 MOMENTUM_LOOKBACK_DAYS = 5
 MOMENTUM_THRESHOLD_PCT = 3.0
@@ -80,6 +87,14 @@ def _output_path() -> Path:
     if override:
         return Path(override)
     return DEFAULT_OUTPUT_PATH
+
+
+def _candidates_path() -> Path:
+    """Where to write premarket_candidates.json. Overridable via env."""
+    override = os.environ.get("PREMARKET_CANDIDATES_PATH")
+    if override:
+        return Path(override)
+    return DEFAULT_CANDIDATES_PATH
 
 
 def _is_scanner_enabled() -> bool:
@@ -474,6 +489,68 @@ def save_output(output: dict, path: Path | None = None) -> Path:
     return target
 
 
+def save_premarket_candidates(
+    output: dict,
+    *,
+    conf_threshold: float = CANDIDATE_CONF_THRESHOLD,
+    path: Path | None = None,
+) -> Path:
+    """Write the filtered top candidates to premarket_candidates.json.
+
+    Keeps only tickers from ``output["ranked"]`` whose normalised confidence
+    (score / max_score) is at or above ``conf_threshold``. The daemon reads
+    this at US_PRE / US_OPEN start to extend the core watchlist without
+    pulling in every sector peer from ``scanner_output.json``.
+    """
+    max_score = SCORE_EARNINGS + SCORE_MOMENTUM + SCORE_SENTIMENT
+    candidates: list[dict] = []
+    for r in output.get("ranked", []):
+        score = r.get("score", 0)
+        confidence = score / max_score if max_score else 0.0
+        if confidence < conf_threshold:
+            continue
+        candidates.append(
+            {
+                "ticker": r["ticker"],
+                "confidence": round(confidence, 3),
+                "reasons": list(r.get("reasons") or []),
+            }
+        )
+
+    payload = {
+        "date": output.get("date") or _today_utc().isoformat(),
+        "generated_at": output.get("generated_at") or datetime.now(timezone.utc).isoformat(),
+        "candidates": candidates,
+    }
+    target = path or _candidates_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    log.info("Wrote %d pre-market candidates (conf ≥ %.2f) to %s",
+             len(candidates), conf_threshold, target)
+    return target
+
+
+def load_premarket_candidates(path: Path | None = None) -> list[dict] | None:
+    """Read premarket_candidates.json; return candidates list or None.
+
+    Returns None when the file is missing, unparseable, or stale (date !=
+    today UTC). Each candidate is ``{ticker, confidence, reasons}``.
+    """
+    target = path or _candidates_path()
+    if not target.exists():
+        return None
+    try:
+        data = json.loads(target.read_text())
+    except Exception as exc:
+        log.warning("Failed to parse candidates cache at %s: %s", target, exc)
+        return None
+    if data.get("date") != _today_utc().isoformat():
+        log.info("Candidates cache stale (date=%s, today=%s)",
+                 data.get("date"), _today_utc().isoformat())
+        return None
+    return list(data.get("candidates") or [])
+
+
 def load_scanner_output(path: Path | None = None) -> dict | None:
     """Read scanner_output.json and return the dict, or None if missing/stale.
 
@@ -568,6 +645,7 @@ def main(core_watchlist: list[str] | None = None, *, top_n: int = DEFAULT_TOP_N)
 
     output = run_scanner(core_watchlist=core_watchlist, top_n=top_n)
     save_output(output)
+    save_premarket_candidates(output)
     log_to_signal_events(output)
 
     stats = output["stats"]
