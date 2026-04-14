@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 import nest_asyncio
@@ -136,6 +137,12 @@ class IBKRTrader:
         on it silently fails with "Socket disconnect". We therefore
         discard the old client and build a new ``IB()`` instance on
         every reconnect.
+
+        clientId retry: IB Gateway holds a clientId briefly after the
+        socket drops. A fresh connect with the same id can fail with
+        Error 326 "client id is already in use". We try up to 3 ids
+        (self._client_id, +1, +2) with a 10s wait between 326 failures.
+        The successfully-connected id is stored back on ``self._client_id``.
         """
         mode_label = "PAPER" if self._paper else "LIVE"
         # Tear down any existing client so its socket / event loop
@@ -145,25 +152,61 @@ class IBKRTrader:
                 self._ib.disconnect()
         except Exception:
             pass
-        try:
-            self._ib = self._new_ib_client()
-        except Exception as exc:
-            log.error("Could not create fresh IB client: %s", exc)
-            return False
-        try:
-            log.info(
-                "Reconnecting to IB Gateway (%s) at %s:%d ...",
-                mode_label, self._host, self._port,
-            )
-            self._ib.connect(
-                self._host, self._port,
-                clientId=self._client_id, timeout=10,
-            )
-            log.info("Reconnected to IB Gateway (%s)", mode_label)
-            return True
-        except Exception as exc:
-            log.error("IBKR reconnect failed: %s", exc)
-            return False
+
+        base_id = self._client_id
+        MAX_ATTEMPTS = 3
+        for attempt in range(MAX_ATTEMPTS):
+            client_id_try = base_id + attempt
+            try:
+                self._ib = self._new_ib_client()
+            except Exception as exc:
+                log.error("Could not create fresh IB client: %s", exc)
+                return False
+            try:
+                log.info(
+                    "Reconnecting to IB Gateway (%s) at %s:%d "
+                    "(clientId=%d, attempt %d/%d) ...",
+                    mode_label, self._host, self._port,
+                    client_id_try, attempt + 1, MAX_ATTEMPTS,
+                )
+                self._ib.connect(
+                    self._host, self._port,
+                    clientId=client_id_try, timeout=10,
+                )
+                log.info(
+                    "Reconnected to IB Gateway (%s) using clientId=%d",
+                    mode_label, client_id_try,
+                )
+                # Remember the id that worked so disconnect() logs it and
+                # a subsequent reconnect starts from a known-good base.
+                self._client_id = client_id_try
+                return True
+            except Exception as exc:
+                err_str = str(exc)
+                is_326 = (
+                    "326" in err_str
+                    or "already in use" in err_str.lower()
+                )
+                # Best-effort teardown of the failed client before next try.
+                try:
+                    self._ib.disconnect()
+                except Exception:
+                    pass
+                if not is_326:
+                    log.error("IBKR reconnect failed (non-326): %s", exc)
+                    return False
+                log.warning(
+                    "clientId %d already in use (Error 326) — "
+                    "waiting 10s before retry",
+                    client_id_try,
+                )
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(10)
+        log.error(
+            "IBKR reconnect failed after %d clientId attempts (base=%d)",
+            MAX_ATTEMPTS, base_id,
+        )
+        return False
 
     def disconnect(self) -> None:
         """Cleanly sever the ib_async connection if one exists.
@@ -175,14 +218,23 @@ class IBKRTrader:
         build a fresh ``IB()`` instance on the next call. Reusing the
         same client object after disconnect leaves it in a destroyed
         state that silently fails on subsequent connect attempts.
+
+        Sleeps 5s before returning to give IB Gateway time to release
+        the clientId server-side. Without this pause, the next
+        ``reconnect()`` routinely hits Error 326 "client id already in
+        use" on the first attempt.
         """
         try:
             if self._ib is not None:
                 self._ib.disconnect()
-                log.info("IBKR disconnected cleanly")
+                log.info(
+                    "IBKR disconnected cleanly (clientId=%d)",
+                    self._client_id,
+                )
         except Exception:
             pass
         self._ib = None
+        time.sleep(5)
 
     def ensure_connected(self) -> bool:
         """Ensure a live connection — build a fresh client if needed.

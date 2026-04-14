@@ -105,19 +105,42 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def _run_loop(self) -> None:
-        """Sleep-check loop that runs during US market hours."""
+        """Sleep-check loop that runs during US market hours.
+
+        Every exception that could possibly escape from a cycle is
+        caught here and logged as a warning — the position manager is
+        a best-effort monitor and MUST NEVER crash the daemon, even
+        when IB Gateway times out or the broker connection flaps.
+        """
         log.info("PositionManager thread started")
         while not self._shutdown.is_set():
-            if not self._is_market_hours():
-                self._shutdown.wait(timeout=self._interval)
-                continue
-
+            # Belt-and-suspenders: wrap the whole cycle (market hours
+            # check + position check + sleep) so a TimeoutError or any
+            # other stray exception can never kill this thread.
             try:
-                self._check_all_positions()
-            except Exception as exc:
-                log.error("PositionManager cycle error: %s", exc, exc_info=True)
+                if not self._is_market_hours():
+                    self._shutdown.wait(timeout=self._interval)
+                    continue
 
-            self._shutdown.wait(timeout=self._interval)
+                try:
+                    self._check_all_positions()
+                except TimeoutError as exc:
+                    log.warning(
+                        "PositionManager: request timed out (non-fatal): %s",
+                        exc,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "PositionManager cycle error (non-fatal): %s", exc,
+                    )
+
+                self._shutdown.wait(timeout=self._interval)
+            except Exception as exc:
+                # Absolute safety net — nothing should escape _run_loop.
+                log.warning(
+                    "PositionManager thread-level error (swallowed): %s", exc,
+                )
+                self._shutdown.wait(timeout=self._interval)
 
         log.info("PositionManager thread exiting")
 
@@ -170,8 +193,13 @@ class PositionManager:
         """
         try:
             portfolio = self._trader.get_portfolio()
+        except TimeoutError as exc:
+            log.warning(
+                "Portfolio fetch timed out (non-fatal): %s", exc,
+            )
+            return []
         except Exception as exc:
-            log.error("Failed to get portfolio: %s", exc)
+            log.warning("Failed to get portfolio (non-fatal): %s", exc)
             return []
 
         if not portfolio:
@@ -267,14 +295,23 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def _close_position(self, ticker: str, shares: int, price: float) -> None:
-        """Sell all shares via the configured broker."""
+        """Sell all shares via the configured broker.
+
+        Never raises. Timeouts and other broker errors are logged as
+        warnings so the monitor loop keeps running — we'd rather
+        retry on the next cycle than tear down the daemon thread.
+        """
         try:
             self._trader.track_trade(
                 ticker=ticker, action="SELL", shares=shares, price=price,
             )
             log.info("Closed position: %s %d shares @ $%.2f", ticker, shares, price)
+        except TimeoutError as exc:
+            log.warning(
+                "Close position timed out for %s (non-fatal): %s", ticker, exc,
+            )
         except Exception as exc:
-            log.error("Failed to close %s: %s", ticker, exc)
+            log.warning("Failed to close %s (non-fatal): %s", ticker, exc)
 
     # ------------------------------------------------------------------
     # Price fetching
@@ -304,14 +341,19 @@ class PositionManager:
         price: float,
         detail: str,
     ) -> None:
-        """Log decision to signal_events table."""
-        self._signal_logger.log({
-            "ticker": ticker,
-            "strategy": "PositionManager",
-            "signal": signal,
-            "price_at_signal": price,
-            "bull_case": detail,
-        })
+        """Log decision to signal_events table (never raises)."""
+        try:
+            self._signal_logger.log({
+                "ticker": ticker,
+                "strategy": "PositionManager",
+                "signal": signal,
+                "price_at_signal": price,
+                "bull_case": detail,
+            })
+        except Exception as exc:
+            log.warning(
+                "Signal log failed for %s (non-fatal): %s", ticker, exc,
+            )
 
     def _send_alert(self, message: str) -> None:
         """Send Telegram alert (best-effort, never raises)."""
