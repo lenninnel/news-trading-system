@@ -163,25 +163,32 @@ async def run_batch(
 
     t0 = time.monotonic()
 
-    tasks = [
-        _process_ticker(
-            coordinator,
-            ticker,
-            account_balance=account_balance,
-            execute=execute,
-            api_semaphore=api_semaphore,
-            data_semaphore=data_semaphore,
-            db_lock=db_lock,
-            debate_semaphore=debate_semaphore,
-            worker_semaphore=worker_semaphore,
-            tracker=tracker,
-            session=session,
-            session_type=session_type,
-        )
-        for ticker in tickers
-    ]
+    try:
+        tasks = [
+            _process_ticker(
+                coordinator,
+                ticker,
+                account_balance=account_balance,
+                execute=execute,
+                api_semaphore=api_semaphore,
+                data_semaphore=data_semaphore,
+                db_lock=db_lock,
+                debate_semaphore=debate_semaphore,
+                worker_semaphore=worker_semaphore,
+                tracker=tracker,
+                session=session,
+                session_type=session_type,
+            )
+            for ticker in tickers
+        ]
 
-    results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+    finally:
+        if hasattr(coordinator, 'paper_trader') and hasattr(coordinator.paper_trader, 'disconnect'):
+            try:
+                coordinator.paper_trader.disconnect()
+            except Exception:
+                pass
 
     elapsed = time.monotonic() - t0
     success = sum(1 for r in results if r is not None)
@@ -1106,9 +1113,10 @@ class DailyScheduler:
                 except Exception as tg_exc:
                     log.warning("Telegram error notification failed: %s", tg_exc)
         finally:
-            # Cleanly disconnect IBKR at end of every session so the next
-            # session reconnects to a fresh socket instead of inheriting a
-            # stale one that silently dropped between sessions.
+            # Reconnect the position manager's IBKR connection (clientId=10)
+            # so it starts the next inter-session interval with a fresh socket.
+            # The per-session trader (clientId=1) is disconnected inside
+            # run_batch() itself.
             if hasattr(self, '_position_manager_trader') and self._position_manager_trader is not None:
                 try:
                     if hasattr(self._position_manager_trader, 'disconnect'):
