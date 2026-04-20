@@ -184,6 +184,25 @@ class PositionManager:
 
         return results
 
+    def _ensure_trader_connected(self) -> None:
+        """Re-establish broker connection if it was torn down between sessions.
+
+        IBKRTrader's ``disconnect()`` sets ``self._ib = None`` at session
+        end. Without this call, every subsequent portfolio query raises
+        ``'NoneType' object has no attribute 'positions'`` until the
+        next session reconnects. Non-IBKR traders simply lack
+        ``ensure_connected`` and are a no-op here.
+        """
+        ensure = getattr(self._trader, "ensure_connected", None)
+        if ensure is None:
+            return
+        try:
+            ensure()
+        except Exception as exc:
+            log.debug(
+                "PositionManager silent reconnect failed (non-fatal): %s", exc,
+            )
+
     def _get_open_positions(self) -> list[dict]:
         """
         Get open positions with stop_loss/take_profit from trade history.
@@ -191,6 +210,7 @@ class PositionManager:
         Returns list of dicts with: ticker, shares, avg_price, stop_loss,
         take_profit.
         """
+        self._ensure_trader_connected()
         try:
             portfolio = self._trader.get_portfolio()
         except TimeoutError as exc:
