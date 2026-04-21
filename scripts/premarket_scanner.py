@@ -46,10 +46,10 @@ DEFAULT_OUTPUT_PATH = Path("/home/trading/trading-data/scanner_output.json")
 
 # Lightweight top-candidates cache consumed by the daemon at US_PRE /
 # US_OPEN start. Distinct from scanner_output.json: only the high-
-# confidence picks (conf ≥ 0.5) end up here, so the session tickers can
+# confidence picks (conf ≥ 0.8) end up here, so the session tickers can
 # be extended without pulling in every sector peer.
 DEFAULT_CANDIDATES_PATH = Path("/tmp/premarket_candidates.json")
-CANDIDATE_CONF_THRESHOLD = 0.5
+CANDIDATE_CONF_THRESHOLD = 0.8
 
 MIN_AVG_VOLUME = 500_000
 MOMENTUM_LOOKBACK_DAYS = 5

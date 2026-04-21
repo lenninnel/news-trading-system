@@ -101,6 +101,7 @@ async def _process_ticker(
     debate_semaphore: asyncio.Semaphore | None = None,
     session: str | None = None,
     session_type: str = "signal",
+    scanner_candidates: set[str] | None = None,
 ) -> dict | None:
     """Process one ticker under the worker semaphore, report progress."""
     async with worker_semaphore:
@@ -115,6 +116,7 @@ async def _process_ticker(
                 debate_semaphore=debate_semaphore,
                 session=session,
                 session_type=session_type,
+                scanner_candidates=scanner_candidates,
             )
             await tracker.record(ticker, result, None)
             return result
@@ -134,6 +136,7 @@ async def run_batch(
     session: str | None = None,
     session_type: str = "signal",
     macro_context: str = "",
+    scanner_candidates: set[str] | None = None,
 ) -> dict:
     """
     Analyse a list of tickers concurrently.
@@ -178,6 +181,7 @@ async def run_batch(
                 tracker=tracker,
                 session=session,
                 session_type=session_type,
+                scanner_candidates=scanner_candidates,
             )
             for ticker in tickers
         ]
@@ -477,6 +481,48 @@ class DailyScheduler:
     # Safety cap on session ticker count to bound per-session API cost even
     # when the scanner floods candidates on a volatile day.
     _US_SESSION_TICKER_CAP = 30
+    # Tier-2 scanner-candidate cap. Scanner picks skip the bull/bear debate
+    # (Sonnet) so every additional candidate is cheap, but we still cap at a
+    # small number to keep signal-generation latency bounded.
+    _SCANNER_CANDIDATE_CAP = 10
+
+    @staticmethod
+    def _resolve_scanner_additions(core: list[str]) -> list[str]:
+        """Return the ordered list of scanner-only tickers to add alongside
+        *core*. Empty when the scanner is disabled or the candidate cache is
+        missing / stale. Caller handles merging and logging.
+        """
+        try:
+            from scripts.premarket_scanner import (
+                _is_scanner_enabled,
+                load_premarket_candidates,
+            )
+        except Exception as exc:
+            log.warning("Scanner module import failed: %s", exc)
+            return []
+
+        if not _is_scanner_enabled():
+            return []
+
+        try:
+            candidates = load_premarket_candidates()
+        except Exception as exc:
+            log.warning("Candidates load failed: %s", exc)
+            return []
+
+        if not candidates:
+            return []
+
+        core_upper = {t.upper() for t in core}
+        added: list[str] = []
+        for c in candidates:
+            ticker = (c.get("ticker") or "").upper()
+            if not ticker or ticker in core_upper or ticker in added:
+                continue
+            added.append(ticker)
+            if len(added) >= DailyScheduler._SCANNER_CANDIDATE_CAP:
+                break
+        return added
 
     @staticmethod
     def _load_us_tickers() -> list[str]:
@@ -484,43 +530,16 @@ class DailyScheduler:
 
         When ENABLE_PREMARKET_SCANNER=true and a fresh
         premarket_candidates.json exists, merges the scanner's
-        high-confidence picks (conf ≥ 0.5) with the core watchlist —
-        deduplicated and capped at _US_SESSION_TICKER_CAP tickers so a
-        volatile day doesn't blow out API budget. Otherwise returns the
-        raw core watchlist — preserving legacy behaviour.
+        high-confidence picks (conf ≥ 0.8, up to _SCANNER_CANDIDATE_CAP
+        tickers) with the core watchlist — deduplicated and capped at
+        _US_SESSION_TICKER_CAP overall so a volatile day doesn't blow
+        out API budget. Otherwise returns the raw core watchlist —
+        preserving legacy behaviour.
         """
         core = DailyScheduler._load_us_tickers_core()
-
-        try:
-            from scripts.premarket_scanner import (
-                _is_scanner_enabled,
-                load_premarket_candidates,
-            )
-        except Exception as exc:
-            log.warning("Scanner module import failed (falling back to core): %s", exc)
+        added = DailyScheduler._resolve_scanner_additions(core)
+        if not added:
             return core
-
-        if not _is_scanner_enabled():
-            return core
-
-        try:
-            candidates = load_premarket_candidates()
-        except Exception as exc:
-            log.warning("Candidates load failed (falling back to core): %s", exc)
-            return core
-
-        if not candidates:
-            return core
-
-        core_upper = {t.upper() for t in core}
-        # Preserve candidate order (ranked highest-confidence first) so the
-        # cap keeps the strongest picks.
-        added: list[str] = []
-        for c in candidates:
-            ticker = (c.get("ticker") or "").upper()
-            if not ticker or ticker in core_upper or ticker in added:
-                continue
-            added.append(ticker)
 
         merged = list(core) + added
         if len(merged) > DailyScheduler._US_SESSION_TICKER_CAP:
@@ -531,12 +550,29 @@ class DailyScheduler:
 
         kept_added = [t for t in added if t in merged]
         if kept_added:
-            log.info("Added %d pre-market candidates to session: %s",
+            log.info("Added %d pre-market candidates to session (Tier 2, debate skipped): %s",
                      len(kept_added), ", ".join(kept_added))
             print(f"[scheduler] Added {len(kept_added)} pre-market candidates: "
                   f"{', '.join(kept_added)}", flush=True)
 
         return merged
+
+    @staticmethod
+    def _load_scanner_candidate_tickers() -> set[str]:
+        """Return the upper-cased tickers that came from the scanner this
+        session (Tier 2). These skip the bull/bear debate in the coordinator.
+
+        Empty set when the scanner is disabled, the cache is missing/stale,
+        or any failure occurs — fail-safe so a broken scanner never causes
+        every ticker to be treated as scanner tier.
+        """
+        try:
+            core = DailyScheduler._load_us_tickers_core()
+            added = DailyScheduler._resolve_scanner_additions(core)
+        except Exception as exc:
+            log.warning("Scanner candidate set load failed (defaulting to empty): %s", exc)
+            return set()
+        return {t.upper() for t in added}
 
     @staticmethod
     def _load_xetra_tickers() -> list[str]:
@@ -953,6 +989,15 @@ class DailyScheduler:
             tickers = [t for t in tickers if not t.endswith(".XETRA")]
             log.info("Excluded XETRA tickers from %s session", run["name"])
 
+        # Tier-2 scanner candidates — these skip the bull/bear debate so the
+        # cost of adding them to the session is essentially free. Resolved
+        # here (not inside run_batch) so tests that patch _load_us_tickers
+        # keep a clear, injectable seam.
+        if run_name in ("XETRA_OPEN", "XETRA_PRE", "PEAD_OPEN"):
+            scanner_candidates: set[str] = set()
+        else:
+            scanner_candidates = self._load_scanner_candidate_tickers()
+
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
         runner_id = _runner_id()
@@ -1033,6 +1078,7 @@ class DailyScheduler:
                     session=run_name,
                     session_type=session_type,
                     macro_context=macro_context,
+                    scanner_candidates=scanner_candidates,
                 )
             )
 

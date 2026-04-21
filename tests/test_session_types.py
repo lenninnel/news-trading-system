@@ -387,7 +387,8 @@ class TestSessionTypePipeline:
         async def fake_analyse(ticker, *, account_balance, execute,
                                api_semaphore, data_semaphore, db_lock,
                                debate_semaphore=None,
-                               session, session_type="signal"):
+                               session, session_type="signal",
+                               scanner_candidates=None):
             captured[ticker] = session_type
             return {
                 "ticker": ticker,
@@ -420,7 +421,8 @@ class TestSessionTypePipeline:
         async def fake_analyse(ticker, *, account_balance, execute,
                                api_semaphore, data_semaphore, db_lock,
                                debate_semaphore=None,
-                               session, session_type="signal"):
+                               session, session_type="signal",
+                               scanner_candidates=None):
             captured[ticker] = session_type
             return {
                 "ticker": ticker,

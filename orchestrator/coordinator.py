@@ -291,7 +291,9 @@ class Coordinator:
             execution = result.get("execution") or {}
 
             # Determine debate outcome
-            if debate:
+            if result.get("is_scanner_candidate"):
+                debate_outcome = "scanner_no_debate"
+            elif debate:
                 if debate.degraded:
                     debate_outcome = "skipped"
                 elif debate.final_signal == debate.original_signal:
@@ -1115,6 +1117,7 @@ class Coordinator:
         debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
         session_type: str = "signal",
+        scanner_candidates: set[str] | None = None,
     ) -> dict:
         """
         Async version of ``run_combined()`` with semaphore-controlled phases.
@@ -1159,6 +1162,7 @@ class Coordinator:
                 db_lock=db_lock,
                 debate_semaphore=debate_semaphore,
                 session=session,
+                scanner_candidates=scanner_candidates,
             )
         if session_type == "pre_signal":
             return await self._pre_signal_refresh_async(
@@ -1343,7 +1347,10 @@ class Coordinator:
         # ── Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ──
         debate_result = None
         is_pead = strat_name == "PEAD"
-        if self.debate_agent.is_enabled() and not is_pead:
+        is_scanner_candidate = ticker.upper() in (scanner_candidates or set())
+        if is_scanner_candidate:
+            log.info("[%s] Scanner candidate (Tier 2) — skipping bull/bear debate", ticker)
+        if self.debate_agent.is_enabled() and not is_pead and not is_scanner_candidate:
             if combined_signal == "HOLD" and conf < 0.35:
                 log.info("[%s] Debate skipped — HOLD signal", ticker)
                 debate_result = DebateResult(
@@ -1511,6 +1518,7 @@ class Coordinator:
             "regime": regime_info,
             "strategy_name": strat_name,
             "debate": debate_result,
+            "is_scanner_candidate": is_scanner_candidate,
             "elapsed_s": round(elapsed, 2),
         }
 
@@ -1795,6 +1803,7 @@ class Coordinator:
         db_lock: asyncio.Lock,
         debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
+        scanner_candidates: set[str] | None = None,
     ) -> dict:
         """
         Execute trades using cached US_PRE signals (fast path).
@@ -1829,6 +1838,7 @@ class Coordinator:
                 debate_semaphore=debate_semaphore,
                 session=session,
                 session_type="signal",
+                scanner_candidates=scanner_candidates,
             )
             fallback["session_type"] = "execution"
             fallback["cache_status"] = "miss"
@@ -1869,13 +1879,19 @@ class Coordinator:
         combined_signal = cached_signal
         conf = cached_conf
         debate_refreshed = False
+        is_scanner_candidate = ticker.upper() in (scanner_candidates or set())
 
         if Database.is_price_stale(current_price, cached_price or 0, threshold=0.02):
             log.info(
                 "[%s] Price stale: cached $%.2f → current $%.2f (>2%%) — refreshing debate",
                 ticker, cached_price or 0, current_price,
             )
-            if self.debate_agent.is_enabled() and cached_signal not in ("HOLD",):
+            if is_scanner_candidate:
+                log.info(
+                    "[%s] Scanner candidate (Tier 2) — skipping debate refresh on drift",
+                    ticker,
+                )
+            elif self.debate_agent.is_enabled() and cached_signal not in ("HOLD",):
                 _dsem = debate_semaphore or api_semaphore
                 async with _dsem:
                     debate_result = await self.debate_agent.run_async(
