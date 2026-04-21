@@ -184,24 +184,35 @@ class PositionManager:
 
         return results
 
-    def _ensure_trader_connected(self) -> None:
+    def _ensure_trader_connected(self) -> bool:
         """Re-establish broker connection if it was torn down between sessions.
 
-        IBKRTrader's ``disconnect()`` sets ``self._ib = None`` at session
-        end. Without this call, every subsequent portfolio query raises
-        ``'NoneType' object has no attribute 'positions'`` until the
-        next session reconnects. Non-IBKR traders simply lack
-        ``ensure_connected`` and are a no-op here.
+        Returns True when the broker is connected (or reconnected
+        successfully), False when reconnect failed or raised. Callers must
+        honour the return value — proceeding to query the broker after a
+        False return hits ``'NoneType' object has no attribute 'positions'``
+        because ``IBKRTrader.disconnect()`` sets ``self._ib = None``.
+
+        Non-IBKR traders (PaperTrader, AlpacaTrader) lack ``ensure_connected``
+        and are assumed always-on.
         """
         ensure = getattr(self._trader, "ensure_connected", None)
         if ensure is None:
-            return
+            return True
         try:
-            ensure()
+            ok = ensure()
         except Exception as exc:
-            log.debug(
-                "PositionManager silent reconnect failed (non-fatal): %s", exc,
+            log.warning(
+                "PositionManager reconnect raised (non-fatal): %s", exc,
             )
+            return False
+        if not ok:
+            log.warning(
+                "PositionManager reconnect returned False — "
+                "skipping portfolio query this cycle",
+            )
+            return False
+        return True
 
     def _get_open_positions(self) -> list[dict]:
         """
@@ -210,12 +221,21 @@ class PositionManager:
         Returns list of dicts with: ticker, shares, avg_price, stop_loss,
         take_profit.
         """
-        self._ensure_trader_connected()
+        if not self._ensure_trader_connected():
+            return []
         try:
             portfolio = self._trader.get_portfolio()
         except TimeoutError as exc:
             log.warning(
                 "Portfolio fetch timed out (non-fatal): %s", exc,
+            )
+            return []
+        except AttributeError as exc:
+            # Race: scheduler thread set self._ib=None between our
+            # ensure_connected() call and this get_portfolio() call.
+            # Next cycle will reconnect; for now, skip quietly.
+            log.warning(
+                "Portfolio query raced with disconnect (non-fatal): %s", exc,
             )
             return []
         except Exception as exc:

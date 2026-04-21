@@ -1158,17 +1158,15 @@ class DailyScheduler:
                     )
                 except Exception as tg_exc:
                     log.warning("Telegram error notification failed: %s", tg_exc)
-        finally:
-            # Reconnect the position manager's IBKR connection (clientId=10)
-            # so it starts the next inter-session interval with a fresh socket.
-            # The per-session trader (clientId=1) is disconnected inside
-            # run_batch() itself.
-            if hasattr(self, '_position_manager_trader') and self._position_manager_trader is not None:
-                try:
-                    if hasattr(self._position_manager_trader, 'disconnect'):
-                        self._position_manager_trader.disconnect()
-                except Exception:
-                    pass
+        # Intentionally NOT disconnecting self._position_manager_trader
+        # here. The position manager owns that connection (clientId=10)
+        # and monitors stop-losses continuously between sessions. An
+        # end-of-session disconnect nulls its self._ib, racing with the
+        # background thread and producing
+        # "'NoneType' object has no attribute 'positions'" every 60s
+        # until the next session reconnects. The per-session trader
+        # (clientId=1) is separate and still disconnected inside
+        # run_batch() itself.
 
     # ── Weekly job dispatch ───────────────────────────────────────────
 
