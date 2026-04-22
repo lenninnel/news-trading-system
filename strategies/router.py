@@ -2,7 +2,7 @@
 Strategy router — maps tickers to their best-fit strategy module.
 
 Based on walk-forward backtest results (2026-03-20):
-    MOMENTUM tickers: META, JPM  (Sharpe > 0.5, win rate > 45%)
+    MOMENTUM tickers: META, JPM, VRT  (Sharpe > 0.5, win rate > 45%)
     PULLBACK tickers: AAPL, MSFT, AMZN, XOM, CVX, BAC, PFE, TSLA
 
 Tickers not in either list fall back to the default strategy.
@@ -15,7 +15,7 @@ from strategies.pullback import PullbackStrategy
 from strategies.base import BaseStrategy
 
 # Ticker → strategy mapping (from backtest validation 2026-03-20)
-MOMENTUM_TICKERS: set[str] = {"META", "JPM"}
+MOMENTUM_TICKERS: set[str] = {"META", "JPM", "VRT"}
 PULLBACK_TICKERS: set[str] = {"AAPL", "MSFT", "AMZN", "XOM", "CVX", "BAC", "PFE", "TSLA"}
 
 # Singletons — strategies are stateless so one instance per type is fine
