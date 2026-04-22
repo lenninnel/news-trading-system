@@ -607,6 +607,11 @@ class Coordinator:
 
         return votes
 
+    # The combined pipeline always asks three strategies to vote
+    # (Momentum, Pullback, NewsCatalyst).  Anything less means one or more
+    # strategies failed/short-circuited and the cluster is partial.
+    _EXPECTED_VOTE_COUNT = 3
+
     def _fuse_signals(
         self,
         ticker: str,
@@ -620,16 +625,36 @@ class Coordinator:
         combine_signals() on exception.
 
         Returns (combined_label, combined_confidence, signal_path) where
-        signal_path is "CLUSTER" when the cluster detector produced the
-        verdict or "FUSION_FALLBACK" when combine_signals() was used.
+        signal_path is one of:
+          * ``CLUSTER``          — all three strategies voted and
+                                   ClusterDetector produced the verdict.
+          * ``CLUSTER_PARTIAL``  — fewer than three strategies voted
+                                   (one or more failed/short-circuited)
+                                   and ClusterDetector still produced a
+                                   verdict on the surviving votes.
+          * ``FUSION_FALLBACK``  — no strategies voted or ClusterDetector
+                                   raised; ``combine_signals()`` produced
+                                   the verdict.
         """
         if strategy_votes:
             try:
                 cluster = self._cluster_detector.detect(strategy_votes)
+                path = (
+                    "CLUSTER"
+                    if len(strategy_votes) >= self._EXPECTED_VOTE_COUNT
+                    else "CLUSTER_PARTIAL"
+                )
+                if path == "CLUSTER_PARTIAL":
+                    voters = [r.strategy_name for r in strategy_votes]
+                    log.info(
+                        "[%s] Cluster partial (%d/%d votes: %s)",
+                        ticker, len(strategy_votes),
+                        self._EXPECTED_VOTE_COUNT, voters,
+                    )
                 return (
                     cluster.cluster_signal,
                     round(max(0.0, min(1.0, cluster.confidence)), 2),
-                    "CLUSTER",
+                    path,
                 )
             except Exception as exc:
                 log.warning(
