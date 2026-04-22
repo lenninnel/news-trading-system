@@ -16,8 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 from orchestrator.coordinator import Coordinator
 
-combine  = Coordinator.combine_signals
-conf     = Coordinator.confidence
+def combine(sentiment_signal, technical_signal):
+    """Label-only adapter — combine_signals now returns (label, confidence)."""
+    return Coordinator.combine_signals(sentiment_signal, technical_signal)[0]
+
+
+conf = Coordinator.confidence
 
 
 # ===========================================================================

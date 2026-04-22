@@ -546,19 +546,61 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def combine_signals(sentiment_signal: str, technical_signal: str) -> str:
+    def combine_signals(
+        sentiment_signal: str,
+        technical_signal: str,
+        sentiment_confidence: float = 0.5,
+        technical_confidence: float = 0.5,
+    ) -> tuple[str, float]:
         """
-        Fuse sentiment and technical signals into a combined label.
+        Fuse sentiment and technical signals into a combined label and
+        a combined confidence score.
+
+        The label comes from _FUSION_TABLE (unchanged 3x3 matrix).
+        The confidence is computed from the two input confidences:
+
+          * Both BUY or both SELL  → max(s, t) * 1.1  (agreement bonus,
+                                                       capped at 1.0)
+          * BUY vs SELL            → abs(s - t) * 0.7 (disagreement penalty)
+          * One HOLD, one non-HOLD → non-HOLD confidence * 0.8
+                                     (both HOLD: max(s, t) * 0.8)
 
         Args:
-            sentiment_signal: "BUY" | "SELL" | "HOLD"
-            technical_signal: "BUY" | "SELL" | "HOLD"
+            sentiment_signal:     "BUY" | "SELL" | "HOLD"
+            technical_signal:     "BUY" | "SELL" | "HOLD"
+            sentiment_confidence: 0.0 - 1.0 (default 0.5)
+            technical_confidence: 0.0 - 1.0 (default 0.5)
 
         Returns:
-            One of: STRONG BUY, STRONG SELL, WEAK BUY, WEAK SELL,
-                    CONFLICTING, HOLD
+            (combined_label, combined_confidence) — label is one of
+            STRONG BUY, STRONG SELL, WEAK BUY, WEAK SELL, CONFLICTING,
+            HOLD; confidence is clamped to [0.0, 1.0] and rounded to
+            two decimal places.
         """
-        return _FUSION_TABLE.get((sentiment_signal, technical_signal), "HOLD")
+        label = _FUSION_TABLE.get((sentiment_signal, technical_signal), "HOLD")
+
+        s = 0.5 if sentiment_confidence is None else sentiment_confidence
+        t = 0.5 if technical_confidence is None else technical_confidence
+        s = max(0.0, min(1.0, s))
+        t = max(0.0, min(1.0, t))
+
+        sent_dir = sentiment_signal in ("BUY", "SELL")
+        tech_dir = technical_signal in ("BUY", "SELL")
+
+        if sent_dir and tech_dir and sentiment_signal == technical_signal:
+            combined_conf = min(1.0, max(s, t) * 1.1)
+        elif sent_dir and tech_dir:
+            combined_conf = abs(s - t) * 0.7
+        else:
+            if sentiment_signal == "HOLD" and technical_signal == "HOLD":
+                non_hold = max(s, t)
+            elif sentiment_signal == "HOLD":
+                non_hold = t
+            else:
+                non_hold = s
+            combined_conf = non_hold * 0.8
+
+        return label, round(max(0.0, min(1.0, combined_conf)), 2)
 
     @staticmethod
     def confidence(
@@ -891,15 +933,15 @@ class Coordinator:
                 tech_for_fusion = "SELL"
             else:
                 tech_for_fusion = "HOLD"
-            combined_signal = self.combine_signals(sentiment["signal"], tech_for_fusion)
-            conf = strategy_result.confidence / 100.0  # 0-100 → 0.0-1.0
+            combined_signal, conf = self.combine_signals(
+                sentiment["signal"], tech_for_fusion,
+                sentiment_confidence=abs(sentiment["avg_score"]),
+                technical_confidence=strategy_result.confidence / 100.0,
+            )
         else:
-            combined_signal = self.combine_signals(sentiment["signal"], technical["signal"])
-            conf = self.confidence(
-                combined_signal,
-                sentiment["avg_score"],
-                volume_confirmed=technical.get("volume_confirmed", False),
-                rvol=technical.get("indicators", {}).get("rvol"),
+            combined_signal, conf = self.combine_signals(
+                sentiment["signal"], technical["signal"],
+                sentiment_confidence=abs(sentiment["avg_score"]),
                 technical_confidence=technical.get("adjusted_confidence"),
             )
 
@@ -1317,8 +1359,11 @@ class Coordinator:
         # ── Fuse signals ───────────────────────────────────────────────
         if pead_result is not None and pead_result["signal"] == "BUY":
             # PEAD BUY acts as a strong additional vote
-            combined_signal = self.combine_signals(sentiment_signal, "BUY")
-            conf = pead_result["confidence"]
+            combined_signal, conf = self.combine_signals(
+                sentiment_signal, "BUY",
+                sentiment_confidence=abs(avg_score),
+                technical_confidence=pead_result["confidence"],
+            )
             strat_name = "PEAD"
             log.info("[%s] PEAD overriding strategy: %s (%.0f%%)",
                      ticker, combined_signal, conf * 100)
@@ -1330,17 +1375,15 @@ class Coordinator:
                 tech_for_fusion = "SELL"
             else:
                 tech_for_fusion = "HOLD"
-            combined_signal = self.combine_signals(sentiment_signal, tech_for_fusion)
-            conf = strategy_result.confidence / 100.0
-        else:
-            combined_signal = self.combine_signals(
-                sentiment_signal, technical["signal"],
+            combined_signal, conf = self.combine_signals(
+                sentiment_signal, tech_for_fusion,
+                sentiment_confidence=abs(avg_score),
+                technical_confidence=strategy_result.confidence / 100.0,
             )
-            conf = self.confidence(
-                combined_signal,
-                avg_score,
-                volume_confirmed=technical.get("volume_confirmed", False),
-                rvol=technical.get("indicators", {}).get("rvol"),
+        else:
+            combined_signal, conf = self.combine_signals(
+                sentiment_signal, technical["signal"],
+                sentiment_confidence=abs(avg_score),
                 technical_confidence=technical.get("adjusted_confidence"),
             )
 
@@ -1691,8 +1734,11 @@ class Coordinator:
         sentiment_signal = self._signal(avg_score)
 
         # ── Fuse with sentiment-only (no TA) ──────────────────────────
-        combined_signal = self.combine_signals(sentiment_signal, "HOLD")
-        conf = self.confidence(combined_signal, avg_score)
+        combined_signal, conf = self.combine_signals(
+            sentiment_signal, "HOLD",
+            sentiment_confidence=abs(avg_score),
+            technical_confidence=0.5,
+        )
 
         # ── Bull/Bear Debate (optional) ───────────────────────────────
         debate_result = None

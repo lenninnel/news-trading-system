@@ -372,7 +372,7 @@ class TestCoordinatorFusion(IntegrationTestBase):
             ("HOLD", "BUY",  "HOLD"),
         ]
         for sent, tech, expected in cases:
-            result = Coordinator.combine_signals(sent, tech)
+            result, _conf = Coordinator.combine_signals(sent, tech)
             self.assertEqual(result, expected, f"({sent}, {tech}) → {result}, expected {expected}")
 
     def test_confidence_scoring(self):
