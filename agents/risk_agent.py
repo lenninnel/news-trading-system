@@ -250,12 +250,12 @@ class RiskAgent(BaseAgent):
         if not skip_reason and regime:
             if regime == "RANGING" and strength == "WEAK":
                 skip_reason = f"WEAK signal skipped in RANGING regime"
-            elif regime == "HIGH_VOL":
+            elif regime in ("HIGH_VOL", "HIGH_VOLATILITY"):
                 if strength != "STRONG":
-                    skip_reason = f"Only STRONG signals allowed in HIGH_VOL regime"
+                    skip_reason = f"Only STRONG signals allowed in HIGH_VOLATILITY regime"
                 elif confidence <= 70:
                     skip_reason = (
-                        f"HIGH_VOL regime requires confidence > 70% "
+                        f"HIGH_VOLATILITY regime requires confidence > 70% "
                         f"(got {confidence:.0f}%)"
                     )
 
