@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS signal_events (
     price_at_signal     REAL,
     trade_executed      INTEGER NOT NULL DEFAULT 0,
     trade_id            TEXT,
+    signal_path         TEXT,
     price_3d            REAL,
     price_5d            REAL,
     price_10d           REAL,
@@ -110,6 +111,14 @@ class SignalLogger:
                     )
                 except Exception:
                     pass  # column already exists
+                # Phase 2d attribution — record which fusion path produced
+                # the combined signal ("CLUSTER" or "FUSION_FALLBACK").
+                try:
+                    conn.execute(
+                        "ALTER TABLE signal_events ADD COLUMN signal_path TEXT"
+                    )
+                except Exception:
+                    pass  # column already exists
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -129,8 +138,8 @@ class SignalLogger:
                          sentiment_score, news_score, social_score,
                          bull_case, bear_case, debate_outcome,
                          price_at_signal, trade_executed, trade_id,
-                         regime, macro_context_used)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         regime, macro_context_used, signal_path)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -153,6 +162,7 @@ class SignalLogger:
                         signal_data.get("trade_id"),
                         signal_data.get("regime"),
                         int(bool(signal_data.get("macro_context_used", 0))),
+                        signal_data.get("signal_path"),
                     ),
                 )
         except Exception as exc:

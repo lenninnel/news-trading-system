@@ -62,9 +62,13 @@ from data.news_feed import NewsFeed
 from data.marketaux_feed import MarketauxFeed
 from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
+from orchestrator.cluster_detector import ClusterDetector
 from storage.database import Database
-from strategies.pead_strategy import PEADStrategy
+from strategies.base import StrategyResult
+from strategies.momentum import MomentumStrategy
 from strategies.news_catalyst import NewsCatalystStrategy
+from strategies.pead_strategy import PEADStrategy
+from strategies.pullback import PullbackStrategy
 from strategies.router import get_strategy, strategy_label
 
 # Maps (sentiment_signal, technical_signal) → combined label
@@ -153,6 +157,13 @@ class Coordinator:
         self._pead_enabled = PEAD_ENABLED
         self._pead_tickers = set(t.upper() for t in PEAD_TICKERS)
         self._pead_strategy = PEADStrategy(cache_path=PEAD_EARNINGS_CACHE_PATH)
+
+        # Phase 2b — multi-strategy cluster detector as the combination layer.
+        # Momentum/Pullback strategies are stateless, so one instance each is
+        # enough.  NewsCatalyst already lives at module scope as `_news_catalyst`.
+        self._cluster_detector = ClusterDetector()
+        self._momentum_strategy = MomentumStrategy()
+        self._pullback_strategy = PullbackStrategy()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -327,6 +338,7 @@ class Coordinator:
                 # build a stub that skips __init__, so macro_context may not
                 # exist as an attribute. Default to empty/False.
                 "macro_context_used": bool(getattr(self, "macro_context", "")),
+                "signal_path": result.get("signal_path"),
             })
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
@@ -540,6 +552,98 @@ class Coordinator:
         except Exception as exc:
             log.warning("[%s] NewsCatalyst failed (non-fatal): %s", ticker, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Multi-strategy cluster fusion (Phase 2b)
+    # ------------------------------------------------------------------
+
+    def _gather_strategy_votes(
+        self,
+        ticker: str,
+        bars,
+        sentiment: dict,
+        *,
+        session: str | None = None,
+        regime: str | None = None,
+    ) -> list[StrategyResult]:
+        """Run Momentum, Pullback, and NewsCatalyst and return the successful
+        results.  Each vote is logged to signal_events individually.  Never
+        raises — a failing strategy is skipped, the others still contribute.
+        """
+        votes: list[StrategyResult] = []
+
+        if bars is None or (hasattr(bars, "empty") and bars.empty):
+            # No price history → strategies can't vote.  NewsCatalyst also
+            # short-circuits on empty bars, so we return empty.
+            return votes
+
+        sentiment_label = sentiment.get("signal", "HOLD")
+
+        for strategy, name in (
+            (self._momentum_strategy, "Momentum"),
+            (self._pullback_strategy, "Pullback"),
+        ):
+            try:
+                result = strategy.analyze(ticker, bars, sentiment_label)
+                votes.append(result)
+                log.info(
+                    "[%s] Strategy %s → %s (%.0f%%)",
+                    ticker, name, result.signal, result.confidence,
+                )
+                self._log_strategy_result(
+                    ticker, result, session=session, regime=regime,
+                )
+            except Exception as exc:
+                log.warning("[%s] Strategy %s failed (non-fatal): %s",
+                            ticker, name, exc)
+
+        # _run_news_catalyst handles its own logging and returns None on
+        # failure or when bars are empty.
+        nc_result = self._run_news_catalyst(
+            ticker, bars, sentiment, session=session,
+        )
+        if nc_result is not None:
+            votes.append(nc_result)
+
+        return votes
+
+    def _fuse_signals(
+        self,
+        ticker: str,
+        strategy_votes: list[StrategyResult],
+        sentiment_signal: str,
+        sentiment_confidence: float,
+        fallback_technical_signal: str,
+        fallback_technical_confidence: float | None,
+    ) -> tuple[str, float, str]:
+        """Combine strategy votes via ClusterDetector, falling back to
+        combine_signals() on exception.
+
+        Returns (combined_label, combined_confidence, signal_path) where
+        signal_path is "CLUSTER" when the cluster detector produced the
+        verdict or "FUSION_FALLBACK" when combine_signals() was used.
+        """
+        if strategy_votes:
+            try:
+                cluster = self._cluster_detector.detect(strategy_votes)
+                return (
+                    cluster.cluster_signal,
+                    round(max(0.0, min(1.0, cluster.confidence)), 2),
+                    "CLUSTER",
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] ClusterDetector failed, falling back to combine_signals: %s",
+                    ticker, exc,
+                )
+
+        label, conf = self.combine_signals(
+            sentiment_signal,
+            fallback_technical_signal,
+            sentiment_confidence=sentiment_confidence,
+            technical_confidence=fallback_technical_confidence,
+        )
+        return label, conf, "FUSION_FALLBACK"
 
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
@@ -885,65 +989,43 @@ class Coordinator:
             except Exception as exc:
                 log.warning("[%s] Regime detection failed: %s", ticker, exc)
 
-        # --- Strategy override ---
-        strategy = get_strategy(ticker)
+        # --- Strategy votes (Momentum + Pullback + NewsCatalyst) ---
+        # strat_name is kept for downstream labels (debate skip logic, result
+        # dict).  The router-selected name names the "primary" strategy for
+        # this ticker even though all votes feed into the cluster detector.
         strat_name = strategy_label(ticker)
-        strategy_result = None
-
-        if strategy is not None:
-            try:
-                # Reuse bars already fetched by the technical agent (avoids
-                # a second Alpaca API call that was causing rate-limiting).
-                bars = technical.get("bars")
-                if bars is None or bars.empty:
-                    raise ValueError("Technical agent returned no bars")
-                strategy_result = strategy.analyze(
-                    ticker, bars, sentiment["signal"],
-                )
-                log.info(
-                    "[%s] Strategy %s → %s (%.0f%%)",
-                    ticker, strat_name,
-                    strategy_result.signal, strategy_result.confidence,
-                )
-                if verbose:
-                    print(f"  Strategy [{strat_name}]: "
-                          f"{strategy_result.signal} ({strategy_result.confidence:.0f}%)")
-            except Exception as exc:
-                log.warning(
-                    "[%s] Strategy %s failed, using generic TA: %s",
-                    ticker, strat_name, exc,
-                )
-
-        # Log individual strategy result (all signals, including HOLD)
         _regime_name = ticker_regime.regime if ticker_regime else None
-        if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result, session=session, regime=_regime_name)
 
-        # --- NewsCatalyst (runs for every ticker alongside the TA strategy) ---
         bars = technical.get("bars")
-        self._run_news_catalyst(ticker, bars, sentiment, session=session)
+        strategy_votes = self._gather_strategy_votes(
+            ticker, bars, sentiment,
+            session=session, regime=_regime_name,
+        )
+        if verbose and strategy_votes:
+            summary = ", ".join(
+                f"{r.strategy_name}={r.signal}({r.confidence:.0f}%)"
+                for r in strategy_votes
+            )
+            print(f"  Strategy votes: {summary}")
 
-        # --- Fuse ---
-        if strategy_result is not None:
-            # Map strategy signal → simple BUY/SELL/HOLD for fusion table
-            _ss = strategy_result.signal.upper()
-            if _ss in ("STRONG BUY", "BUY", "WEAK BUY"):
-                tech_for_fusion = "BUY"
-            elif _ss in ("SELL", "STRONG SELL", "WEAK SELL"):
-                tech_for_fusion = "SELL"
-            else:
-                tech_for_fusion = "HOLD"
-            combined_signal, conf = self.combine_signals(
-                sentiment["signal"], tech_for_fusion,
-                sentiment_confidence=abs(sentiment["avg_score"]),
-                technical_confidence=strategy_result.confidence / 100.0,
-            )
-        else:
-            combined_signal, conf = self.combine_signals(
-                sentiment["signal"], technical["signal"],
-                sentiment_confidence=abs(sentiment["avg_score"]),
-                technical_confidence=technical.get("adjusted_confidence"),
-            )
+        # Router-selected vote — still drives the downstream stop-loss /
+        # take-profit override so the risk layer keeps its pre-cluster
+        # behaviour (the cluster decides direction/confidence, the primary
+        # strategy provides the SL/TP levels).
+        strategy_result = next(
+            (r for r in strategy_votes if r.strategy_name == strat_name),
+            None,
+        )
+
+        # --- Fuse via cluster detector (falls back to combine_signals) ---
+        combined_signal, conf, signal_path = self._fuse_signals(
+            ticker,
+            strategy_votes,
+            sentiment_signal=sentiment["signal"],
+            sentiment_confidence=abs(sentiment["avg_score"]),
+            fallback_technical_signal=technical["signal"],
+            fallback_technical_confidence=technical.get("adjusted_confidence"),
+        )
 
         # --- Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ---
         debate_result = None
@@ -1135,6 +1217,7 @@ class Coordinator:
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
             "strategy_name": strat_name,
+            "signal_path": signal_path,
             "debate": debate_result,
         }
 
@@ -1314,77 +1397,58 @@ class Coordinator:
             except Exception as exc:
                 log.warning("[%s] Regime detection failed: %s", ticker, exc)
 
-        # ── Strategy override ────────────────────────────────────────
-        strategy = get_strategy(ticker)
+        # ── Strategy votes (Momentum + Pullback + NewsCatalyst) ─────────
+        # strat_name is kept for downstream labels (debate skip logic, result
+        # dict).  The router-selected name names the "primary" strategy for
+        # this ticker even though all votes feed into the cluster detector.
         strat_name = strategy_label(ticker)
-        strategy_result = None
-
-        if strategy is not None:
-            try:
-                # Reuse bars already fetched by the technical agent
-                bars = technical.get("bars")
-                if bars is None or bars.empty:
-                    raise ValueError("Technical agent returned no bars")
-                strategy_result = await asyncio.to_thread(
-                    strategy.analyze, ticker, bars, sentiment_signal,
-                )
-                log.info(
-                    "[%s] Strategy %s → %s (%.0f%%)",
-                    ticker, strat_name,
-                    strategy_result.signal, strategy_result.confidence,
-                )
-            except Exception as exc:
-                log.warning(
-                    "[%s] Strategy %s failed, using generic TA: %s",
-                    ticker, strat_name, exc,
-                )
-
-        # Log individual strategy result (all signals, including HOLD)
         _regime_name = ticker_regime.regime if ticker_regime else None
-        if strategy_result is not None:
-            self._log_strategy_result(ticker, strategy_result, session=session, regime=_regime_name)
 
-        # ── NewsCatalyst (runs for every ticker alongside the TA strategy) ──
         bars = technical.get("bars")
-        sentiment_for_news = {
+        sentiment_for_cluster = {
             "avg_score": avg_score,
             "scored": scored,
             "signal": sentiment_signal,
         }
-        self._run_news_catalyst(ticker, bars, sentiment_for_news, session=session)
+        strategy_votes = await asyncio.to_thread(
+            self._gather_strategy_votes,
+            ticker, bars, sentiment_for_cluster,
+            session=session, regime=_regime_name,
+        )
+
+        # Router-selected vote — drives the downstream stop-loss /
+        # take-profit override (the cluster decides direction/confidence,
+        # the primary strategy provides the SL/TP levels).
+        strategy_result = next(
+            (r for r in strategy_votes if r.strategy_name == strat_name),
+            None,
+        )
 
         # ── PEAD check (no API calls — pure data) ─────────────────────
         pead_result = self._run_pead(ticker, session=session)
 
         # ── Fuse signals ───────────────────────────────────────────────
         if pead_result is not None and pead_result["signal"] == "BUY":
-            # PEAD BUY acts as a strong additional vote
+            # PEAD BUY acts as a strong additional vote — bypass the cluster
+            # and use the legacy sentiment-vs-PEAD fusion so PEAD's confidence
+            # dominates (matches pre-Phase-2b PEAD override semantics).
             combined_signal, conf = self.combine_signals(
                 sentiment_signal, "BUY",
                 sentiment_confidence=abs(avg_score),
                 technical_confidence=pead_result["confidence"],
             )
+            signal_path = "FUSION_FALLBACK"
             strat_name = "PEAD"
             log.info("[%s] PEAD overriding strategy: %s (%.0f%%)",
                      ticker, combined_signal, conf * 100)
-        elif strategy_result is not None:
-            _ss = strategy_result.signal.upper()
-            if _ss in ("STRONG BUY", "BUY", "WEAK BUY"):
-                tech_for_fusion = "BUY"
-            elif _ss in ("SELL", "STRONG SELL", "WEAK SELL"):
-                tech_for_fusion = "SELL"
-            else:
-                tech_for_fusion = "HOLD"
-            combined_signal, conf = self.combine_signals(
-                sentiment_signal, tech_for_fusion,
-                sentiment_confidence=abs(avg_score),
-                technical_confidence=strategy_result.confidence / 100.0,
-            )
         else:
-            combined_signal, conf = self.combine_signals(
-                sentiment_signal, technical["signal"],
+            combined_signal, conf, signal_path = self._fuse_signals(
+                ticker,
+                strategy_votes,
+                sentiment_signal=sentiment_signal,
                 sentiment_confidence=abs(avg_score),
-                technical_confidence=technical.get("adjusted_confidence"),
+                fallback_technical_signal=technical["signal"],
+                fallback_technical_confidence=technical.get("adjusted_confidence"),
             )
 
         # ── Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ──
@@ -1560,6 +1624,7 @@ class Coordinator:
             "event_risk_flag": event_risk_flag,
             "regime": regime_info,
             "strategy_name": strat_name,
+            "signal_path": signal_path,
             "debate": debate_result,
             "is_scanner_candidate": is_scanner_candidate,
             "elapsed_s": round(elapsed, 2),
@@ -1733,12 +1798,13 @@ class Coordinator:
         avg_score = self._weighted_aggregate(scored, self._active_weights())
         sentiment_signal = self._signal(avg_score)
 
-        # ── Fuse with sentiment-only (no TA) ──────────────────────────
+        # ── Fuse with sentiment-only (no TA, no strategies) ───────────
         combined_signal, conf = self.combine_signals(
             sentiment_signal, "HOLD",
             sentiment_confidence=abs(avg_score),
             technical_confidence=0.5,
         )
+        signal_path = "FUSION_FALLBACK"
 
         # ── Bull/Bear Debate (optional) ───────────────────────────────
         debate_result = None
