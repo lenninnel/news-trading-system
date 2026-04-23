@@ -1146,20 +1146,12 @@ class Coordinator:
         else:
             event_risk_flag = "none"
 
-        # Downgrade STRONG signals when earnings are imminent
-        sizing_signal = combined_signal
-        if event_risk_flag == "earnings_imminent":
-            if combined_signal == "STRONG BUY":
-                sizing_signal = "WEAK BUY"
-            elif combined_signal == "STRONG SELL":
-                sizing_signal = "WEAK SELL"
-
         # Use per-ticker regime when available, fall back to broad market
         _effective_regime = (ticker_regime.regime if ticker_regime
                              else regime_info.get("regime"))
         risk = self.risk_agent.run(
             ticker=ticker,
-            signal=sizing_signal,
+            signal=combined_signal,
             confidence=conf * 100,          # convert 0–1 → 0–100
             current_price=price,
             account_balance=account_balance,
@@ -1563,17 +1555,10 @@ class Coordinator:
         else:
             event_risk_flag = "none"
 
-        sizing_signal = combined_signal
-        if event_risk_flag == "earnings_imminent":
-            if combined_signal == "STRONG BUY":
-                sizing_signal = "WEAK BUY"
-            elif combined_signal == "STRONG SELL":
-                sizing_signal = "WEAK SELL"
-
         async with db_lock:
             risk = self.risk_agent.run(
                 ticker=ticker,
-                signal=sizing_signal,
+                signal=combined_signal,
                 confidence=conf * 100,
                 current_price=price,
                 account_balance=account_balance,

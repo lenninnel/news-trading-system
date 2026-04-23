@@ -44,7 +44,7 @@ watchlist:
 
 # ── Account ───────────────────────────────────────────────────────────────────
 account:
-  balance: 10000.0          # USD — used for position sizing
+  balance: 98412.0          # USD — actual IBKR paper account balance
 
 # ── Execution ─────────────────────────────────────────────────────────────────
 execution:

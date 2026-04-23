@@ -1073,7 +1073,7 @@ class DailyScheduler:
                 run_batch(
                     tickers,
                     workers=workers,
-                    account_balance=10_000.0,
+                    account_balance=98_412.0,
                     execute=execute,
                     session=run_name,
                     session_type=session_type,
