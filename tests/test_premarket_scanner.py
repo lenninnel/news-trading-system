@@ -2,7 +2,8 @@
 Unit tests for D9 pre-market scanner (scripts/premarket_scanner.py).
 
 Covers:
-    - Ranking math (earnings*3 + momentum*2 + sentiment*1, tiebreak on move)
+    - Ranking math (earnings*3 + momentum*2 + volume*1, tiebreak on move)
+    - Volume-spike detection from batch stats
     - Sector contagion via get_peers
     - Output JSON shape
     - resolve_us_tickers fallback when the scanner is disabled
@@ -10,8 +11,7 @@ Covers:
     - Stale output is ignored (falls back to core)
     - log_to_signal_events is fire-and-forget (no raise on DB error)
 
-All network I/O (S&P 500 fetch, yfinance, news aggregator, sentiment agent)
-is monkeypatched — no real calls.
+All network I/O (S&P 500 fetch, yfinance) is monkeypatched — no real calls.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from scripts import premarket_scanner as scanner
 def test_rank_candidates_scores_and_orders():
     earnings = {"AAPL", "MSFT"}
     momentum = {"AAPL", "NVDA", "TSLA"}
-    sentiment = {"AAPL": 0.8, "META": 0.2}
+    volume = {"AAPL": 2.1, "META": 1.8}
     stats = {
         "AAPL": {"pct_change_5d": 5.0},
         "MSFT": {"pct_change_5d": 1.0},
@@ -43,18 +43,19 @@ def test_rank_candidates_scores_and_orders():
     ranked = scanner.rank_candidates(
         earnings_flag=earnings,
         momentum_flag=momentum,
-        sentiment_scores=sentiment,
+        volume_scores=volume,
         stats=stats,
     )
 
-    # AAPL: 3 (earnings) + 2 (momentum) + 1 (sentiment) = 6
-    # MSFT: 3 (earnings)                                 = 3
-    # NVDA:              2 (momentum)                    = 2
-    # TSLA:              2 (momentum)                    = 2  (tie, higher |Δ| wins)
-    # META:                               1 (sentiment)  = 1
+    # AAPL: 3 (earnings) + 2 (momentum) + 1 (volume) = 6
+    # MSFT: 3 (earnings)                              = 3
+    # NVDA:              2 (momentum)                 = 2
+    # TSLA:              2 (momentum)                 = 2  (tie, higher |Δ| wins)
+    # META:                               1 (volume)  = 1
     assert ranked[0]["ticker"] == "AAPL"
     assert ranked[0]["score"] == 6
-    assert set(ranked[0]["reasons"]) == {"earnings", "momentum", "sentiment"}
+    assert set(ranked[0]["reasons"]) == {"earnings", "momentum", "volume"}
+    assert ranked[0]["volume_ratio"] == 2.1
     assert ranked[1]["ticker"] == "MSFT"
     assert ranked[1]["score"] == 3
     # NVDA (|7|) outranks TSLA (|4|) at score=2
@@ -65,8 +66,26 @@ def test_rank_candidates_scores_and_orders():
 
 def test_rank_candidates_empty():
     assert scanner.rank_candidates(
-        earnings_flag=set(), momentum_flag=set(), sentiment_scores={}, stats={}
+        earnings_flag=set(), momentum_flag=set(), volume_scores={}, stats={}
     ) == []
+
+
+# ── Volume-spike detection ────────────────────────────────────────────────
+
+
+def test_find_volume_spike_candidates_threshold():
+    stats = {
+        "SPIKE":     {"avg_volume_20d": 1_000_000, "volume_today": 2_000_000},  # 2.0x
+        "EDGE":      {"avg_volume_20d": 1_000_000, "volume_today": 1_500_000},  # 1.5x ↳ include
+        "QUIET":     {"avg_volume_20d": 1_000_000, "volume_today": 1_400_000},  # below
+        "NO_BASE":   {"avg_volume_20d": None,      "volume_today": 5_000_000},
+        "ZERO_BASE": {"avg_volume_20d": 0,         "volume_today": 5_000_000},
+        "NO_TODAY":  {"avg_volume_20d": 1_000_000, "volume_today": None},
+    }
+    out = scanner.find_volume_spike_candidates(stats)
+    assert set(out) == {"SPIKE", "EDGE"}
+    assert out["SPIKE"] == pytest.approx(2.0)
+    assert out["EDGE"] == pytest.approx(1.5)
 
 
 # ── Momentum / liquidity filters ──────────────────────────────────────────
@@ -157,15 +176,22 @@ def test_run_scanner_output_shape(monkeypatch):
     monkeypatch.setattr(scanner, "fetch_sp500_universe",
                         lambda: ["AAPL", "NVDA", "META", "XOM"])
     monkeypatch.setattr(scanner, "fetch_liquidity_and_momentum", lambda tickers: {
-        "AAPL": {"pct_change_5d": 5.0, "avg_volume": 10_000_000, "last_close": 180.0},
-        "NVDA": {"pct_change_5d": 8.0, "avg_volume": 50_000_000, "last_close": 900.0},
-        "META": {"pct_change_5d": 1.0, "avg_volume": 15_000_000, "last_close": 500.0},
-        "XOM":  {"pct_change_5d": 0.2, "avg_volume": 20_000_000, "last_close": 120.0},
+        # NVDA has a 2x volume spike; AAPL/META/XOM are quiet.
+        "AAPL": {"pct_change_5d": 5.0, "avg_volume": 10_000_000,
+                 "avg_volume_20d": 10_000_000, "volume_today": 11_000_000,
+                 "last_close": 180.0},
+        "NVDA": {"pct_change_5d": 8.0, "avg_volume": 50_000_000,
+                 "avg_volume_20d": 50_000_000, "volume_today": 100_000_000,
+                 "last_close": 900.0},
+        "META": {"pct_change_5d": 1.0, "avg_volume": 15_000_000,
+                 "avg_volume_20d": 15_000_000, "volume_today": 14_000_000,
+                 "last_close": 500.0},
+        "XOM":  {"pct_change_5d": 0.2, "avg_volume": 20_000_000,
+                 "avg_volume_20d": 20_000_000, "volume_today": 18_000_000,
+                 "last_close": 120.0},
     })
     monkeypatch.setattr(scanner, "find_earnings_candidates",
                         lambda tickers, today=None: {"AAPL"})
-    monkeypatch.setattr(scanner, "fetch_sentiment_candidates",
-                        lambda tickers: {"NVDA": 0.85})
     monkeypatch.setattr(scanner, "expand_with_peers",
                         lambda tickers: set(tickers) | {"VRT"})
 
@@ -203,7 +229,7 @@ def test_run_scanner_output_shape(monkeypatch):
     assert s["post_liquidity"] == 4
     assert s["earnings_flagged"] == 1
     assert s["momentum_flagged"] == 2   # AAPL (5%), NVDA (8%)
-    assert s["sentiment_flagged"] == 1
+    assert s["volume_flagged"] == 1     # NVDA only (100M / 50M = 2.0x)
     assert s["final_count"] == len(output["tickers"])
 
 
@@ -319,7 +345,7 @@ def test_log_to_signal_events_never_raises(monkeypatch):
         "tickers": ["AAPL", "NVDA"],
         "ranked": [
             {"ticker": "AAPL", "score": 6, "reasons": ["earnings", "momentum"],
-             "sentiment": None},
+             "volume_ratio": None},
         ],
     }
     # Must not raise

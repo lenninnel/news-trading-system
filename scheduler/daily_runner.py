@@ -944,11 +944,11 @@ class DailyScheduler:
                 stats = out.get("stats", {})
                 log.info(
                     "[%s] scanner complete — final=%d (universe=%d, liquid=%d, "
-                    "earnings=%d, momentum=%d, sentiment=%d)",
+                    "earnings=%d, momentum=%d, volume=%d)",
                     run_name, stats.get("final_count", 0),
                     stats.get("universe_size", 0), stats.get("post_liquidity", 0),
                     stats.get("earnings_flagged", 0), stats.get("momentum_flagged", 0),
-                    stats.get("sentiment_flagged", 0),
+                    stats.get("volume_flagged", 0),
                 )
                 if self._tg:
                     try:
@@ -957,7 +957,7 @@ class DailyScheduler:
                             f"tickers picked (universe={stats.get('universe_size', 0)}, "
                             f"earnings={stats.get('earnings_flagged', 0)}, "
                             f"momentum={stats.get('momentum_flagged', 0)}, "
-                            f"sentiment={stats.get('sentiment_flagged', 0)})"
+                            f"volume={stats.get('volume_flagged', 0)})"
                         )
                     except Exception as exc:
                         log.warning("Telegram scanner summary failed: %s", exc)

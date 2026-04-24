@@ -7,11 +7,16 @@ universe down to 20-30 high-opportunity candidates based on:
   1. Liquidity          (avg_volume > 500k shares)
   2. Earnings catalyst  (earnings in [-3d, +5d])
   3. Price momentum     (|5d price change| > 3%)
-  4. News sentiment     (avg lexicon score > 0.6 or < 0.4 on flagged tickers)
+  4. Volume spike       (today's volume > 1.5× 20d average)
   5. Sector contagion   (peers of flagged tickers via sector_map.json)
 
+The scanner intentionally uses ONLY cheap, free signals (yfinance prices +
+volumes). News/FinBERT/Claude sentiment runs downstream in US_PRE on just
+the top candidates — running it across 100+ tickers here was both slow and
+cost ~2.5k API calls/day for negligible ranking value.
+
 The final list is the union of:
-  - Top-N ranked candidates (by earnings*3 + momentum*2 + sentiment*1)
+  - Top-N ranked candidates (by earnings*3 + momentum*2 + volume*1)
   - Existing core watchlist (18 tickers — always included as a safety floor)
   - Sector peers of flagged tickers (via storage.database.get_peers)
 
@@ -30,7 +35,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
@@ -57,15 +61,14 @@ MOMENTUM_THRESHOLD_PCT = 3.0
 EARNINGS_WINDOW_FORWARD = 5
 EARNINGS_WINDOW_BACKWARD = 3
 
-# SentimentAgent emits score ∈ {-1, 0, +1}. Normalised to 0..1 with
-# (score + 1) / 2, so neutral=0.5, bullish=1.0, bearish=0.0.
-SENTIMENT_BULL_THRESHOLD = 0.6
-SENTIMENT_BEAR_THRESHOLD = 0.4
+# Volume-spike signal — proxy for unusual activity without paying for news.
+VOLUME_LOOKBACK_DAYS = 20
+VOLUME_SPIKE_RATIO_MIN = 1.5
 
 # Per-criterion score weights (higher = more important for ranking)
 SCORE_EARNINGS = 3
 SCORE_MOMENTUM = 2
-SCORE_SENTIMENT = 1
+SCORE_VOLUME = 1
 
 DEFAULT_TOP_N = 20
 
@@ -73,9 +76,9 @@ DEFAULT_TOP_N = 20
 # to time out; 100 is a safe middle ground.
 BATCH_CHUNK = 100
 
-# Only score sentiment on tickers that already passed an earnings or momentum
-# flag — keeps the Claude/lexicon cost bounded regardless of universe size.
-SENTIMENT_MAX_CANDIDATES = 60
+# Download window must cover both the momentum lookback AND the 20d volume
+# baseline with a weekend/holiday buffer. "2mo" (~42 trading days) is plenty.
+BATCH_PERIOD = "2mo"
 
 
 # ── Paths & I/O helpers ───────────────────────────────────────────────────
@@ -161,13 +164,20 @@ def fetch_sp500_universe() -> list[str]:
         return []
 
 
-# ── Step 2: liquidity + momentum (one batch call) ─────────────────────────
+# ── Step 2: liquidity + momentum + volume-spike (one batch call) ──────────
 
 
 def fetch_liquidity_and_momentum(tickers: list[str]) -> dict[str, dict]:
-    """Batch-download 5-day OHLCV for every ticker in one shot.
+    """Batch-download ~2 months of OHLCV for every ticker in one shot.
 
-    Returns {ticker: {"pct_change_5d": float, "avg_volume": float, "last_close": float}}.
+    Returns {ticker: {
+        "pct_change_5d":  float,  # last 5 trading days
+        "avg_volume":     float,  # full-window mean (used for liquidity floor)
+        "avg_volume_20d": float,  # 20 days ending *yesterday* (spike baseline)
+        "volume_today":   float,  # last bar's volume (most recent session)
+        "last_close":     float,
+    }}.
+
     Tickers with insufficient data are silently dropped. Network failures are
     logged and partial results returned.
     """
@@ -182,7 +192,7 @@ def fetch_liquidity_and_momentum(tickers: list[str]) -> dict[str, dict]:
         try:
             df = yf.download(
                 tickers=" ".join(chunk),
-                period=f"{MOMENTUM_LOOKBACK_DAYS + 2}d",
+                period=BATCH_PERIOD,
                 interval="1d",
                 group_by="ticker",
                 threads=True,
@@ -204,15 +214,30 @@ def fetch_liquidity_and_momentum(tickers: list[str]) -> dict[str, dict]:
                     sub = df
                 close = sub["Close"].dropna() if "Close" in sub else pd.Series(dtype=float)
                 volume = sub["Volume"].dropna() if "Volume" in sub else pd.Series(dtype=float)
-                if len(close) < 2 or len(volume) < 1:
+                if len(close) < MOMENTUM_LOOKBACK_DAYS + 1 or len(volume) < 2:
                     continue
-                first, last = float(close.iloc[0]), float(close.iloc[-1])
-                if first <= 0:
+
+                # 5-day % change: compare last close to the close 5 bars back.
+                ref_close = float(close.iloc[-(MOMENTUM_LOOKBACK_DAYS + 1)])
+                last_close = float(close.iloc[-1])
+                if ref_close <= 0:
                     continue
+
+                # 20d volume baseline excludes the most recent bar so the spike
+                # ratio doesn't self-reference. If we don't have 20 prior bars
+                # yet, None disables the volume signal for this ticker today.
+                prior = volume.iloc[:-1]
+                avg_volume_20d = (
+                    float(prior.tail(VOLUME_LOOKBACK_DAYS).mean())
+                    if len(prior) >= VOLUME_LOOKBACK_DAYS else None
+                )
+
                 stats[t] = {
-                    "pct_change_5d": (last - first) / first * 100.0,
+                    "pct_change_5d": (last_close - ref_close) / ref_close * 100.0,
                     "avg_volume": float(volume.mean()),
-                    "last_close": last,
+                    "avg_volume_20d": avg_volume_20d,
+                    "volume_today": float(volume.iloc[-1]),
+                    "last_close": last_close,
                 }
             except Exception:
                 continue
@@ -272,54 +297,27 @@ def find_momentum_candidates(stats: dict[str, dict]) -> set[str]:
     return flagged
 
 
-# ── Step 5: news sentiment (for already-flagged tickers only) ─────────────
+# ── Step 5: volume-spike catalyst (free proxy for "unusual activity") ────
 
 
-def fetch_sentiment_candidates(tickers: Iterable[str]) -> dict[str, float]:
-    """Fetch headlines and compute avg normalised sentiment per ticker.
+def find_volume_spike_candidates(stats: dict[str, dict]) -> dict[str, float]:
+    """Return {ticker: spike_ratio} for tickers where volume_today / 20d-avg
+    exceeds VOLUME_SPIKE_RATIO_MIN.
 
-    Only tickers whose avg score is outside the neutral band (0.4..0.6) are
-    returned. Normalised sentiment is (raw_score + 1) / 2 where raw_score is
-    -1/0/+1 from SentimentAgent.run.
-
-    The scanner limits this to SENTIMENT_MAX_CANDIDATES to keep Claude /
-    lexicon costs bounded regardless of universe size.
+    Pure function — reads already-fetched batch stats, makes no network calls.
+    This replaces the old news/FinBERT sentiment pass, which was both slow and
+    expensive (~2500 Alpaca News + Claude calls per scan).
     """
-    from agents.sentiment_agent import SentimentAgent
-    from data.news_aggregator import NewsAggregator
-
-    bounded = list(tickers)[:SENTIMENT_MAX_CANDIDATES]
-    if not bounded:
-        return {}
-
-    aggregator = NewsAggregator()
-    agent = SentimentAgent()
-
     scores: dict[str, float] = {}
-    for t in bounded:
-        try:
-            headlines = aggregator.fetch(t) or []
-        except Exception:
-            headlines = []
-        if not headlines:
+    for t, s in stats.items():
+        baseline = s.get("avg_volume_20d")
+        today = s.get("volume_today")
+        if not baseline or baseline <= 0 or today is None:
             continue
-
-        normalised: list[float] = []
-        for h in headlines[:10]:  # cap per ticker — recent headlines are enough
-            try:
-                result = agent.run(h, t)
-                raw = result.get("score", 0)
-                normalised.append((raw + 1) / 2.0)
-            except Exception:
-                continue
-
-        if not normalised:
-            continue
-        avg = sum(normalised) / len(normalised)
-        if avg >= SENTIMENT_BULL_THRESHOLD or avg <= SENTIMENT_BEAR_THRESHOLD:
-            scores[t] = avg
-
-    log.info("Sentiment candidates (strong bull/bear): %d", len(scores))
+        ratio = today / baseline
+        if ratio >= VOLUME_SPIKE_RATIO_MIN:
+            scores[t] = ratio
+    log.info("Volume-spike candidates (ratio ≥ %.1fx): %d", VOLUME_SPIKE_RATIO_MIN, len(scores))
     return scores
 
 
@@ -351,15 +349,15 @@ def rank_candidates(
     *,
     earnings_flag: set[str],
     momentum_flag: set[str],
-    sentiment_scores: dict[str, float],
+    volume_scores: dict[str, float],
     stats: dict[str, dict],
 ) -> list[dict]:
     """Score each flagged ticker and return a ranked list of dicts.
 
-    Score = earnings*3 + momentum*2 + sentiment*1, with ties broken by the
+    Score = earnings*3 + momentum*2 + volume*1, with ties broken by the
     absolute 5-day price move (higher = more interesting).
     """
-    universe = earnings_flag | momentum_flag | set(sentiment_scores.keys())
+    universe = earnings_flag | momentum_flag | set(volume_scores.keys())
 
     ranked: list[dict] = []
     for t in universe:
@@ -371,9 +369,9 @@ def rank_candidates(
         if t in momentum_flag:
             score += SCORE_MOMENTUM
             reasons.append("momentum")
-        if t in sentiment_scores:
-            score += SCORE_SENTIMENT
-            reasons.append("sentiment")
+        if t in volume_scores:
+            score += SCORE_VOLUME
+            reasons.append("volume")
 
         ranked.append(
             {
@@ -381,7 +379,7 @@ def rank_candidates(
                 "score": score,
                 "reasons": reasons,
                 "pct_change_5d": stats.get(t, {}).get("pct_change_5d"),
-                "sentiment": sentiment_scores.get(t),
+                "volume_ratio": volume_scores.get(t),
             }
         )
 
@@ -417,7 +415,7 @@ def run_scanner(
                 "post_liquidity": int,
                 "earnings_flagged": int,
                 "momentum_flagged": int,
-                "sentiment_flagged": int,
+                "volume_flagged": int,
                 "final_count": int,
             }
         }
@@ -427,24 +425,25 @@ def run_scanner(
     # 1. Universe
     universe = fetch_sp500_universe()
 
-    # 2. Liquidity + momentum (single batch call)
+    # 2. Liquidity + momentum + volume baseline (single batch call)
     stats = fetch_liquidity_and_momentum(universe) if universe else {}
     liquid = filter_liquid(stats)
+    liquid_stats = {t: stats[t] for t in liquid if t in stats}
 
     # 3. Earnings catalyst (bounded by liquid universe)
     earnings = find_earnings_candidates(liquid, today=today)
 
     # 4. Momentum catalyst
-    momentum = find_momentum_candidates({t: stats[t] for t in liquid if t in stats})
+    momentum = find_momentum_candidates(liquid_stats)
 
-    # 5. Sentiment on already-flagged tickers only
-    sentiment = fetch_sentiment_candidates(earnings | momentum)
+    # 5. Volume-spike catalyst — pure function over already-fetched stats.
+    volume = find_volume_spike_candidates(liquid_stats)
 
     # 6. Rank and take top-N
     ranked = rank_candidates(
         earnings_flag=earnings,
         momentum_flag=momentum,
-        sentiment_scores=sentiment,
+        volume_scores=volume,
         stats=stats,
     )
     top = ranked[:top_n]
@@ -470,7 +469,7 @@ def run_scanner(
             "post_liquidity": len(liquid),
             "earnings_flagged": len(earnings),
             "momentum_flagged": len(momentum),
-            "sentiment_flagged": len(sentiment),
+            "volume_flagged": len(volume),
             "final_count": len(final_set),
         },
     }
@@ -502,7 +501,7 @@ def save_premarket_candidates(
     this at US_PRE / US_OPEN start to extend the core watchlist without
     pulling in every sector peer from ``scanner_output.json``.
     """
-    max_score = SCORE_EARNINGS + SCORE_MOMENTUM + SCORE_SENTIMENT
+    max_score = SCORE_EARNINGS + SCORE_MOMENTUM + SCORE_VOLUME
     candidates: list[dict] = []
     for r in output.get("ranked", []):
         score = r.get("score", 0)
@@ -608,10 +607,11 @@ def log_to_signal_events(output: dict, *, session: str = "PREMARKET_SCAN") -> No
 
     logger = SignalLogger()
     ranked_by_ticker = {r["ticker"]: r for r in output.get("ranked", [])}
+    max_score = SCORE_EARNINGS + SCORE_MOMENTUM + SCORE_VOLUME
     for ticker in output.get("tickers", []):
         r = ranked_by_ticker.get(ticker)
         reasons = r.get("reasons") if r else ["core_watchlist"]
-        confidence = (r.get("score", 0) / (SCORE_EARNINGS + SCORE_MOMENTUM + SCORE_SENTIMENT)) if r else 0.0
+        confidence = (r.get("score", 0) / max_score) if r else 0.0
         try:
             logger.log(
                 {
@@ -620,7 +620,9 @@ def log_to_signal_events(output: dict, *, session: str = "PREMARKET_SCAN") -> No
                     "strategy": "PreMarketScanner",
                     "signal": "WATCH",
                     "confidence": round(confidence, 3),
-                    "sentiment_score": r.get("sentiment") if r else None,
+                    # Scanner no longer computes sentiment; FinBERT/Claude
+                    # scoring happens in US_PRE on just the top picks.
+                    "sentiment_score": None,
                     "debate_outcome": ",".join(reasons) if reasons else None,
                 }
             )
@@ -654,7 +656,7 @@ def main(core_watchlist: list[str] | None = None, *, top_n: int = DEFAULT_TOP_N)
         f"liquid={stats['post_liquidity']} "
         f"earnings={stats['earnings_flagged']} "
         f"momentum={stats['momentum_flagged']} "
-        f"sentiment={stats['sentiment_flagged']} "
+        f"volume={stats['volume_flagged']} "
         f"→ final={stats['final_count']}",
         flush=True,
     )
