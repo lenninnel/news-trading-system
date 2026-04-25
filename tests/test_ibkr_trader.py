@@ -220,6 +220,44 @@ class TestIBKROrders:
         assert result["action"] == "SELL"
         assert result["pnl"] == 50.0  # (155 - 150) * 10
 
+    def test_track_trade_cancelled_does_not_write_db(self):
+        """Cancelled order: no DB writes, returned dict marks skipped."""
+        trader, mock_ib, mock_db = _make_trader()
+
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Cancelled"
+        mock_trade.log = [MagicMock(message="Error 321: read-only API")]
+        mock_ib.placeOrder.return_value = mock_trade
+
+        result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+
+        assert result["trade_id"] is None
+        assert result["skipped"] is True
+        assert "Cancelled" in result["skip_reason"] or "cancelled" in result["skip_reason"]
+        mock_db.log_trade_history.assert_not_called()
+        mock_db.set_portfolio_position.assert_not_called()
+
+    def test_track_trade_timeout_cancels_and_skips_db(self):
+        """Non-terminal order past timeout is cancelled and not written."""
+        from execution import ibkr_trader as mod
+
+        trader, mock_ib, mock_db = _make_trader()
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Submitted"  # never terminal
+        mock_trade.log = []
+        mock_ib.placeOrder.return_value = mock_trade
+
+        # Shrink the timeout so the test finishes fast.
+        with patch.object(mod, "ORDER_FILL_TIMEOUT", 0.05), \
+             patch.object(mod, "ORDER_POLL_INTERVAL", 0.01):
+            result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+
+        assert result["trade_id"] is None
+        assert result["skipped"] is True
+        mock_ib.cancelOrder.assert_called_once_with(mock_trade.order)
+        mock_db.log_trade_history.assert_not_called()
+        mock_db.set_portfolio_position.assert_not_called()
+
     def test_invalid_action_raises(self):
         trader, _, _ = _make_trader()
         with pytest.raises(ValueError, match="BUY or SELL"):
@@ -254,10 +292,29 @@ class TestIBKROrders:
         mock_pos.position = 50
         mock_ib.positions.return_value = [mock_pos]
 
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Filled"
+        mock_ib.placeOrder.return_value = mock_trade
+
         result = trader.close_position("AAPL")
 
         assert result is True
         mock_ib.placeOrder.assert_called_once()
+
+    def test_close_position_cancelled_returns_false(self):
+        """close_position returns False if IBKR cancels the closing order."""
+        trader, mock_ib, _ = _make_trader()
+        mock_pos = MagicMock()
+        mock_pos.contract.symbol = "AAPL"
+        mock_pos.position = 50
+        mock_ib.positions.return_value = [mock_pos]
+
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Cancelled"
+        mock_trade.log = [MagicMock(message="insufficient buying power")]
+        mock_ib.placeOrder.return_value = mock_trade
+
+        assert trader.close_position("AAPL") is False
 
     def test_close_position_not_found(self):
         """close_position returns False if no position exists."""

@@ -40,6 +40,14 @@ log = logging.getLogger(__name__)
 # Tickers that cannot be traded on IBKR via this integration.
 UNSUPPORTED_IBKR: set[str] = set()
 
+# Order outcome polling — wait this long for placeOrder to reach a terminal
+# orderStatus before we give up and cancel. Tuned to cover normal Gateway
+# round-trip plus a few seconds of slack for slow paper sessions.
+ORDER_FILL_TIMEOUT = 30.0
+ORDER_POLL_INTERVAL = 0.5
+_TERMINAL_FILLED = {"Filled"}
+_TERMINAL_CANCELLED = {"Cancelled", "Inactive", "ApiCancelled"}
+
 
 def _is_pytest_running() -> bool:
     return "pytest" in sys.modules or "_pytest" in sys.modules
@@ -292,12 +300,20 @@ class IBKRTrader:
 
         order = self._MarketOrder(action, shares)
         trade = self._ib.placeOrder(contract, order)
-        self._ib.sleep(2)  # give it a moment to fill
+        outcome, detail = self._wait_for_order_terminal(trade)
 
-        fill_price = price
-        if trade.orderStatus.status == "Filled":
-            fill_price = trade.orderStatus.avgFillPrice or price
+        if outcome != "filled":
+            self._handle_unfilled(trade, ticker, outcome, detail)
+            return {
+                "trade_id": None, "ticker": ticker, "action": action,
+                "shares": shares, "price": price,
+                "stop_loss": stop_loss, "take_profit": take_profit,
+                "pnl": 0.0, "total_value": 0.0,
+                "skipped": True,
+                "skip_reason": f"IBKR order {outcome}: {detail}",
+            }
 
+        fill_price = trade.orderStatus.avgFillPrice or price
         pnl = self._sync_position(ticker, action, shares, fill_price)
 
         trade_id = self._db.log_trade_history(
@@ -306,8 +322,8 @@ class IBKRTrader:
         )
 
         log.info(
-            "IBKR TRADE: %s %s %d shares @ $%.2f (trade_id=%s)",
-            action, ticker, shares, fill_price, trade_id,
+            "IBKR ORDER FILLED: %s %d shares @ $%.2f (trade_id=%s)",
+            action, shares, fill_price, trade_id,
         )
 
         return {
@@ -393,9 +409,16 @@ class IBKRTrader:
                 contract = self._Stock(ticker.upper(), "SMART", "USD")
                 self._ib.qualifyContracts(contract)
                 order = self._MarketOrder(side, abs(qty))
-                self._ib.placeOrder(contract, order)
-                log.info("Closed IBKR position: %s %d shares", ticker, abs(qty))
-                return True
+                trade = self._ib.placeOrder(contract, order)
+                outcome, detail = self._wait_for_order_terminal(trade)
+                if outcome == "filled":
+                    log.info(
+                        "IBKR ORDER FILLED: %s %d shares of %s",
+                        side, abs(qty), ticker,
+                    )
+                    return True
+                self._handle_unfilled(trade, ticker, outcome, detail)
+                return False
         return False
 
     def place_order(
@@ -424,7 +447,19 @@ class IBKRTrader:
             raise ValueError(f"Unsupported order_type: {order_type}")
 
         trade = self._ib.placeOrder(contract, order)
-        return {"order_id": trade.order.orderId}
+        outcome, detail = self._wait_for_order_terminal(trade)
+        if outcome == "filled":
+            log.info(
+                "IBKR ORDER FILLED: %s %d shares of %s",
+                side, qty, ticker,
+            )
+            return {"order_id": trade.order.orderId, "status": "Filled"}
+        self._handle_unfilled(trade, ticker, outcome, detail)
+        return {
+            "order_id": trade.order.orderId,
+            "status": "Cancelled" if outcome == "cancelled" else "Timeout",
+            "reason": detail,
+        }
 
     def is_market_open(self) -> bool:
         """Check if US market is currently open."""
@@ -525,6 +560,61 @@ class IBKRTrader:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _wait_for_order_terminal(
+        self, trade, timeout: float | None = None,
+        poll: float | None = None,
+    ) -> tuple[str, str]:
+        """Poll ``trade.orderStatus.status`` until terminal or timeout.
+
+        Returns (outcome, detail):
+            ("filled",    last_status)
+            ("cancelled", reason from trade.log[-1].message, or status)
+            ("timeout",   last_status)
+
+        ``timeout`` / ``poll`` resolve to the module-level constants when
+        ``None`` so test patches of those constants take effect.
+        """
+        eff_timeout = ORDER_FILL_TIMEOUT if timeout is None else timeout
+        eff_poll = ORDER_POLL_INTERVAL if poll is None else poll
+        deadline = time.monotonic() + eff_timeout
+        while True:
+            status = getattr(trade.orderStatus, "status", "") or ""
+            if status in _TERMINAL_FILLED:
+                return ("filled", status)
+            if status in _TERMINAL_CANCELLED:
+                reason = ""
+                try:
+                    log_entries = getattr(trade, "log", None) or []
+                    if log_entries:
+                        reason = getattr(log_entries[-1], "message", "") or ""
+                except Exception:
+                    reason = ""
+                return ("cancelled", reason or status)
+            if time.monotonic() >= deadline:
+                return ("timeout", status)
+            try:
+                self._ib.sleep(eff_poll)
+            except Exception:
+                time.sleep(eff_poll)
+
+    def _handle_unfilled(
+        self, trade, ticker: str, outcome: str, detail: str,
+    ) -> None:
+        """Log + (on timeout) cancel an order that didn't fill."""
+        if outcome == "cancelled":
+            log.warning("IBKR ORDER CANCELLED: %s — %s", ticker, detail)
+            return
+        # timeout
+        try:
+            self._ib.cancelOrder(trade.order)
+        except Exception as exc:
+            log.warning(
+                "IBKR ORDER TIMEOUT: %s — cancelOrder failed: %s",
+                ticker, exc,
+            )
+        else:
+            log.warning("IBKR ORDER TIMEOUT: %s — cancelled", ticker)
 
     def _sync_position(
         self, ticker: str, action: str, shares: int, fill_price: float,
