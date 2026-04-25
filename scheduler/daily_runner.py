@@ -1237,11 +1237,35 @@ class DailyScheduler:
 
 # ── EOD summary (shared by daemon + track.py --eod) ──────────────────
 
+def _configured_account_balance() -> float:
+    """Return the configured paper-trading balance.
+
+    We do NOT read this from the broker. IBKR paper accounts default to
+    $1,000,000 of "virtual cash" and our actual paper balance is $98,412 \u2014
+    querying the broker would show $1M and mislead every EOD summary.
+    """
+    try:
+        path = Path(__file__).resolve().parent.parent / "config" / "watchlist.yaml"
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        bal = (cfg.get("trading") or {}).get("balance")
+        if bal:
+            return float(bal)
+    except Exception:
+        pass
+    return 98_412.0
+
+
 def send_eod_summary(tg, batch: dict, tickers: list[str]) -> None:
     """
     Send an end-of-day P&L summary via Telegram.
 
-    Attempts to pull live data from Alpaca; falls back to batch results.
+    Reads open positions from the local ``portfolio_positions`` table and
+    today's executed trades from ``trade_history`` \u2014 both populated by
+    the PositionManager (mark-to-market every 60s) and the broker trade
+    hooks. We deliberately do NOT call ``broker.get_account()``: IBKR
+    paper returns its $1M default which would clobber the actual
+    configured paper balance.
     """
     if tg is None:
         return
@@ -1249,41 +1273,56 @@ def send_eod_summary(tg, batch: dict, tickers: list[str]) -> None:
     results = batch["results"]
     day_name = datetime.now(timezone.utc).strftime("%a %b %d")
 
-    # Count trades
+    # Count trades attempted in today's batch
     trades_executed = sum(
         1 for r in results
         if r and (r.get("execution") or {}).get("trade_id")
     )
     trades_failed = batch.get("fail_count", 0)
 
-    # Try Alpaca for live portfolio data
-    portfolio_value = 0.0
-    daily_pnl = 0.0
-    daily_pct = 0.0
+    # \u2500\u2500 P&L from local DB \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    account_balance = _configured_account_balance()
+    realized_today = 0.0
+    unrealized = 0.0
     pos_lines: list[str] = []
 
     try:
-        from execution.alpaca_trader import AlpacaTrader
-        trader = AlpacaTrader()
-        account = trader._api.get_account()
-        positions = trader._api.list_positions()
+        from storage.database import Database
+        db = Database()
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        with db._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS pnl "
+                "FROM trade_history "
+                "WHERE date(created_at) = date(?)",
+                (today_iso,),
+            ).fetchone()
+            realized_today = float(row["pnl"] or 0) if row else 0.0
 
-        portfolio_value = float(account.portfolio_value)
-        prev_close = float(account.last_equity)
-        daily_pnl = portfolio_value - prev_close
-        daily_pct = (daily_pnl / prev_close * 100) if prev_close else 0.0
+            # Open positions, mark-to-market via current_value (refreshed
+            # every 60s by PositionManager during US market hours).
+            positions = conn.execute(
+                "SELECT ticker, shares, avg_price, current_value "
+                "FROM portfolio_positions "
+                "WHERE shares > 0 ORDER BY ticker"
+            ).fetchall()
 
         for p in positions:
-            pct = float(p.unrealized_plpc) * 100
-            sign = "+" if pct >= 0 else ""
-            pos_lines.append(f"{p.symbol} {sign}{pct:.1f}%")
+            shares = p["shares"] or 0
+            avg = float(p["avg_price"] or 0)
+            cur_val = float(p["current_value"] or 0)
+            cost = avg * shares
+            pos_pnl = cur_val - cost
+            pos_pct = (pos_pnl / cost * 100) if cost else 0.0
+            unrealized += pos_pnl
+            sign = "+" if pos_pct >= 0 else ""
+            pos_lines.append(f"{p['ticker']} {sign}{pos_pct:.1f}%")
     except Exception as exc:
-        log.debug("Alpaca data unavailable for EOD summary: %s", exc)
-        # Fallback: use batch result balance
-        for r in results:
-            if r is not None:
-                portfolio_value = r.get("account_balance", 0)
-                break
+        log.warning("EOD P&L from DB failed (non-fatal): %s", exc)
+
+    daily_pnl = realized_today + unrealized
+    portfolio_value = account_balance + unrealized
+    daily_pct = (daily_pnl / account_balance * 100) if account_balance else 0.0
 
     # Top signals for next session
     strong: list[str] = []
@@ -1299,6 +1338,8 @@ def send_eod_summary(tg, batch: dict, tickers: list[str]) -> None:
         f"\U0001f4ca *EOD Summary \u2014 {day_name}*",
         f"\U0001f4bc Portfolio: ${portfolio_value:,.0f} "
         f"({sign}${daily_pnl:,.0f} today, {sign}{daily_pct:.2f}%)",
+        f"   Realized: ${realized_today:+,.0f} \u2502 "
+        f"Unrealized: ${unrealized:+,.0f}",
         f"\U0001f4c8 Trades today: {trades_executed} executed, "
         f"{trades_failed} failed",
     ]

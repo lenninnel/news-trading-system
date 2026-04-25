@@ -71,6 +71,12 @@ class PositionManager:
         from analytics.signal_logger import SignalLogger
         self._signal_logger = SignalLogger(db=db)
 
+        # Direct DB handle so we can mark-to-market portfolio_positions every
+        # cycle. Without this the EOD P&L summary reads stale current_value
+        # (IBKRTrader.get_portfolio() writes 0 to current_value because IB
+        # paper feeds don't include market prices).
+        self._db = db
+
     # ------------------------------------------------------------------
     # Thread lifecycle
     # ------------------------------------------------------------------
@@ -178,11 +184,50 @@ class PositionManager:
                 log.warning("No price for %s — skipping", ticker)
                 continue
 
+            # Mark-to-market: persist live current_value so the EOD P&L
+            # summary and dashboard see real numbers. Best-effort — never
+            # block stop-loss evaluation if the DB write fails.
+            self._mark_to_market(ticker, pos.get("shares", 0),
+                                 pos.get("avg_price", 0), current_price)
+
             result = self._evaluate_position(pos, current_price)
             if result:
                 results.append(result)
 
         return results
+
+    def _mark_to_market(
+        self,
+        ticker: str,
+        shares: int,
+        avg_price: float,
+        current_price: float,
+    ) -> None:
+        """Update portfolio_positions.current_value with the live mark.
+
+        Runs once per ticker per 60s cycle during market hours. Without it,
+        the column is whatever was written at the last broker sync — which
+        for IBKR paper is 0.0 (no market data subscription).
+        """
+        if shares <= 0 or current_price <= 0:
+            return
+        try:
+            db = self._db
+            if db is None:
+                from storage.database import Database
+                db = Database()
+                self._db = db
+            db.set_portfolio_position(
+                ticker=ticker,
+                shares=shares,
+                avg_price=avg_price,
+                current_value=round(shares * current_price, 2),
+            )
+        except Exception as exc:
+            log.warning(
+                "Mark-to-market write failed for %s (non-fatal): %s",
+                ticker, exc,
+            )
 
     def _ensure_trader_connected(self) -> bool:
         """Re-establish broker connection if it was torn down between sessions.

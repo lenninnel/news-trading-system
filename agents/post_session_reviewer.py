@@ -45,8 +45,12 @@ DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 # prompt is heavier — more signals, more positions to format.
 TIMEOUT_SECONDS = 15.0
 
-# Total schedule slots per weekday. Used in the "Sessions: X/Y" line.
-TOTAL_SESSIONS = 7
+# Sessions that actually log to signal_events on a typical US weekday.
+# The schedule has 7 slots but XETRA_PRE/XETRA_OPEN have no EU tickers
+# (empty list since 2026-04-09) and MIDDAY is monitor-only — none of them
+# write signal_events rows, so they should not appear in the X/Y denominator.
+# The five that DO log: PREMARKET_SCAN, US_PRE, PEAD_OPEN, US_OPEN, EOD.
+TOTAL_SESSIONS = 5
 
 MAX_TOKENS = 400
 
