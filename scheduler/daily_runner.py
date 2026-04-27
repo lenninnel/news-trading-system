@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -819,7 +820,7 @@ class DailyScheduler:
             while True:
                 try:
                     nrt = self.next_run_time()
-                    wait_s = max(0, int((nrt - datetime.now(timezone.utc)).total_seconds()))
+                    wait_s = max(0, math.ceil((nrt - datetime.now(timezone.utc)).total_seconds()))
                     run_info = self._run_for_time(nrt)
                     run_name = run_info["name"] if run_info else "UNKNOWN"
 
