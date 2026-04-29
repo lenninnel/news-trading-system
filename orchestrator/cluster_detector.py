@@ -68,9 +68,21 @@ class ClusterDetector:
 
         # No directional signals at all
         if not buy_side and not sell_side:
+            hold_confidences = [
+                r.confidence / 100.0
+                for r in confident
+                if r.signal.upper() == "HOLD"
+            ]
+            if hold_confidences:
+                # Mirror the HOLD-vs-direction convention in coordinator.py
+                # (non_hold * 0.8) by taking max * 0.8 — preserves per-event
+                # variance instead of compressing every HOLD to a constant.
+                hold_conf = max(hold_confidences) * 0.8
+            else:
+                hold_conf = 0.25
             return ClusterResult(
                 cluster_signal="HOLD",
-                confidence=0.25,
+                confidence=hold_conf,
                 cluster_strength=0,
                 disagreeing_strategies=[],
                 agreeing_strategies=[r.strategy_name for r in confident],
