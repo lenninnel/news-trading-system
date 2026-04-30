@@ -114,7 +114,7 @@ class TestMomentumRulesDirectly:
         assert len(reasoning) == 3
 
     def test_two_conditions_hold(self):
-        """2/4 conditions → HOLD."""
+        """1/4 conditions (only uptrend) → HOLD at 17.5 (10 + 1/4 * 30)."""
         ind = {
             "price": 150.0, "rsi": 70.0,  # outside 50-65
             "sma20": 148.0, "sma50": 145.0,
@@ -123,7 +123,7 @@ class TestMomentumRulesDirectly:
         }
         signal, confidence, reasoning = MomentumStrategy._apply_rules(ind, "HOLD")
         assert signal == "HOLD"
-        assert confidence == 25.0
+        assert confidence == 17.5
 
     def test_rsi_below_50_hold(self):
         """RSI below 50 = momentum condition fails."""

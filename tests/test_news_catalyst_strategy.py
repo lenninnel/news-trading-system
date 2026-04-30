@@ -50,7 +50,8 @@ class TestNewsCatalystStrategy:
         bars = _make_bars()
         result = self.strategy.analyze("AAPL", bars, "HOLD")
         assert result.signal == "HOLD"
-        assert result.confidence == 25.0
+        # 0-headline / no-data baseline
+        assert result.confidence == 10.0
 
     def test_negative_news_sell(self):
         bars = _make_bars(last_volume_mult=1.5, last_pct_change=-1.5)
@@ -63,7 +64,8 @@ class TestNewsCatalystStrategy:
         bars = _make_bars()
         result = self.strategy.analyze("AAPL", bars, "BUY", news_data=None)
         assert result.signal == "HOLD"
-        assert result.confidence == 25.0
+        # 0-headline / no-data baseline
+        assert result.confidence == 10.0
 
     def test_insufficient_bars(self):
         bars = pd.DataFrame({"Close": [100], "Volume": [1000], "Open": [99], "High": [101], "Low": [99]})

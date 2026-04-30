@@ -226,15 +226,31 @@ class PullbackStrategy(BaseStrategy):
             # 2 or fewer — no actionable signal
             if not reasoning:
                 reasoning.append("No pullback conditions triggered")
-            signal, confidence = "HOLD", 20.0
+            # HOLD confidence scales 10-40 with conditions_met / 4 plus the
+            # already-computed proximity bonuses so a near-setup pullback
+            # (close to SMA50, recovering from an oversold dip) reads above
+            # a distant one. Total conditions = 4. Capped at 40.
+            signal = "HOLD"
+            confidence = min(
+                40.0,
+                10.0 + (conditions_met / 4.0) * 30.0
+                + rsi_recovery + stoch_recovery + proximity_bonus,
+            )
 
         # ── Downtrend filter: prevent catching falling knives ──
         sma200 = ind.get("sma200")
         if sma200 and price and sma200 > 0:
             sma_ratio = price / sma200
             if sma_ratio < 0.70:
+                # Suppression of an otherwise-actionable setup is high-conviction
+                # HOLD \u2014 preserve conditions_met-based score so a 3/4 pullback
+                # blocked by the downtrend reads above a 0/4 HOLD.
                 signal = "HOLD"
-                confidence = 20.0
+                confidence = min(
+                    40.0,
+                    10.0 + (conditions_met / 4.0) * 30.0
+                    + rsi_recovery + stoch_recovery + proximity_bonus,
+                )
                 reasoning.append("Extreme downtrend \u2014 signal suppressed")
             elif sma_ratio < 0.80 and signal in ("BUY", "STRONG BUY"):
                 signal = "WEAK BUY"

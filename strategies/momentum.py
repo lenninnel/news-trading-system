@@ -199,15 +199,21 @@ class MomentumStrategy(BaseStrategy):
             # 2 or fewer conditions — no actionable signal
             if not reasoning:
                 reasoning.append("No momentum conditions triggered")
-            signal, confidence = "HOLD", 25.0
+            # HOLD confidence scales 10-40 with conditions_met / 4 so a
+            # 0/4 HOLD reads weaker than a 2/4 near-miss. Total conditions = 4.
+            signal = "HOLD"
+            confidence = 10.0 + (conditions_met / 4.0) * 30.0
 
         # ── Downtrend filter: prevent catching falling knives ──
         sma200 = ind.get("sma200")
         if sma200 and price and sma200 > 0:
             sma_ratio = price / sma200
             if sma_ratio < 0.70:
+                # Suppression of an otherwise-actionable setup is high-conviction
+                # HOLD \u2014 keep conditions_met-based score so a 3/4 setup blocked
+                # by the downtrend reads above a 0/4 HOLD.
                 signal = "HOLD"
-                confidence = 25.0
+                confidence = 10.0 + (conditions_met / 4.0) * 30.0
                 reasoning.append("Extreme downtrend \u2014 signal suppressed")
             elif sma_ratio < 0.80 and signal in ("BUY", "STRONG BUY"):
                 signal = "WEAK BUY"

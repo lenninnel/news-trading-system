@@ -103,7 +103,7 @@ class TestPullbackRulesDirectly:
         assert len(reasoning) == 3
 
     def test_two_conditions_hold(self):
-        """2/4 → HOLD."""
+        """2/4 → HOLD, data-driven in 10-40 range (10 + 2/4 * 30 + bonuses)."""
         ind = {
             "price": 102.0, "rsi": 55.0, "rsi_prev": 50.0,  # never dipped <45
             "sma50": 100.0, "sma50_dist_pct": 2.0,
@@ -112,7 +112,7 @@ class TestPullbackRulesDirectly:
         }
         signal, confidence, reasoning = PullbackStrategy._apply_rules(ind)
         assert signal == "HOLD"
-        assert confidence == 20.0
+        assert 25.0 <= confidence <= 40.0
 
     def test_downtrend_blocks_uptrend_condition(self):
         """Price below SMA50 → uptrend condition fails."""
@@ -262,7 +262,8 @@ class TestPullbackEndToEnd:
         result = strat.analyze("AAPL", bars)
 
         assert result.signal == "HOLD"
-        assert result.confidence <= 25.0
+        # Data-driven HOLD now ranges 10-40 (10 + conds/4*30 + bonuses)
+        assert result.confidence <= 40.0
 
     def test_downtrend_no_uptrend_in_reasoning(self):
         strat = PullbackStrategy()

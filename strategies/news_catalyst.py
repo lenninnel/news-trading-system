@@ -46,9 +46,10 @@ class NewsCatalystStrategy(BaseStrategy):
         conditions_met = 0
 
         if bars is None or bars.empty or len(bars) < 21:
+            # 0-headline / no-data HOLD baseline (see fallthrough HOLD below)
             return StrategyResult(
                 signal="HOLD",
-                confidence=25.0,
+                confidence=10.0,
                 strategy_name=self.name,
                 reasoning=["Insufficient bar data"],
             )
@@ -61,9 +62,10 @@ class NewsCatalystStrategy(BaseStrategy):
 
         # Default news_data if not provided
         if not news_data:
+            # 0-headline / no-data HOLD baseline (see fallthrough HOLD below)
             return StrategyResult(
                 signal="HOLD",
-                confidence=25.0,
+                confidence=10.0,
                 strategy_name=self.name,
                 indicators={"price": close},
                 reasoning=["No news data available"],
@@ -158,9 +160,20 @@ class NewsCatalystStrategy(BaseStrategy):
                 reasoning=reasoning,
             )
 
+        # Data-driven HOLD: scale by sentiment magnitude, headline volume,
+        # and price/volume reaction. A 0-headline neutral HOLD floors at 10
+        # ("nothing happening"), a high-volume strong-news neutral HOLD caps
+        # at 30 (real conviction in inaction).
+        hold_conf = min(
+            30.0,
+            10.0
+            + min(10.0, headline_count * 2.0)
+            + news_score * 10.0
+            + max(0.0, (rvol - 1.0)) * 5.0,
+        )
         return StrategyResult(
             signal="HOLD",
-            confidence=25.0,
+            confidence=hold_conf,
             strategy_name=self.name,
             indicators=indicators,
             reasoning=reasoning,
