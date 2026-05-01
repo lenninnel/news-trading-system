@@ -84,6 +84,18 @@ _FUSION_TABLE: dict[tuple[str, str], str] = {
     ("HOLD", "HOLD"): "HOLD",
 }
 
+# Post-debate confidence floors per signal type. Applied after the debate
+# may have lowered confidence — directional signals must stay above their
+# execution gates. HOLD is intentionally absent: strategies emit data-driven
+# HOLD confidence (Phase A) and clamping back to 0.25 erases the variance.
+_SIGNAL_FLOORS: dict[str, float] = {
+    "STRONG BUY":  0.60,
+    "STRONG SELL": 0.60,
+    "WEAK BUY":    0.35,
+    "WEAK SELL":   0.35,
+    "CONFLICTING": 0.10,
+}
+
 
 _news_catalyst = NewsCatalystStrategy()
 
@@ -753,7 +765,9 @@ class Coordinator:
         a directional technical signal now lands in the 40-60% band.
 
         CONFLICTING is fixed at 0.10 (agents actively disagree).
-        HOLD is fixed at 0.25 (no directional conviction).
+        HOLD is data-driven: `blended * 0.4` (range 0.0-0.40) so a
+        no-conviction HOLD reads weaker than a high-conviction HOLD —
+        no constant floor that would erase strategy-level variance.
 
         Volume adjustment (applied after base calculation):
             +0.10 when volume_confirmed is True (RVOL > 1.5 + OBV aligns).
@@ -783,7 +797,11 @@ class Coordinator:
         elif combined_signal == "CONFLICTING":
             base = 0.10
         else:
-            base = 0.25  # HOLD
+            # HOLD — data-driven, scales 0.0-0.40 with blended input strength.
+            # Phase B: removed the 0.25 constant floor so a low-conviction
+            # HOLD reads below a high-conviction HOLD and the variance from
+            # the strategy/cluster layer survives.
+            base = blended * 0.4
 
         # Volume adjustment (only for directional signals)
         # Note: low-rvol penalty removed -- rvol compares partial intraday
@@ -1081,14 +1099,9 @@ class Coordinator:
             conf = debate_result.adjusted_confidence
 
             # Enforce signal-type minimum floors after debate penalty.
-            # The debate can reduce confidence but must not push it below
-            # the floor for the resulting signal type.
-            _SIGNAL_FLOORS = {
-                "STRONG BUY": 0.60, "STRONG SELL": 0.60,
-                "WEAK BUY": 0.35, "WEAK SELL": 0.35,
-                "HOLD": 0.25,
-                "CONFLICTING": 0.10,
-            }
+            # The debate can reduce confidence but must not push directional
+            # signals below their execution gates. HOLD has no floor (Phase B)
+            # — strategies emit data-driven HOLD confidence; clamping erases it.
             floor = _SIGNAL_FLOORS.get(combined_signal, 0.0)
             if conf < floor:
                 log.debug(
@@ -1498,6 +1511,18 @@ class Coordinator:
                     )
             combined_signal = debate_result.final_signal
             conf = debate_result.adjusted_confidence
+
+            # Enforce signal-type minimum floors after debate penalty.
+            # Mirrors the sync run_combined() clamp — without this the async
+            # production path lets debate-adjusted WEAK BUY drop below the
+            # 0.35 execution gate (observed bug: TSLA WEAK BUY 0.41 → 0.26).
+            floor = _SIGNAL_FLOORS.get(combined_signal, 0.0)
+            if conf < floor:
+                log.debug(
+                    "[%s] Debate pushed confidence %.2f below %s floor %.2f — clamping",
+                    ticker, conf, combined_signal, floor,
+                )
+                conf = floor
 
         # ── Phase 4: DB writes + risk sizing ───────────────────────────
         async with db_lock:

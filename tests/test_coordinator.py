@@ -111,12 +111,15 @@ class TestConfidence:
         assert conf("CONFLICTING", -1.0) == 0.10
         assert conf("CONFLICTING", 0.0)  == 0.10
 
-    # --- HOLD: fixed 0.25 ---
+    # --- HOLD: data-driven, scales 0.0-0.40 with input strength (Phase B) ---
 
-    def test_hold_is_always_0_25(self):
-        assert conf("HOLD", 1.0)  == 0.25
-        assert conf("HOLD", -1.0) == 0.25
-        assert conf("HOLD", 0.0)  == 0.25
+    def test_hold_is_data_driven(self):
+        # 0 input → 0 confidence; max input → 0.40 cap
+        assert conf("HOLD", 0.0)  == 0.0
+        assert conf("HOLD", 1.0)  == 0.40
+        assert conf("HOLD", -1.0) == 0.40
+        # Monotonic in |avg_score|
+        assert conf("HOLD", 0.3) < conf("HOLD", 0.8)
 
     # --- Confidence is always within [0, 1] ---
 
@@ -241,10 +244,14 @@ class TestConfidenceTechnicalBlend:
         c = conf("WEAK BUY", 0.35, technical_confidence=0.5)
         assert 0.40 <= c <= 0.60
 
-    def test_technical_does_not_affect_hold(self):
-        """HOLD confidence is fixed at 0.25 regardless of technical confidence."""
-        c = conf("HOLD", 0.5, technical_confidence=0.8)
-        assert c == 0.25
+    def test_technical_affects_hold(self):
+        """Phase B: HOLD is data-driven (blended * 0.4), so a stronger
+        technical signal raises HOLD confidence."""
+        low  = conf("HOLD", 0.5, technical_confidence=0.2)
+        high = conf("HOLD", 0.5, technical_confidence=0.9)
+        assert high > low
+        # Both still bounded by the 0.40 HOLD cap
+        assert low <= 0.40 and high <= 0.40
 
     def test_technical_does_not_affect_conflicting(self):
         """CONFLICTING confidence is fixed at 0.10 regardless."""
@@ -372,11 +379,12 @@ class TestDebateFloorEnforcement:
     Coordinator.run() that clamps ``conf`` after overwriting it with
     ``debate_result.adjusted_confidence``."""
 
-    # The floor map used in coordinator.py after the debate block:
+    # The floor map used in coordinator.py after the debate block.
+    # Phase B: HOLD is intentionally absent — strategies emit data-driven
+    # HOLD confidence (10-40%) and a 0.25 clamp would erase that variance.
     _SIGNAL_FLOORS = {
         "STRONG BUY": 0.60, "STRONG SELL": 0.60,
         "WEAK BUY": 0.35, "WEAK SELL": 0.35,
-        "HOLD": 0.25,
         "CONFLICTING": 0.10,
     }
 
@@ -386,7 +394,6 @@ class TestDebateFloorEnforcement:
         floors = {
             "STRONG BUY": 0.60, "STRONG SELL": 0.60,
             "WEAK BUY": 0.35, "WEAK SELL": 0.35,
-            "HOLD": 0.25,
             "CONFLICTING": 0.10,
         }
         floor = floors.get(signal, 0.0)
@@ -416,10 +423,12 @@ class TestDebateFloorEnforcement:
     def test_strong_sell_never_below_060(self):
         assert self._apply_floor("STRONG SELL", 0.30) == 0.60
 
-    def test_hold_stays_at_025(self):
-        """HOLD floor is 0.25."""
-        assert self._apply_floor("HOLD", 0.20) == 0.25
-        assert self._apply_floor("HOLD", 0.25) == 0.25
+    def test_hold_no_floor_phase_b(self):
+        """Phase B: HOLD has no floor — data-driven values (e.g. 0.20)
+        survive instead of being clamped up to 0.25."""
+        assert self._apply_floor("HOLD", 0.20) == 0.20
+        assert self._apply_floor("HOLD", 0.10) == 0.10
+        assert self._apply_floor("HOLD", 0.0)  == 0.0
 
     def test_conflicting_stays_at_010(self):
         """CONFLICTING floor is 0.10."""
