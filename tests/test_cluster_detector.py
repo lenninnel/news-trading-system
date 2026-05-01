@@ -43,13 +43,16 @@ class TestClusterDetector:
         assert cluster.cluster_strength == 0
 
     def test_no_directional_signals(self):
+        # Phase C: HOLD votes are aggregated from the unfiltered list, so
+        # sub-MIN_CONFIDENCE HOLDs (25%) now drive the cluster confidence
+        # instead of being discarded. max(25, 25)/100 * 0.8 = 0.20.
         results = [
             _make_result("HOLD", 25, "Momentum"),
             _make_result("HOLD", 25, "Pullback"),
         ]
         cluster = self.detector.detect(results)
         assert cluster.cluster_signal == "HOLD"
-        assert cluster.confidence == 0.25
+        assert cluster.confidence == 0.20
 
     def test_single_strategy_no_boost(self):
         results = [_make_result("BUY", 70, "Momentum")]

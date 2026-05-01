@@ -68,9 +68,15 @@ class ClusterDetector:
 
         # No directional signals at all
         if not buy_side and not sell_side:
+            # Aggregate HOLD votes from the *unfiltered* strategy_results.
+            # MIN_CONFIDENCE is a noise filter for directional (BUY/SELL)
+            # votes — but for HOLDs, the sub-threshold values ARE the data
+            # (a 0/4 Momentum HOLD at 10% is real "no setup", not noise).
+            # Filtering on confident here was the Phase A regression that
+            # left Combined HOLD pinned at the 0.25 fallback.
             hold_confidences = [
                 r.confidence / 100.0
-                for r in confident
+                for r in strategy_results
                 if r.signal.upper() == "HOLD"
             ]
             if hold_confidences:
