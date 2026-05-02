@@ -164,6 +164,13 @@ async def run_batch(
     tracker = _ProgressTracker(len(tickers))
 
     coordinator = Coordinator(macro_context=macro_context)
+    # Push the live account balance into the PortfolioManager so its
+    # MAX_DEPLOYED_PCT cap (60% of account) is computed against the
+    # actual NetLiquidation rather than its placeholder $10k init value.
+    try:
+        coordinator._portfolio_manager.set_account_balance(account_balance)
+    except Exception as exc:
+        log.warning("PortfolioManager balance update failed (non-fatal): %s", exc)
 
     t0 = time.monotonic()
 
@@ -1112,6 +1119,18 @@ class DailyScheduler:
                         print("[scheduler] WARNING: IBKR reconnect failed", flush=True)
             except Exception as exc:
                 log.warning("IBKR ensure_connected check failed (non-fatal): %s", exc)
+
+            # Force a portfolio sync so the PortfolioManager gate reads
+            # current state. Outside US market hours (XETRA, US_PRE, EOD)
+            # the 60s PositionManager mark-to-market loop is idle, so the
+            # local portfolio_positions table can be hours stale.
+            try:
+                if hasattr(self._position_manager_trader, 'get_portfolio'):
+                    self._position_manager_trader.get_portfolio()
+            except Exception as exc:
+                log.warning(
+                    "Pre-session portfolio sync failed (non-fatal): %s", exc,
+                )
 
         # Live account balance for risk sizing — fetch once per session
         # (cached as a local variable for the duration of run_batch).

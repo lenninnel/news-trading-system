@@ -94,8 +94,16 @@ class PortfolioManager:
 
     # ── Limits ────────────────────────────────────────────────────────────────
     MAX_POSITIONS     = 8
-    MAX_PER_STRATEGY  = 2
-    MAX_PER_SECTOR    = 3
+    # MAX_PER_STRATEGY tuned for the active 11-ticker universe: router
+    # routes 3 tickers to Momentum and 8 to Pullback. A cap of 4 keeps
+    # Pullback from filling every slot while never binding on Momentum
+    # (which only has 3 candidates). Total is still bounded by MAX_POSITIONS.
+    MAX_PER_STRATEGY  = 4
+    # MAX_PER_SECTOR=4: 6 of 11 watchlist tickers are Tech (META, AAPL,
+    # MSFT, AMZN, TSLA, VRT). A cap of 3 was too tight — would refuse the
+    # 4th Tech name even if signals all fired. 4 leaves room for diversification
+    # without forcing rejection on a Tech-heavy day.
+    MAX_PER_SECTOR    = 4
     MAX_DEPLOYED_PCT  = 0.60
     MAX_POSITION_PCT  = 0.15
     MAX_SECTOR_PCT    = 0.40
@@ -116,6 +124,18 @@ class PortfolioManager:
         self._paper_trader = PaperTrader(db_path)
         self._db           = Database(db_path)
         self._init_meta_schema()
+
+    def set_account_balance(self, balance: float) -> None:
+        """Update the balance used for `MAX_DEPLOYED_PCT` cap math.
+
+        Coordinator instantiates the PortfolioManager once at startup
+        with a placeholder balance; the scheduler refreshes this each
+        session from live IBKR NetLiquidation so the deployment cap
+        scales with the real account value (was hardcoded against an
+        outdated $98k baseline).
+        """
+        if balance and balance > 0:
+            self._balance = float(balance)
 
     # ------------------------------------------------------------------
     # Schema: position_metadata (strategy + sector per open position)

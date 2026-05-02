@@ -62,6 +62,7 @@ from data.news_feed import NewsFeed
 from data.marketaux_feed import MarketauxFeed
 from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
+from execution.portfolio_manager import PortfolioManager
 from orchestrator.cluster_detector import ClusterDetector
 from storage.database import Database
 from strategies.base import StrategyResult
@@ -176,6 +177,12 @@ class Coordinator:
         self._cluster_detector = ClusterDetector()
         self._momentum_strategy = MomentumStrategy()
         self._pullback_strategy = PullbackStrategy()
+
+        # Portfolio-level safety caps (max positions, sector concentration,
+        # correlation, deployment %). Instantiated with a placeholder balance;
+        # the scheduler calls set_account_balance() each session with the
+        # live IBKR NetLiquidation so MAX_DEPLOYED_PCT scales correctly.
+        self._portfolio_manager = PortfolioManager()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -1221,15 +1228,45 @@ class Coordinator:
                 if verbose:
                     print(f"\n  [SKIPPED] Position already open for {ticker}")
             else:
-                execution = self.paper_trader.track_trade(
-                    ticker=ticker,
-                    action=risk["direction"],
-                    shares=risk["shares"],
-                    price=price,
-                    stop_loss=risk["stop_loss"],
-                    take_profit=risk["take_profit"],
-                )
-                if verbose:
+                # Portfolio-level gate (BUY only)
+                pm_blocked = False
+                if risk["direction"] == "BUY":
+                    proposed_usd = float(risk["shares"]) * float(price)
+                    allowed, pm_reason = self._portfolio_manager.can_add_position(
+                        ticker, strat_name, proposed_usd,
+                    )
+                    if not allowed:
+                        pm_blocked = True
+                        log.info("[%s] PortfolioManager blocked: %s", ticker, pm_reason)
+                        if verbose:
+                            print(f"\n  [SKIPPED] PortfolioManager: {pm_reason}")
+                if pm_blocked:
+                    execution = None
+                else:
+                    execution = self.paper_trader.track_trade(
+                        ticker=ticker,
+                        action=risk["direction"],
+                        shares=risk["shares"],
+                        price=price,
+                        stop_loss=risk["stop_loss"],
+                        take_profit=risk["take_profit"],
+                    )
+                    if execution and execution.get("trade_id"):
+                        try:
+                            if risk["direction"] == "BUY":
+                                self._portfolio_manager.register_position(
+                                    ticker=ticker,
+                                    strategy=strat_name,
+                                    entry_price=execution.get("price", price),
+                                )
+                            else:
+                                self._portfolio_manager.clear_position_meta(ticker)
+                        except Exception as exc:
+                            log.warning(
+                                "[%s] PortfolioManager metadata update failed: %s",
+                                ticker, exc,
+                            )
+                if execution and verbose:
                     print(f"\n  [EXECUTED] Paper trade #{execution['trade_id']}: "
                           f"{risk['direction']} {risk['shares']} {ticker} "
                           f"@ ${price:.2f}")
@@ -1624,14 +1661,46 @@ class Coordinator:
                     ):
                         log.info("[%s] Duplicate BUY blocked — position already open", ticker)
                     else:
-                        execution = self.paper_trader.track_trade(
-                            ticker=ticker,
-                            action=risk["direction"],
-                            shares=risk["shares"],
-                            price=price,
-                            stop_loss=risk["stop_loss"],
-                            take_profit=risk["take_profit"],
-                        )
+                        # Portfolio-level gate (BUY only — SELLs reduce exposure)
+                        pm_blocked = False
+                        if risk["direction"] == "BUY":
+                            proposed_usd = float(risk["shares"]) * float(price)
+                            allowed, reason = self._portfolio_manager.can_add_position(
+                                ticker, strat_name, proposed_usd,
+                            )
+                            if not allowed:
+                                pm_blocked = True
+                                log.info(
+                                    "[%s] PortfolioManager blocked: %s",
+                                    ticker, reason,
+                                )
+                        if not pm_blocked:
+                            execution = self.paper_trader.track_trade(
+                                ticker=ticker,
+                                action=risk["direction"],
+                                shares=risk["shares"],
+                                price=price,
+                                stop_loss=risk["stop_loss"],
+                                take_profit=risk["take_profit"],
+                            )
+                            # Register / clear position metadata so the
+                            # per-strategy and per-sector caps actually
+                            # see meaningful tags on the next gate check.
+                            if execution and execution.get("trade_id"):
+                                try:
+                                    if risk["direction"] == "BUY":
+                                        self._portfolio_manager.register_position(
+                                            ticker=ticker,
+                                            strategy=strat_name,
+                                            entry_price=execution.get("price", price),
+                                        )
+                                    else:
+                                        self._portfolio_manager.clear_position_meta(ticker)
+                                except Exception as exc:
+                                    log.warning(
+                                        "[%s] PortfolioManager metadata update failed: %s",
+                                        ticker, exc,
+                                    )
 
         elapsed = _time.monotonic() - t0
 
