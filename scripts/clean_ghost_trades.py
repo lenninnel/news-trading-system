@@ -36,6 +36,22 @@ load_dotenv()
 # Using $200 catches the $150 fixture prices while leaving real trades alone.
 GHOST_PRICE_THRESHOLD = 200.0
 
+# ISO 4217 cash currency codes that can appear in portfolio_positions /
+# trade_history as cash holdings (e.g. after a FX conversion that moves
+# EUR -> USD, the EUR balance shows up with price=0.00). These rows
+# must never be touched by ghost cleanup. "BASE" is IBKR's aggregate
+# row for the account base currency.
+# Why an explicit allowlist instead of a length heuristic: real equity
+# tickers also fit a 3-letter pattern (JPM, BAC, WMT, XOM), so we have
+# to enumerate currencies — we can't infer "is this cash?" from shape.
+_CASH_CURRENCY_CODES = frozenset({
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+    "HKD", "SGD", "CNH", "CNY", "SEK", "NOK", "DKK", "MXN",
+    "ZAR", "KRW", "INR", "BRL", "ILS", "PLN", "HUF", "CZK",
+    "TRY", "AED", "SAR", "THB", "IDR", "MYR", "PHP", "VND",
+    "RUB", "BASE",
+})
+
 
 def _resolve_db_path() -> str:
     """Find the database — Railway /data volume first, then local default."""
@@ -55,16 +71,22 @@ def clean_ghost_data(db_path: str, apply: bool = False) -> dict:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    # --- Ghost positions (avg_price < threshold) ---
+    # Build "AND UPPER(ticker) NOT IN (?, ?, ...)" so cash holdings
+    # (EUR / USD / etc.) are skipped by both the SELECT and the DELETE.
+    placeholders = ",".join("?" * len(_CASH_CURRENCY_CODES))
+    cash_excl_sql = f" AND UPPER(ticker) NOT IN ({placeholders})"
+    cash_excl_params: tuple = tuple(_CASH_CURRENCY_CODES)
+
+    # --- Ghost positions (avg_price < threshold, excluding cash) ---
     ghost_positions = conn.execute(
-        "SELECT * FROM portfolio_positions WHERE avg_price < ?",
-        (GHOST_PRICE_THRESHOLD,),
+        f"SELECT * FROM portfolio_positions WHERE avg_price < ?{cash_excl_sql}",
+        (GHOST_PRICE_THRESHOLD, *cash_excl_params),
     ).fetchall()
 
-    # --- Ghost trades (price < threshold) ---
+    # --- Ghost trades (price < threshold, excluding cash) ---
     ghost_trades = conn.execute(
-        "SELECT * FROM trade_history WHERE price < ?",
-        (GHOST_PRICE_THRESHOLD,),
+        f"SELECT * FROM trade_history WHERE price < ?{cash_excl_sql}",
+        (GHOST_PRICE_THRESHOLD, *cash_excl_params),
     ).fetchall()
 
     deleted_positions = 0
@@ -73,15 +95,15 @@ def clean_ghost_data(db_path: str, apply: bool = False) -> dict:
     if apply and (ghost_positions or ghost_trades):
         if ghost_positions:
             cursor = conn.execute(
-                "DELETE FROM portfolio_positions WHERE avg_price < ?",
-                (GHOST_PRICE_THRESHOLD,),
+                f"DELETE FROM portfolio_positions WHERE avg_price < ?{cash_excl_sql}",
+                (GHOST_PRICE_THRESHOLD, *cash_excl_params),
             )
             deleted_positions = cursor.rowcount
 
         if ghost_trades:
             cursor = conn.execute(
-                "DELETE FROM trade_history WHERE price < ?",
-                (GHOST_PRICE_THRESHOLD,),
+                f"DELETE FROM trade_history WHERE price < ?{cash_excl_sql}",
+                (GHOST_PRICE_THRESHOLD, *cash_excl_params),
             )
             deleted_trades = cursor.rowcount
 
