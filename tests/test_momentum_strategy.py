@@ -343,6 +343,7 @@ class TestMomentumEdgeCases:
         strat = MomentumStrategy()
         assert "META" in strat.PREFERRED_TICKERS
         assert "JPM" in strat.PREFERRED_TICKERS
+        assert "VRT" in strat.PREFERRED_TICKERS
 
     def test_indicators_populated(self):
         strat = MomentumStrategy()

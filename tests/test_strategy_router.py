@@ -168,12 +168,6 @@ class TestRouterTickerSets:
 class TestPreferredTickersAlignment:
     """Verify PREFERRED_TICKERS on strategy classes match the router."""
 
-    @pytest.mark.skip(
-        reason="Known drift from Phase 1 11-ticker refresh: MomentumStrategy."
-        "PREFERRED_TICKERS still lists only {META, JPM} while the router now "
-        "also includes VRT. Follow-up task to update the strategy class; "
-        "until then this invariant is intentionally disabled."
-    )
     def test_momentum_preferred_matches_router(self):
         strat = MomentumStrategy()
         assert set(strat.PREFERRED_TICKERS) == MOMENTUM_TICKERS

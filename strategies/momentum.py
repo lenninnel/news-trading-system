@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 class MomentumStrategy(BaseStrategy):
     """Trend-following momentum strategy with volume confirmation."""
 
-    PREFERRED_TICKERS = ["META", "JPM"]
+    PREFERRED_TICKERS = ["META", "JPM", "VRT"]
 
     @property
     def name(self) -> str:
