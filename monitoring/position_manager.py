@@ -26,14 +26,18 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
-# US market window (UTC)
-_MARKET_OPEN_HOUR = 14
-_MARKET_OPEN_MIN = 30
-_MARKET_CLOSE_HOUR = 21
-_MARKET_CLOSE_MIN = 0
+# US market hours expressed in exchange-local time so DST is handled
+# automatically. Previously the constants were hardcoded UTC (14:30-21:00),
+# which is correct only during EST (winter); during EDT (March-November)
+# the NYSE opens at 13:30 UTC, so the monitor was skipping the first
+# hour of every summer trading day.
+_NY_TZ = ZoneInfo("America/New_York")
+_MARKET_OPEN_LOCAL = (9, 30)    # 9:30 AM ET
+_MARKET_CLOSE_LOCAL = (16, 0)   # 4:00 PM ET
 
 # Trailing-stop parameters
 _TRAILING_ACTIVATION_PCT = 2.0   # position must be up >2% to activate
@@ -156,14 +160,14 @@ class PositionManager:
 
     @staticmethod
     def _is_market_hours() -> bool:
-        """Return True if current UTC time is within 14:30–21:00 on a weekday."""
-        now = datetime.now(timezone.utc)
+        """Return True if it's a US-Eastern weekday between 9:30 and 16:00."""
+        now = datetime.now(_NY_TZ)
         if now.weekday() >= 5:  # weekend
             return False
 
         now_minutes = now.hour * 60 + now.minute
-        open_minutes = _MARKET_OPEN_HOUR * 60 + _MARKET_OPEN_MIN
-        close_minutes = _MARKET_CLOSE_HOUR * 60 + _MARKET_CLOSE_MIN
+        open_minutes = _MARKET_OPEN_LOCAL[0] * 60 + _MARKET_OPEN_LOCAL[1]
+        close_minutes = _MARKET_CLOSE_LOCAL[0] * 60 + _MARKET_CLOSE_LOCAL[1]
         return open_minutes <= now_minutes < close_minutes
 
     # ------------------------------------------------------------------

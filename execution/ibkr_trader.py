@@ -347,10 +347,27 @@ class IBKRTrader:
         }
 
     def get_positions(self) -> list[dict]:
-        """Return open positions from IBKR."""
+        """Return open *equity* positions from IBKR.
+
+        FX cash positions (secType="CASH", e.g. EUR/USD/GBP balances after
+        a currency conversion) and other non-stock contract types are
+        filtered out: they share the namespace with the equity ticker
+        column in portfolio_positions and confuse the PositionManager,
+        which would try to evaluate stop-losses against yfinance prices
+        for the symbol — e.g. a `pos.contract.symbol == "EUR"` from an
+        FX balance hits yfinance's delisted "EUR" ETF and spams skip
+        warnings every 60s. Only secType="STK" enters the local table.
+        """
         positions = self._ib.positions()
         result = []
         for pos in positions:
+            sec_type = getattr(pos.contract, "secType", "STK")
+            if sec_type != "STK":
+                log.debug(
+                    "Skipping non-stock position: %s (secType=%s)",
+                    pos.contract.symbol, sec_type,
+                )
+                continue
             ticker = pos.contract.symbol
             qty = int(pos.position)
             avg_entry = float(pos.avgCost) / abs(qty) if qty != 0 else 0.0

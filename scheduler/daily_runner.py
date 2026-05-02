@@ -794,7 +794,39 @@ class DailyScheduler:
             # collides with per-session trading connections (which use
             # clientId 1/2/3). IBKR rejects duplicate clientIds, so a
             # shared id would block all trading sessions.
-            trader = create_trader(client_id=10)
+            #
+            # Retry on connect failure: nts-trading and ibgateway.service
+            # come up independently after host boot, and on a cold reboot
+            # ibgateway can take 3+ minutes longer (IBC dialog handlers,
+            # JTS auth). Without a retry loop a single boot-time race
+            # leaves the monitor permanently dead until the next daemon
+            # restart, so positions opened that day get no stop-loss
+            # protection.
+            backoffs = [5, 10, 20, 30, 60, 60]   # ~3 minutes total
+            trader = None
+            last_exc: Exception | None = None
+            for attempt, wait_s in enumerate([0, *backoffs], start=1):
+                if wait_s:
+                    time.sleep(wait_s)
+                try:
+                    trader = create_trader(client_id=10)
+                    if attempt > 1:
+                        log.info(
+                            "PositionManager IBKR connect succeeded on attempt %d",
+                            attempt,
+                        )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    log.warning(
+                        "PositionManager IBKR connect failed (attempt %d/%d): %s",
+                        attempt, len(backoffs) + 1, exc,
+                    )
+            if trader is None:
+                raise last_exc or RuntimeError(
+                    "PositionManager could not connect to IBKR"
+                )
+
             self._position_manager_trader = trader
             position_manager = PositionManager(
                 trader=trader, notifier=self._tg,
@@ -804,6 +836,18 @@ class DailyScheduler:
             print("[scheduler] PositionManager started (60s interval)", flush=True)
         except Exception as exc:
             log.warning("PositionManager startup failed (non-fatal): %s", exc)
+            # Loud Telegram alert: a silent dead monitor means the next
+            # filled BUY has no stop-loss enforcement until next restart.
+            if self._tg:
+                try:
+                    self._tg._send(
+                        "\U0001f6a8 *PositionManager failed to start*\n"
+                        f"`{str(exc)[:200]}`\n"
+                        "Stop-loss / take-profit monitoring is OFFLINE "
+                        "until the next daemon restart."
+                    )
+                except Exception:
+                    pass
 
         # Run once immediately on startup if within trading hours
         last_executed: str | None = None
@@ -1069,12 +1113,20 @@ class DailyScheduler:
             except Exception as exc:
                 log.warning("IBKR ensure_connected check failed (non-fatal): %s", exc)
 
+        # Live account balance for risk sizing — fetch once per session
+        # (cached as a local variable for the duration of run_batch).
+        # We piggyback on the persistent PositionManager trader (clientId=10)
+        # which we just confirmed is connected. Fall back to the configured
+        # balance if the broker query fails so a transient IBKR hiccup never
+        # blocks a session.
+        account_balance = self._fetch_session_account_balance()
+
         try:
             batch = asyncio.run(
                 run_batch(
                     tickers,
                     workers=workers,
-                    account_balance=98_412.0,
+                    account_balance=account_balance,
                     execute=execute,
                     session=run_name,
                     session_type=session_type,
@@ -1168,6 +1220,43 @@ class DailyScheduler:
         # until the next session reconnects. The per-session trader
         # (clientId=1) is separate and still disconnected inside
         # run_batch() itself.
+
+    def _fetch_session_account_balance(self) -> float:
+        """Live IBKR portfolio value for this session's risk sizing.
+
+        Why query the broker instead of using the configured value:
+        before this fix, every session passed the hardcoded $98,412 which
+        only reflected the original paper-account deposit. After currency
+        conversions, deposits, or P&L the real NetLiquidation drifts, and
+        risk sizing on a stale baseline mis-sizes positions by integer
+        multiples (observed: actual base $293k vs hardcoded $98k → 3x
+        undersized).
+
+        Falls back to ``_configured_account_balance()`` on any broker
+        error so a transient IBKR hiccup never blocks a session. The
+        EOD summary still uses the configured baseline (deliberate —
+        see send_eod_summary() and _configured_account_balance()).
+        """
+        trader = getattr(self, "_position_manager_trader", None)
+        if trader is None or not hasattr(trader, "get_account"):
+            return _configured_account_balance()
+        try:
+            account = trader.get_account() or {}
+            value = float(account.get("portfolio_value") or 0.0)
+            if value > 0:
+                log.info(
+                    "Session account balance from IBKR: $%.2f (NetLiquidation)",
+                    value,
+                )
+                return value
+            log.warning(
+                "IBKR returned zero portfolio_value — using configured balance",
+            )
+        except Exception as exc:
+            log.warning(
+                "IBKR balance fetch failed (using configured): %s", exc,
+            )
+        return _configured_account_balance()
 
     # ── Weekly job dispatch ───────────────────────────────────────────
 
