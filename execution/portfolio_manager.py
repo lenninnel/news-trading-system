@@ -121,7 +121,14 @@ class PortfolioManager:
     ) -> None:
         self._balance      = account_balance
         self._db_path      = db_path
-        self._paper_trader = PaperTrader(db_path)
+        # Latent bug: PaperTrader's first arg is `db: Database | None`,
+        # not a path. Passing the path string left self._db as the string,
+        # so `_paper_trader.get_portfolio() -> self._db.get_portfolio()`
+        # raised "'str' object has no attribute 'get_portfolio'" the first
+        # time PortfolioManager actually ran in production (US_PRE 2026-05-04
+        # after wiring + EXECUTE_TRADES=true exposed the path). Pass a
+        # proper Database instance bound to the same path.
+        self._paper_trader = PaperTrader(Database(db_path))
         self._db           = Database(db_path)
         self._init_meta_schema()
 
