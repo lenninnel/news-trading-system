@@ -370,13 +370,16 @@ class IBKRTrader:
                 continue
             ticker = pos.contract.symbol
             qty = int(pos.position)
-            avg_entry = float(pos.avgCost) / abs(qty) if qty != 0 else 0.0
+            # IBKR Position.avgCost is already average cost per share for STK
+            # (verified empirically 2026-05-04: dividing by qty produced
+            # fill_price/qty noise — e.g. TRGP $254.49 fill recorded as $4.46).
+            avg_entry = float(pos.avgCost) if qty != 0 else 0.0
             result.append({
                 "ticker": ticker,
                 "qty": qty,
                 "avg_entry": avg_entry,
                 "current_price": 0.0,    # requires market data subscription
-                "unrealized_pl": float(pos.avgCost) * -1 if qty else 0.0,
+                "unrealized_pl": 0.0,
                 "unrealized_plpc": 0.0,
             })
         return result

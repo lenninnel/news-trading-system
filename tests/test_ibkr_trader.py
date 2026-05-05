@@ -167,8 +167,9 @@ class TestIBKRAccount:
         trader, mock_ib, _ = _make_trader()
         mock_pos = MagicMock()
         mock_pos.contract.symbol = "AAPL"
+        mock_pos.contract.secType = "STK"
         mock_pos.position = 100
-        mock_pos.avgCost = 15000.0  # total cost, not per-share
+        mock_pos.avgCost = 150.0  # IBKR returns average cost per share for STK
         mock_ib.positions.return_value = [mock_pos]
 
         result = trader.get_positions()

@@ -486,14 +486,43 @@ class Coordinator:
                     ):
                         log.info("[%s] PEAD duplicate BUY blocked", ticker)
                     else:
-                        execution = self.paper_trader.track_trade(
-                            ticker=ticker,
-                            action=risk["direction"],
-                            shares=risk["shares"],
-                            price=price,
-                            stop_loss=risk["stop_loss"],
-                            take_profit=risk["take_profit"],
-                        )
+                        # Portfolio-level gate (BUY only).
+                        pm_blocked = False
+                        if risk["direction"] == "BUY":
+                            proposed_usd = float(risk["shares"]) * float(price)
+                            allowed, pm_reason = self._portfolio_manager.can_add_position(
+                                ticker, "PEAD", proposed_usd,
+                            )
+                            if not allowed:
+                                pm_blocked = True
+                                log.info(
+                                    "[%s] PortfolioManager blocked: %s",
+                                    ticker, pm_reason,
+                                )
+                        if not pm_blocked:
+                            execution = self.paper_trader.track_trade(
+                                ticker=ticker,
+                                action=risk["direction"],
+                                shares=risk["shares"],
+                                price=price,
+                                stop_loss=risk["stop_loss"],
+                                take_profit=risk["take_profit"],
+                            )
+                            if execution and execution.get("trade_id"):
+                                try:
+                                    if risk["direction"] == "BUY":
+                                        self._portfolio_manager.register_position(
+                                            ticker=ticker,
+                                            strategy="PEAD",
+                                            entry_price=execution.get("price", price),
+                                        )
+                                    else:
+                                        self._portfolio_manager.clear_position_meta(ticker)
+                                except Exception as exc:
+                                    log.warning(
+                                        "[%s] PortfolioManager metadata update failed: %s",
+                                        ticker, exc,
+                                    )
 
         # Store forward signal for execution session
         if combined_signal not in ("HOLD", "CONFLICTING"):
@@ -2193,6 +2222,17 @@ class Coordinator:
 
                 if (risk.get("stop_loss") and risk["stop_loss"] > 0
                         and risk.get("take_profit") and risk["take_profit"] > 0):
+                    # Resolve strategy: cached signal_events.strategy first,
+                    # then forward_signal.strategy_name, then "unknown".
+                    strat_name = (
+                        cached.get("strategy")
+                        or next(
+                            (f.get("strategy_name") for f in pending
+                             if f.get("strategy_name")),
+                            None,
+                        )
+                        or "unknown"
+                    )
                     async with db_lock:
                         if risk["direction"] == "BUY" and (
                             self._has_alpaca_position(ticker)
@@ -2200,23 +2240,58 @@ class Coordinator:
                         ):
                             log.info("[%s] BUY blocked — position already open", ticker)
                         else:
-                            execution = self.paper_trader.track_trade(
-                                ticker=ticker,
-                                action=risk["direction"],
-                                shares=risk["shares"],
-                                price=current_price,
-                                stop_loss=risk["stop_loss"],
-                                take_profit=risk["take_profit"],
-                            )
-                            log.info(
-                                "[%s] Cached signal executed: %s %d shares @ %.2f",
-                                ticker, risk["direction"], risk["shares"], current_price,
-                            )
-                            for fr in forward_results:
-                                if fr["status"] == "confirmed":
-                                    self.signal_logger.update_forward_signal(
-                                        fr["id"], "executed",
+                            # Portfolio-level gate (BUY only). Mirrors the
+                            # gate applied in run_combined / analyse_ticker_async
+                            # so cached US_OPEN executions also respect
+                            # max_positions / sector / strategy / deployment caps.
+                            pm_blocked = False
+                            if risk["direction"] == "BUY":
+                                proposed_usd = float(risk["shares"]) * float(current_price)
+                                allowed, pm_reason = self._portfolio_manager.can_add_position(
+                                    ticker, strat_name, proposed_usd,
+                                )
+                                if not allowed:
+                                    pm_blocked = True
+                                    log.info(
+                                        "[%s] PortfolioManager blocked: %s",
+                                        ticker, pm_reason,
                                     )
+                            if not pm_blocked:
+                                execution = self.paper_trader.track_trade(
+                                    ticker=ticker,
+                                    action=risk["direction"],
+                                    shares=risk["shares"],
+                                    price=current_price,
+                                    stop_loss=risk["stop_loss"],
+                                    take_profit=risk["take_profit"],
+                                )
+                                log.info(
+                                    "[%s] Cached signal executed: %s %d shares @ %.2f",
+                                    ticker, risk["direction"], risk["shares"], current_price,
+                                )
+                                # Register / clear position metadata so the
+                                # per-strategy and per-sector caps see meaningful
+                                # tags on the next gate check.
+                                if execution and execution.get("trade_id"):
+                                    try:
+                                        if risk["direction"] == "BUY":
+                                            self._portfolio_manager.register_position(
+                                                ticker=ticker,
+                                                strategy=strat_name,
+                                                entry_price=execution.get("price", current_price),
+                                            )
+                                        else:
+                                            self._portfolio_manager.clear_position_meta(ticker)
+                                    except Exception as exc:
+                                        log.warning(
+                                            "[%s] PortfolioManager metadata update failed: %s",
+                                            ticker, exc,
+                                        )
+                                for fr in forward_results:
+                                    if fr["status"] == "confirmed":
+                                        self.signal_logger.update_forward_signal(
+                                            fr["id"], "executed",
+                                        )
 
         elapsed = _time.monotonic() - t0
 

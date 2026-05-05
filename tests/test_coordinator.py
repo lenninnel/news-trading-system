@@ -523,3 +523,107 @@ class TestSessionPropagation:
 
         logged = coordinator.signal_logger.log.call_args[0][0]
         assert logged["session"] is None
+
+
+# ===========================================================================
+# Cached US_OPEN execution path — PortfolioManager gate + register_position
+# ===========================================================================
+
+class TestCachedUSOpenPortfolioGate:
+    """Verify that _execute_forward_signals_async honours the PortfolioManager
+    can_add_position gate and registers metadata after a successful BUY.
+
+    Was missing on 2026-05-04: AAPL/MSFT/XOM executed via this path with
+    no metadata row in position_metadata, and no portfolio cap enforcement
+    beyond duplicate-ticker. See coordinator.py:_execute_forward_signals_async.
+    """
+
+    def _make_coordinator(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from orchestrator.coordinator import Coordinator
+
+        c = Coordinator.__new__(Coordinator)
+        c.db = MagicMock()
+        c.db.get_cached_signal.return_value = {
+            "signal": "WEAK BUY",
+            "confidence": 0.42,
+            "price_at_signal": 100.0,
+            "strategy": "momentum",
+            "sentiment_score": 0.2,
+        }
+        c.db.get_portfolio_position.return_value = None  # no duplicate
+
+        c.market_data = MagicMock()
+        c.market_data.fetch.return_value = {"price": 100.5, "degraded": False}
+
+        c.signal_logger = MagicMock()
+        c.signal_logger.get_pending_forward_signals.return_value = []
+
+        c.debate_agent = MagicMock()
+        c.debate_agent.is_enabled.return_value = False
+
+        c.risk_agent = MagicMock()
+        c.risk_agent.run.return_value = {
+            "skipped": False,
+            "direction": "BUY",
+            "shares": 10,
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        }
+
+        c.paper_trader = MagicMock()
+        c.paper_trader.track_trade.return_value = {
+            "trade_id": 999, "price": 100.5,
+        }
+
+        c._portfolio_manager = MagicMock()
+        c._has_alpaca_position = lambda _t: False
+        return c
+
+    def test_pm_gate_blocks_track_trade(self):
+        """can_add_position returning (False, reason) prevents track_trade."""
+        import asyncio
+        c = self._make_coordinator()
+        c._portfolio_manager.can_add_position.return_value = (
+            False, "Max 8 positions reached",
+        )
+
+        result = asyncio.run(c._execute_forward_signals_async(
+            "AAPL",
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+        ))
+
+        c._portfolio_manager.can_add_position.assert_called_once()
+        c.paper_trader.track_trade.assert_not_called()
+        c._portfolio_manager.register_position.assert_not_called()
+        assert result["execution"] is None
+
+    def test_pm_gate_allows_then_registers(self):
+        """When can_add_position allows, track_trade fires and metadata
+        is registered with the resolved strategy name."""
+        import asyncio
+        c = self._make_coordinator()
+        c._portfolio_manager.can_add_position.return_value = (True, "")
+
+        result = asyncio.run(c._execute_forward_signals_async(
+            "AAPL",
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+        ))
+
+        c._portfolio_manager.can_add_position.assert_called_once()
+        # Strategy name should resolve to cached signal_events.strategy
+        args, kwargs = c._portfolio_manager.can_add_position.call_args
+        assert "momentum" in (list(args) + list(kwargs.values()))
+
+        c.paper_trader.track_trade.assert_called_once()
+        c._portfolio_manager.register_position.assert_called_once()
+        reg_kwargs = c._portfolio_manager.register_position.call_args.kwargs
+        assert reg_kwargs["ticker"] == "AAPL"
+        assert reg_kwargs["strategy"] == "momentum"
+        assert result["execution"] is not None
