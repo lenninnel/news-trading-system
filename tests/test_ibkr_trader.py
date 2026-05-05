@@ -178,6 +178,33 @@ class TestIBKRAccount:
         assert result[0]["qty"] == 100
         assert result[0]["avg_entry"] == 150.0
 
+    def test_get_portfolio_writes_entry_value_not_zero(self):
+        """get_portfolio must write current_value = qty × avg_entry to the DB.
+
+        Regression guard for the 2026-05-05 CASY breach: the prior
+        hardcoded current_value=0.0 zeroed the numerator of
+        PortfolioManager.can_add_position's deployment-cap check, silently
+        disabling the 60 % cap. The entry-value approximation is the
+        contract.
+        """
+        trader, mock_ib, mock_db = _make_trader()
+        mock_pos = MagicMock()
+        mock_pos.contract.symbol = "AAPL"
+        mock_pos.contract.secType = "STK"
+        mock_pos.position = 100
+        mock_pos.avgCost = 150.0
+        mock_ib.positions.return_value = [mock_pos]
+
+        result = trader.get_portfolio()
+        assert result[0]["current_value"] == 15000.0  # 100 × 150.0
+
+        mock_db.set_portfolio_position.assert_called_once()
+        kwargs = mock_db.set_portfolio_position.call_args.kwargs
+        assert kwargs["ticker"] == "AAPL"
+        assert kwargs["shares"] == 100
+        assert kwargs["avg_price"] == 150.0
+        assert kwargs["current_value"] == 15000.0  # never 0.0
+
 
 # ── Order placement ──────────────────────────────────────────────────────────
 

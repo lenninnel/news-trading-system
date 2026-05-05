@@ -389,11 +389,20 @@ class IBKRTrader:
         positions = self.get_positions()
         result = []
         for pos in positions:
+            qty = int(pos["qty"])
+            avg = float(pos["avg_entry"])
+            # Entry-value approximation. Live mark-to-market is refreshed by
+            # monitoring.position_manager._mark_to_market every 60s during
+            # market hours; this write is a sane default between cycles.
+            # Why not 0.0: PortfolioManager.can_add_position reads
+            # sum(current_value) for the deployment cap. A zero clobbered
+            # the numerator and silently disabled the 60 % cap (CASY breach
+            # 2026-05-05).
             row = {
                 "ticker": pos["ticker"],
-                "shares": pos["qty"],
-                "avg_price": pos["avg_entry"],
-                "current_value": 0.0,
+                "shares": qty,
+                "avg_price": avg,
+                "current_value": round(qty * avg, 2),
                 "updated_at": None,
             }
             self._db.set_portfolio_position(
