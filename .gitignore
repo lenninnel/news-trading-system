@@ -6,3 +6,13 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Generated backtest artifacts
+backtest/results/*.json
+backtest_results/*.json
+
+# Runtime logs
+logs/*.log
+
+# Stale tooling configs (e.g. Railway URL)
+.mcp.json
