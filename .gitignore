@@ -16,3 +16,23 @@ logs/*.log
 
 # Stale tooling configs (e.g. Railway URL)
 .mcp.json
+# Generated outputs
+backtest/results/*.json
+backtest_results/*.json
+logs/*.log
+*.log
+
+# Local config
+.mcp.json
+
+# Research files (live outside repo)
+nts_research/
+
+# Model artifacts
+*.pkl
+*.parquet
+
+# Coverage and test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
