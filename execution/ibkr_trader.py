@@ -15,11 +15,14 @@ IBKR_PAPER        "true" (default) or "false" for live trading
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import nest_asyncio
 import pandas as pd
@@ -86,6 +89,23 @@ class IBKRTrader:
         self._port = port
         self._client_id = client_id
 
+        # Dedicated event-loop thread for all IBKR I/O. ib_insync's sync
+        # API (placeOrder, qualifyContracts, ib.sleep) calls util.run()
+        # which uses the *calling thread's* asyncio loop. When PositionManager
+        # (a background thread) invoked placeOrder against an IB() built
+        # on the main thread, the call hung forever because that thread's
+        # loop knew nothing about the IB socket reader (verified
+        # 2026-05-11: XOM SELL stalled inside _evaluate_position the
+        # moment a position breached its stop). Pinning all IBKR I/O to
+        # a single always-running loop on a dedicated thread eliminates
+        # the race; cross-thread callers (PM, scheduler) dispatch via
+        # asyncio.run_coroutine_threadsafe through _run_in_ib_loop with
+        # a 60s timeout so a stuck broker call surfaces as a TimeoutError
+        # instead of freezing the monitor.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._loop_thread_ident: int | None = None
+
         if ib is not None:
             self._ib = ib
             # In test mode, Stock/MarketOrder are not needed (tests mock placeOrder)
@@ -99,16 +119,23 @@ class IBKRTrader:
                 "pytest — pass a mock ib= argument instead"
             )
 
-        from ib_insync import IB, MarketOrder, Stock
+        from ib_insync import MarketOrder, Stock
 
         self._Stock = Stock
         self._MarketOrder = MarketOrder
-        self._ib = IB()
-        mode_label = "PAPER" if paper else "LIVE"
-        log.info("Connecting to IB Gateway (%s) at %s:%d ...", mode_label, host, port)
 
+        # Start the dedicated I/O loop thread before constructing IB().
+        self._start_loop_thread()
+
+        mode_label = "PAPER" if paper else "LIVE"
+        # Dispatch timeout = (10s connect × 3) + (5s wait × 2) + slack = ~50s.
         try:
-            self._ib.connect(host, port, clientId=client_id, timeout=10)
+            self._run_in_ib_loop(self._build_and_connect_ib, timeout=60.0)
+        except TimeoutError as exc:
+            raise ConnectionError(
+                f"Cannot connect to IB Gateway at {host}:{port} — "
+                f"timed out after 60s across clientId retries: {exc}"
+            ) from exc
         except Exception as exc:
             raise ConnectionError(
                 f"Cannot connect to IB Gateway at {host}:{port} — "
@@ -118,6 +145,143 @@ class IBKRTrader:
         log.info("Connected to IB Gateway (%s)", mode_label)
 
     # ------------------------------------------------------------------
+    # Event-loop thread (IBKR I/O isolation)
+    # ------------------------------------------------------------------
+
+    def _start_loop_thread(self) -> None:
+        """Spawn a daemon thread that runs an asyncio loop forever.
+
+        The loop owned by this thread is the *only* loop that ever
+        sees the IB() socket. All public methods that touch
+        ``self._ib`` dispatch onto this thread via :meth:`_run_in_ib_loop`.
+        """
+        ready = threading.Event()
+        startup_err: list[BaseException] = []
+
+        def _loop_main() -> None:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self._loop = loop
+                self._loop_thread_ident = threading.get_ident()
+                ready.set()
+                loop.run_forever()
+            except BaseException as exc:  # pragma: no cover — daemon thread
+                startup_err.append(exc)
+                ready.set()
+
+        self._loop_thread = threading.Thread(
+            target=_loop_main,
+            name=f"IBKRTrader-loop-cid{self._client_id}",
+            daemon=True,
+        )
+        self._loop_thread.start()
+        if not ready.wait(timeout=10):
+            raise ConnectionError(
+                "IBKRTrader event-loop thread failed to start within 10s"
+            )
+        if startup_err:
+            raise ConnectionError(
+                f"IBKRTrader loop thread crashed during startup: {startup_err[0]}"
+            )
+
+    def _build_and_connect_ib(self) -> None:
+        """Construct IB() and connect with clientId retry — on the loop thread.
+
+        Mirrors :meth:`reconnect`'s 3-attempt incrementing-clientId pattern.
+        Necessary because IB Gateway holds a clientId briefly after the
+        previous day's session disconnects — the first US_PRE of every
+        morning hits "Peer closed connection" / "Socket disconnect" on
+        clientId=1 (observed 4 days in a row, May 6–11 2026). Retrying
+        on the same id never recovers; bumping to id+1 connects cleanly.
+        """
+        from ib_insync import IB
+        mode_label = "PAPER" if self._paper else "LIVE"
+        base_id = self._client_id
+        MAX_ATTEMPTS = 3
+        last_exc: Exception | None = None
+        for attempt in range(MAX_ATTEMPTS):
+            client_id_try = base_id + attempt
+            self._ib = IB()
+            try:
+                log.info(
+                    "Connecting to IB Gateway (%s) at %s:%d "
+                    "(clientId=%d, attempt %d/%d) ...",
+                    mode_label, self._host, self._port,
+                    client_id_try, attempt + 1, MAX_ATTEMPTS,
+                )
+                self._ib.connect(
+                    self._host, self._port,
+                    clientId=client_id_try, timeout=10,
+                )
+                # Remember the id that worked so disconnect() logs it and
+                # a subsequent reconnect starts from a known-good base.
+                self._client_id = client_id_try
+                return
+            except Exception as exc:
+                last_exc = exc
+                # Best-effort teardown of the failed client before next try.
+                try:
+                    self._ib.disconnect()
+                except Exception:
+                    pass
+                if attempt < MAX_ATTEMPTS - 1:
+                    log.warning(
+                        "Initial connect failed on clientId=%d (%s) — "
+                        "waiting 5s and retrying with clientId=%d",
+                        client_id_try, str(exc)[:120], client_id_try + 1,
+                    )
+                    time.sleep(5)
+        # All attempts exhausted — re-raise the last error so __init__
+        # turns it into the existing ConnectionError contract.
+        raise last_exc if last_exc is not None else ConnectionError(
+            f"IBKR connect failed after {MAX_ATTEMPTS} clientId attempts "
+            f"(base={base_id})"
+        )
+
+    def _run_in_ib_loop(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        timeout: float = 60.0,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute ``func`` on the IB event-loop thread.
+
+        Same-thread callers run ``func`` directly. Cross-thread callers
+        submit a coroutine wrapper via ``asyncio.run_coroutine_threadsafe``
+        and block on the future for up to ``timeout`` seconds. On timeout
+        the future is cancelled and a TimeoutError is raised so the
+        caller can log loudly and alert — the alternative (no timeout)
+        is the indefinite hang that wedged PositionManager for four
+        days in May 2026.
+        """
+        # Test mode: a mock IB was injected, no loop thread exists.
+        if self._loop is None:
+            return func(*args, **kwargs)
+        # Same-thread call: avoid the dispatch overhead.
+        if threading.get_ident() == self._loop_thread_ident:
+            return func(*args, **kwargs)
+
+        async def _wrap() -> Any:
+            return func(*args, **kwargs)
+
+        future = asyncio.run_coroutine_threadsafe(_wrap(), self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            log.error(
+                "IBKR call timed out after %.1fs in cross-thread dispatch "
+                "(func=%s)",
+                timeout, getattr(func, "__name__", repr(func)),
+            )
+            future.cancel()
+            raise TimeoutError(
+                f"IBKR call did not return within {timeout}s "
+                f"(func={getattr(func, '__name__', repr(func))})"
+            ) from exc
+
+    # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
 
@@ -125,9 +289,14 @@ class IBKRTrader:
         """Check if IBKR connection is alive."""
         if self._ib is None:
             return False
+        def _impl() -> bool:
+            try:
+                return self._ib.isConnected()
+            except Exception:
+                return False
         try:
-            return self._ib.isConnected()
-        except Exception:
+            return self._run_in_ib_loop(_impl, timeout=5.0)
+        except TimeoutError:
             return False
 
     def _new_ib_client(self):
@@ -153,70 +322,78 @@ class IBKRTrader:
         Error 326 "client id is already in use". We try up to 3 ids
         (self._client_id, +1, +2) with a 10s wait between 326 failures.
         The successfully-connected id is stored back on ``self._client_id``.
-        """
-        mode_label = "PAPER" if self._paper else "LIVE"
-        # Tear down any existing client so its socket / event loop
-        # state is released before we replace it.
-        try:
-            if self._ib is not None:
-                self._ib.disconnect()
-        except Exception:
-            pass
 
-        base_id = self._client_id
-        MAX_ATTEMPTS = 3
-        for attempt in range(MAX_ATTEMPTS):
-            client_id_try = base_id + attempt
+        Runs on the dedicated IB loop thread so the new IB() instance
+        is bound to the same loop that owns the rest of the I/O.
+        """
+        def _impl() -> bool:
+            mode_label = "PAPER" if self._paper else "LIVE"
+            # Tear down any existing client so its socket / event loop
+            # state is released before we replace it.
             try:
-                self._ib = self._new_ib_client()
-            except Exception as exc:
-                log.error("Could not create fresh IB client: %s", exc)
-                return False
-            try:
-                log.info(
-                    "Reconnecting to IB Gateway (%s) at %s:%d "
-                    "(clientId=%d, attempt %d/%d) ...",
-                    mode_label, self._host, self._port,
-                    client_id_try, attempt + 1, MAX_ATTEMPTS,
-                )
-                self._ib.connect(
-                    self._host, self._port,
-                    clientId=client_id_try, timeout=10,
-                )
-                log.info(
-                    "Reconnected to IB Gateway (%s) using clientId=%d",
-                    mode_label, client_id_try,
-                )
-                # Remember the id that worked so disconnect() logs it and
-                # a subsequent reconnect starts from a known-good base.
-                self._client_id = client_id_try
-                return True
-            except Exception as exc:
-                err_str = str(exc)
-                is_326 = (
-                    "326" in err_str
-                    or "already in use" in err_str.lower()
-                )
-                # Best-effort teardown of the failed client before next try.
-                try:
+                if self._ib is not None:
                     self._ib.disconnect()
-                except Exception:
-                    pass
-                if not is_326:
-                    log.error("IBKR reconnect failed (non-326): %s", exc)
+            except Exception:
+                pass
+
+            base_id = self._client_id
+            MAX_ATTEMPTS = 3
+            for attempt in range(MAX_ATTEMPTS):
+                client_id_try = base_id + attempt
+                try:
+                    self._ib = self._new_ib_client()
+                except Exception as exc:
+                    log.error("Could not create fresh IB client: %s", exc)
                     return False
-                log.warning(
-                    "clientId %d already in use (Error 326) — "
-                    "waiting 10s before retry",
-                    client_id_try,
-                )
-                if attempt < MAX_ATTEMPTS - 1:
-                    time.sleep(10)
-        log.error(
-            "IBKR reconnect failed after %d clientId attempts (base=%d)",
-            MAX_ATTEMPTS, base_id,
-        )
-        return False
+                try:
+                    log.info(
+                        "Reconnecting to IB Gateway (%s) at %s:%d "
+                        "(clientId=%d, attempt %d/%d) ...",
+                        mode_label, self._host, self._port,
+                        client_id_try, attempt + 1, MAX_ATTEMPTS,
+                    )
+                    self._ib.connect(
+                        self._host, self._port,
+                        clientId=client_id_try, timeout=10,
+                    )
+                    log.info(
+                        "Reconnected to IB Gateway (%s) using clientId=%d",
+                        mode_label, client_id_try,
+                    )
+                    self._client_id = client_id_try
+                    return True
+                except Exception as exc:
+                    err_str = str(exc)
+                    is_326 = (
+                        "326" in err_str
+                        or "already in use" in err_str.lower()
+                    )
+                    try:
+                        self._ib.disconnect()
+                    except Exception:
+                        pass
+                    if not is_326:
+                        log.error("IBKR reconnect failed (non-326): %s", exc)
+                        return False
+                    log.warning(
+                        "clientId %d already in use (Error 326) — "
+                        "waiting 10s before retry",
+                        client_id_try,
+                    )
+                    if attempt < MAX_ATTEMPTS - 1:
+                        time.sleep(10)
+            log.error(
+                "IBKR reconnect failed after %d clientId attempts (base=%d)",
+                MAX_ATTEMPTS, base_id,
+            )
+            return False
+
+        # reconnect itself can take up to 3 × (10s connect + 10s wait) = 60s.
+        try:
+            return self._run_in_ib_loop(_impl, timeout=90.0)
+        except TimeoutError as exc:
+            log.error("reconnect() dispatch timed out: %s", exc)
+            return False
 
     def disconnect(self) -> None:
         """Cleanly sever the ib_async connection if one exists.
@@ -234,16 +411,22 @@ class IBKRTrader:
         ``reconnect()`` routinely hits Error 326 "client id already in
         use" on the first attempt.
         """
+        def _impl() -> None:
+            try:
+                if self._ib is not None:
+                    self._ib.disconnect()
+                    log.info(
+                        "IBKR disconnected cleanly (clientId=%d)",
+                        self._client_id,
+                    )
+            except Exception:
+                pass
+            self._ib = None
         try:
-            if self._ib is not None:
-                self._ib.disconnect()
-                log.info(
-                    "IBKR disconnected cleanly (clientId=%d)",
-                    self._client_id,
-                )
-        except Exception:
-            pass
-        self._ib = None
+            self._run_in_ib_loop(_impl, timeout=15.0)
+        except TimeoutError as exc:
+            log.warning("disconnect() dispatch timed out: %s", exc)
+            self._ib = None
         time.sleep(5)
 
     def ensure_connected(self) -> bool:
@@ -295,56 +478,65 @@ class IBKRTrader:
         if shares < 1:
             raise ValueError(f"shares must be >= 1, got {shares}")
 
-        contract = self._Stock(ticker, "SMART", "USD")
-        self._ib.qualifyContracts(contract)
+        # Order timeout = ORDER_FILL_TIMEOUT + a small margin for the
+        # qualifyContracts round-trip and the post-fill DB write.
+        dispatch_timeout = ORDER_FILL_TIMEOUT + 20.0
 
-        order = self._MarketOrder(action, shares)
-        trade = self._ib.placeOrder(contract, order)
-        outcome, detail = self._wait_for_order_terminal(trade)
+        def _impl() -> dict:
+            contract = self._Stock(ticker, "SMART", "USD")
+            self._ib.qualifyContracts(contract)
 
-        if outcome != "filled":
-            self._handle_unfilled(trade, ticker, outcome, detail)
+            order = self._MarketOrder(action, shares)
+            trade = self._ib.placeOrder(contract, order)
+            outcome, detail = self._wait_for_order_terminal(trade)
+
+            if outcome != "filled":
+                self._handle_unfilled(trade, ticker, outcome, detail)
+                return {
+                    "trade_id": None, "ticker": ticker, "action": action,
+                    "shares": shares, "price": price,
+                    "stop_loss": stop_loss, "take_profit": take_profit,
+                    "pnl": 0.0, "total_value": 0.0,
+                    "skipped": True,
+                    "skip_reason": f"IBKR order {outcome}: {detail}",
+                }
+
+            fill_price = trade.orderStatus.avgFillPrice or price
+            pnl = self._sync_position(ticker, action, shares, fill_price)
+
+            trade_id = self._db.log_trade_history(
+                ticker=ticker, action=action, shares=shares, price=fill_price,
+                stop_loss=stop_loss, take_profit=take_profit, pnl=pnl,
+            )
+
+            log.info(
+                "IBKR ORDER FILLED: %s %d shares @ $%.2f (trade_id=%s)",
+                action, shares, fill_price, trade_id,
+            )
+
             return {
-                "trade_id": None, "ticker": ticker, "action": action,
-                "shares": shares, "price": price,
+                "trade_id": trade_id, "ticker": ticker, "action": action,
+                "shares": shares, "price": fill_price,
                 "stop_loss": stop_loss, "take_profit": take_profit,
-                "pnl": 0.0, "total_value": 0.0,
-                "skipped": True,
-                "skip_reason": f"IBKR order {outcome}: {detail}",
+                "pnl": pnl, "total_value": round(shares * fill_price, 2),
             }
 
-        fill_price = trade.orderStatus.avgFillPrice or price
-        pnl = self._sync_position(ticker, action, shares, fill_price)
-
-        trade_id = self._db.log_trade_history(
-            ticker=ticker, action=action, shares=shares, price=fill_price,
-            stop_loss=stop_loss, take_profit=take_profit, pnl=pnl,
-        )
-
-        log.info(
-            "IBKR ORDER FILLED: %s %d shares @ $%.2f (trade_id=%s)",
-            action, shares, fill_price, trade_id,
-        )
-
-        return {
-            "trade_id": trade_id, "ticker": ticker, "action": action,
-            "shares": shares, "price": fill_price,
-            "stop_loss": stop_loss, "take_profit": take_profit,
-            "pnl": pnl, "total_value": round(shares * fill_price, 2),
-        }
+        return self._run_in_ib_loop(_impl, timeout=dispatch_timeout)
 
     def get_account(self) -> dict:
         """Return account summary: cash, portfolio_value, buying_power."""
-        summary = self._ib.accountSummary()
-        values: dict[str, float] = {}
-        for item in summary:
-            if item.tag in ("TotalCashValue", "NetLiquidation", "BuyingPower"):
-                values[item.tag] = float(item.value)
-        return {
-            "cash": values.get("TotalCashValue", 0.0),
-            "portfolio_value": values.get("NetLiquidation", 0.0),
-            "buying_power": values.get("BuyingPower", 0.0),
-        }
+        def _impl() -> dict:
+            summary = self._ib.accountSummary()
+            values: dict[str, float] = {}
+            for item in summary:
+                if item.tag in ("TotalCashValue", "NetLiquidation", "BuyingPower"):
+                    values[item.tag] = float(item.value)
+            return {
+                "cash": values.get("TotalCashValue", 0.0),
+                "portfolio_value": values.get("NetLiquidation", 0.0),
+                "buying_power": values.get("BuyingPower", 0.0),
+            }
+        return self._run_in_ib_loop(_impl, timeout=15.0)
 
     def get_positions(self) -> list[dict]:
         """Return open *equity* positions from IBKR.
@@ -358,31 +550,33 @@ class IBKRTrader:
         FX balance hits yfinance's delisted "EUR" ETF and spams skip
         warnings every 60s. Only secType="STK" enters the local table.
         """
-        positions = self._ib.positions()
-        result = []
-        for pos in positions:
-            sec_type = getattr(pos.contract, "secType", "STK")
-            if sec_type != "STK":
-                log.debug(
-                    "Skipping non-stock position: %s (secType=%s)",
-                    pos.contract.symbol, sec_type,
-                )
-                continue
-            ticker = pos.contract.symbol
-            qty = int(pos.position)
-            # IBKR Position.avgCost is already average cost per share for STK
-            # (verified empirically 2026-05-04: dividing by qty produced
-            # fill_price/qty noise — e.g. TRGP $254.49 fill recorded as $4.46).
-            avg_entry = float(pos.avgCost) if qty != 0 else 0.0
-            result.append({
-                "ticker": ticker,
-                "qty": qty,
-                "avg_entry": avg_entry,
-                "current_price": 0.0,    # requires market data subscription
-                "unrealized_pl": 0.0,
-                "unrealized_plpc": 0.0,
-            })
-        return result
+        def _impl() -> list[dict]:
+            positions = self._ib.positions()
+            result = []
+            for pos in positions:
+                sec_type = getattr(pos.contract, "secType", "STK")
+                if sec_type != "STK":
+                    log.debug(
+                        "Skipping non-stock position: %s (secType=%s)",
+                        pos.contract.symbol, sec_type,
+                    )
+                    continue
+                ticker = pos.contract.symbol
+                qty = int(pos.position)
+                # IBKR Position.avgCost is already average cost per share for STK
+                # (verified empirically 2026-05-04: dividing by qty produced
+                # fill_price/qty noise — e.g. TRGP $254.49 fill recorded as $4.46).
+                avg_entry = float(pos.avgCost) if qty != 0 else 0.0
+                result.append({
+                    "ticker": ticker,
+                    "qty": qty,
+                    "avg_entry": avg_entry,
+                    "current_price": 0.0,    # requires market data subscription
+                    "unrealized_pl": 0.0,
+                    "unrealized_plpc": 0.0,
+                })
+            return result
+        return self._run_in_ib_loop(_impl, timeout=15.0)
 
     def get_portfolio(self) -> list[dict]:
         """Return positions in the format expected by the coordinator."""
@@ -414,41 +608,45 @@ class IBKRTrader:
 
     def get_orders(self) -> list[dict]:
         """Return open orders."""
-        orders = self._ib.openOrders()
-        return [
-            {
-                "order_id": o.orderId,
-                "ticker": o.contract.symbol if hasattr(o, "contract") else "?",
-                "action": o.action,
-                "qty": int(o.totalQuantity),
-                "status": o.orderStatus.status if hasattr(o, "orderStatus") else "unknown",
-            }
-            for o in orders
-        ]
+        def _impl() -> list[dict]:
+            orders = self._ib.openOrders()
+            return [
+                {
+                    "order_id": o.orderId,
+                    "ticker": o.contract.symbol if hasattr(o, "contract") else "?",
+                    "action": o.action,
+                    "qty": int(o.totalQuantity),
+                    "status": o.orderStatus.status if hasattr(o, "orderStatus") else "unknown",
+                }
+                for o in orders
+            ]
+        return self._run_in_ib_loop(_impl, timeout=15.0)
 
     def close_position(self, ticker: str) -> bool:
         """Close an open position by submitting a market order for the opposite side."""
-        positions = self._ib.positions()
-        for pos in positions:
-            if pos.contract.symbol.upper() == ticker.upper():
-                qty = int(pos.position)
-                if qty == 0:
+        def _impl() -> bool:
+            positions = self._ib.positions()
+            for pos in positions:
+                if pos.contract.symbol.upper() == ticker.upper():
+                    qty = int(pos.position)
+                    if qty == 0:
+                        return False
+                    side = "SELL" if qty > 0 else "BUY"
+                    contract = self._Stock(ticker.upper(), "SMART", "USD")
+                    self._ib.qualifyContracts(contract)
+                    order = self._MarketOrder(side, abs(qty))
+                    trade = self._ib.placeOrder(contract, order)
+                    outcome, detail = self._wait_for_order_terminal(trade)
+                    if outcome == "filled":
+                        log.info(
+                            "IBKR ORDER FILLED: %s %d shares of %s",
+                            side, abs(qty), ticker,
+                        )
+                        return True
+                    self._handle_unfilled(trade, ticker, outcome, detail)
                     return False
-                side = "SELL" if qty > 0 else "BUY"
-                contract = self._Stock(ticker.upper(), "SMART", "USD")
-                self._ib.qualifyContracts(contract)
-                order = self._MarketOrder(side, abs(qty))
-                trade = self._ib.placeOrder(contract, order)
-                outcome, detail = self._wait_for_order_terminal(trade)
-                if outcome == "filled":
-                    log.info(
-                        "IBKR ORDER FILLED: %s %d shares of %s",
-                        side, abs(qty), ticker,
-                    )
-                    return True
-                self._handle_unfilled(trade, ticker, outcome, detail)
-                return False
-        return False
+            return False
+        return self._run_in_ib_loop(_impl, timeout=ORDER_FILL_TIMEOUT + 20.0)
 
     def place_order(
         self,
@@ -466,38 +664,42 @@ class IBKRTrader:
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got '{side}'")
-
-        contract = self._Stock(ticker.upper(), "SMART", "USD")
-        self._ib.qualifyContracts(contract)
-
-        if order_type == "market":
-            order = self._MarketOrder(side, qty)
-        else:
+        if order_type != "market":
             raise ValueError(f"Unsupported order_type: {order_type}")
 
-        trade = self._ib.placeOrder(contract, order)
-        outcome, detail = self._wait_for_order_terminal(trade)
-        if outcome == "filled":
-            log.info(
-                "IBKR ORDER FILLED: %s %d shares of %s",
-                side, qty, ticker,
-            )
-            return {"order_id": trade.order.orderId, "status": "Filled"}
-        self._handle_unfilled(trade, ticker, outcome, detail)
-        return {
-            "order_id": trade.order.orderId,
-            "status": "Cancelled" if outcome == "cancelled" else "Timeout",
-            "reason": detail,
-        }
+        def _impl() -> dict:
+            contract = self._Stock(ticker.upper(), "SMART", "USD")
+            self._ib.qualifyContracts(contract)
+            order = self._MarketOrder(side, qty)
+            trade = self._ib.placeOrder(contract, order)
+            outcome, detail = self._wait_for_order_terminal(trade)
+            if outcome == "filled":
+                log.info(
+                    "IBKR ORDER FILLED: %s %d shares of %s",
+                    side, qty, ticker,
+                )
+                return {"order_id": trade.order.orderId, "status": "Filled"}
+            self._handle_unfilled(trade, ticker, outcome, detail)
+            return {
+                "order_id": trade.order.orderId,
+                "status": "Cancelled" if outcome == "cancelled" else "Timeout",
+                "reason": detail,
+            }
+        return self._run_in_ib_loop(_impl, timeout=ORDER_FILL_TIMEOUT + 20.0)
 
     def is_market_open(self) -> bool:
         """Check if US market is currently open."""
         # ib_insync doesn't have a simple market-hours query;
         # use reqMarketDataType as a proxy — if we can get live data, market is open.
+        def _impl() -> bool:
+            try:
+                self._ib.reqMarketDataType(1)  # live data
+                return True
+            except Exception:
+                return False
         try:
-            self._ib.reqMarketDataType(1)  # live data
-            return True
-        except Exception:
+            return self._run_in_ib_loop(_impl, timeout=10.0)
+        except TimeoutError:
             return False
 
     # ------------------------------------------------------------------
@@ -542,41 +744,38 @@ class IBKRTrader:
         elif symbol.endswith(".DE"):
             symbol = symbol.rsplit(".", 1)[0]
 
-        contract = self._Stock(symbol, "SMART", "USD")
-        self._ib.qualifyContracts(contract)
+        def _impl() -> pd.DataFrame:
+            contract = self._Stock(symbol, "SMART", "USD")
+            self._ib.qualifyContracts(contract)
+            bars = self._ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            if not bars:
+                raise ValueError(f"IBKR returned no bars for {ticker} ({timeframe})")
+            rows = [
+                {
+                    "date": b.date,
+                    "Open": b.open,
+                    "High": b.high,
+                    "Low": b.low,
+                    "Close": b.close,
+                    "Volume": int(b.volume),
+                }
+                for b in bars
+            ]
+            df_ = pd.DataFrame(rows).set_index("date")
+            if len(df_) > limit:
+                df_ = df_.iloc[-limit:]
+            log.debug("IBKR bars: %s → %d bars (%s)", ticker, len(df_), timeframe)
+            return df_
 
-        bars = self._ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
-
-        if not bars:
-            raise ValueError(f"IBKR returned no bars for {ticker} ({timeframe})")
-
-        rows = [
-            {
-                "date": b.date,
-                "Open": b.open,
-                "High": b.high,
-                "Low": b.low,
-                "Close": b.close,
-                "Volume": int(b.volume),
-            }
-            for b in bars
-        ]
-        df = pd.DataFrame(rows).set_index("date")
-
-        # Trim to requested limit (keep most recent)
-        if len(df) > limit:
-            df = df.iloc[-limit:]
-
-        log.debug("IBKR bars: %s → %d bars (%s)", ticker, len(df), timeframe)
-        return df
+        return self._run_in_ib_loop(_impl, timeout=30.0)
 
     def get_trade_history(
         self,

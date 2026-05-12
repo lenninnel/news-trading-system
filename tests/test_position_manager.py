@@ -23,6 +23,25 @@ from monitoring.position_manager import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_portfolio_positions():
+    """Wipe portfolio_positions rows before each test.
+
+    The pre-existing PM tests construct PM without passing db=, which
+    causes PM to instantiate a real Database() against the shared
+    /tmp/pytest_trading.db. _check_all_positions then writes test
+    tickers (AAPL, NVDA, …) into portfolio_positions via _mark_to_market,
+    plus (since 2026-05-12) trailing_stop values. Those persist across
+    tests and contaminate the rehydration path. Clearing the table
+    before each test isolates state without touching the existing tests.
+    """
+    from storage.database import Database
+    db = Database()
+    with db._connect() as conn:
+        conn.execute("DELETE FROM portfolio_positions")
+    yield
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 def _make_trader(portfolio=None, trade_history=None):
@@ -231,6 +250,83 @@ class TestTrailingStop:
         assert results[0]["action"] == "stop_loss"
         # Trailing stop should be cleaned up
         assert "AAPL" not in pm._trailing_stops
+
+
+# ── test: trailing-stop persistence (DB rehydration) ─────────────────
+
+class TestTrailingStopPersistence:
+    def test_rehydrates_from_db_on_init(self):
+        """PM should preload _trailing_stops from db.get_trailing_stops()."""
+        trader = _make_trader()
+        db = MagicMock()
+        db.get_trailing_stops.return_value = {"AAPL": 210.50, "MSFT": 405.25}
+
+        pm = PositionManager(trader=trader, db=db)
+
+        db.get_trailing_stops.assert_called_once()
+        assert pm._trailing_stops == {"AAPL": 210.50, "MSFT": 405.25}
+
+    def test_empty_db_yields_empty_dict(self):
+        """No persisted trailing stops → in-memory dict stays empty."""
+        trader = _make_trader()
+        db = MagicMock()
+        db.get_trailing_stops.return_value = {}
+
+        pm = PositionManager(trader=trader, db=db)
+
+        assert pm._trailing_stops == {}
+
+    def test_rehydrate_db_error_is_non_fatal(self):
+        """A DB failure during rehydrate must not crash PM construction."""
+        trader = _make_trader()
+        db = MagicMock()
+        db.get_trailing_stops.side_effect = RuntimeError("disk I/O error")
+
+        # Should not raise
+        pm = PositionManager(trader=trader, db=db)
+        assert pm._trailing_stops == {}
+
+    def test_trailing_update_persists_to_db(self):
+        """When trailing stop activates, set_trailing_stop must be called."""
+        portfolio, history = _make_position(
+            ticker="AAPL", shares=10, avg_price=200.0,
+            stop_loss=190.0, take_profit=250.0,
+        )
+        trader = _make_trader(portfolio=portfolio, trade_history=history)
+        db = MagicMock()
+        db.get_trailing_stops.return_value = {}
+
+        pm = PositionManager(trader=trader, db=db)
+        with patch.object(pm, "_fetch_current_price", return_value=210.0):
+            pm._check_all_positions()
+
+        # AAPL is +5% from $200 → trail activated; DB write must occur.
+        assert "AAPL" in pm._trailing_stops
+        db.set_trailing_stop.assert_called_once()
+        ticker_arg, stop_arg = db.set_trailing_stop.call_args[0]
+        assert ticker_arg == "AAPL"
+        assert stop_arg == pytest.approx(pm._trailing_stops["AAPL"])
+
+    def test_stop_loss_close_clears_persisted_trailing(self):
+        """On SL fire, the DB column must be NULLed (set_trailing_stop(None))."""
+        portfolio, history = _make_position(
+            ticker="AAPL", shares=10, avg_price=200.0,
+            stop_loss=195.0, take_profit=220.0,
+        )
+        trader = _make_trader(portfolio=portfolio, trade_history=history)
+        db = MagicMock()
+        db.get_trailing_stops.return_value = {}
+
+        pm = PositionManager(trader=trader, db=db)
+        with patch.object(pm, "_fetch_current_price", return_value=190.0):
+            pm._check_all_positions()
+
+        # Verify clear was called with None for AAPL
+        clear_calls = [
+            c for c in db.set_trailing_stop.call_args_list
+            if c.args[0] == "AAPL" and c.args[1] is None
+        ]
+        assert clear_calls, "expected set_trailing_stop('AAPL', None) on SL"
 
 
 # ── test: outside market hours ───────────────────────────────────────

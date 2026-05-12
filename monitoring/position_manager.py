@@ -68,7 +68,10 @@ class PositionManager:
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
 
-        # Trailing stops: ticker → current trailing stop price
+        # Trailing stops: ticker → current trailing stop price.
+        # Primary working state is this in-memory dict; the DB
+        # (portfolio_positions.trailing_stop column) is the persistence
+        # layer used to survive daemon restarts. Rehydrated below.
         self._trailing_stops: dict[str, float] = {}
 
         # Signal logger for audit trail
@@ -80,6 +83,33 @@ class PositionManager:
         # (IBKRTrader.get_portfolio() writes 0 to current_value because IB
         # paper feeds don't include market prices).
         self._db = db
+
+        # Rehydrate trailing stops from DB. Before 2026-05-12 the dict
+        # was wiped on every restart, so any locked-in gain disappeared
+        # until the next 60s cycle re-established the trail at the new
+        # (lower) price. Best-effort — a DB error here is non-fatal;
+        # the monitor simply re-trails on the next cycle.
+        try:
+            db_for_read = self._db
+            if db_for_read is None:
+                from storage.database import Database
+                db_for_read = Database()
+                self._db = db_for_read
+            persisted = db_for_read.get_trailing_stops()
+            if persisted:
+                self._trailing_stops.update(persisted)
+                log.info(
+                    "PositionManager rehydrated %d trailing stop(s): %s",
+                    len(persisted),
+                    {t: f"${p:.2f}" for t, p in persisted.items()},
+                )
+            else:
+                log.info("PositionManager rehydrate: no persisted trailing stops")
+        except Exception as exc:
+            log.warning(
+                "PositionManager trailing-stop rehydrate failed (non-fatal): %s",
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Thread lifecycle
@@ -176,17 +206,25 @@ class PositionManager:
 
     def _check_all_positions(self) -> list[dict]:
         """Iterate open positions and apply stop/profit/trailing logic."""
+        log.info("PM heartbeat: _check_all_positions ENTRY")
         positions = self._get_open_positions()
+        tickers = [p["ticker"] for p in positions]
+        log.info("PM heartbeat: cycle running, %d positions to evaluate: %s",
+                 len(positions), tickers)
         if not positions:
+            log.info("PM heartbeat: _check_all_positions EXIT (no positions)")
             return []
 
         results: list[dict] = []
         for pos in positions:
             ticker = pos["ticker"]
+            log.info("PM heartbeat: [%s] fetching price (sl=%s tp=%s)",
+                     ticker, pos.get("stop_loss"), pos.get("take_profit"))
             current_price = self._fetch_current_price(ticker)
             if current_price is None:
                 log.warning("No price for %s — skipping", ticker)
                 continue
+            log.info("PM heartbeat: [%s] price fetched = $%.2f", ticker, current_price)
 
             # Mark-to-market: persist live current_value so the EOD P&L
             # summary and dashboard see real numbers. Best-effort — never
@@ -194,10 +232,15 @@ class PositionManager:
             self._mark_to_market(ticker, pos.get("shares", 0),
                                  pos.get("avg_price", 0), current_price)
 
+            log.info("PM heartbeat: [%s] evaluating px=$%.2f sl=%s tp=%s",
+                     ticker, current_price, pos.get("stop_loss"),
+                     pos.get("take_profit"))
             result = self._evaluate_position(pos, current_price)
+            log.info("PM heartbeat: [%s] eval result=%s", ticker, result)
             if result:
                 results.append(result)
 
+        log.info("PM heartbeat: _check_all_positions EXIT (results=%d)", len(results))
         return results
 
     def _mark_to_market(
@@ -230,6 +273,37 @@ class PositionManager:
         except Exception as exc:
             log.warning(
                 "Mark-to-market write failed for %s (non-fatal): %s",
+                ticker, exc,
+            )
+
+    def _persist_trailing_stop(self, ticker: str, stop_price: float) -> None:
+        """Best-effort DB write for the trailing-stop value.
+
+        Errors are logged as warnings — the in-memory dict is authoritative
+        for the current process; the DB is only consulted at startup
+        rehydration. A failed write means a restart in the next few
+        seconds would lose this update; we accept that risk rather than
+        block the monitor on a transient SQLite error.
+        """
+        if self._db is None:
+            return
+        try:
+            self._db.set_trailing_stop(ticker, stop_price)
+        except Exception as exc:
+            log.warning(
+                "Trailing-stop persist failed for %s (non-fatal): %s",
+                ticker, exc,
+            )
+
+    def _clear_persisted_trailing_stop(self, ticker: str) -> None:
+        """Null out the trailing_stop column for *ticker*. Never raises."""
+        if self._db is None:
+            return
+        try:
+            self._db.set_trailing_stop(ticker, None)
+        except Exception as exc:
+            log.warning(
+                "Trailing-stop clear failed for %s (non-fatal): %s",
                 ticker, exc,
             )
 
@@ -270,10 +344,15 @@ class PositionManager:
         Returns list of dicts with: ticker, shares, avg_price, stop_loss,
         take_profit.
         """
-        if not self._ensure_trader_connected():
+        connected = self._ensure_trader_connected()
+        log.info("PM heartbeat: ensure_connected=%s, is_connected=%s",
+                 connected, getattr(self._trader, "is_connected", lambda: "n/a")())
+        if not connected:
             return []
         try:
             portfolio = self._trader.get_portfolio()
+            log.info("PM heartbeat: trader.get_portfolio() returned %d items",
+                     len(portfolio) if portfolio else 0)
         except TimeoutError as exc:
             log.warning(
                 "Portfolio fetch timed out (non-fatal): %s", exc,
@@ -341,8 +420,13 @@ class PositionManager:
             self._send_alert(msg)
             self._log_event(ticker, "SELL", current_price,
                             f"stop_loss_triggered at ${effective_stop:.2f}")
-            # Clean up trailing stop
+            # Clean up trailing stop (memory + DB). The DB clear is a
+            # belt-and-braces — _close_position → _sync_position deletes
+            # the whole row on a full close, but if the SELL fails we
+            # still want the stale trailing_stop wiped so the next cycle
+            # re-trails from current price.
             self._trailing_stops.pop(ticker, None)
+            self._clear_persisted_trailing_stop(ticker)
             return {"ticker": ticker, "action": "stop_loss", "price": current_price,
                     "pnl_pct": pnl_pct}
 
@@ -355,6 +439,7 @@ class PositionManager:
             self._log_event(ticker, "SELL", current_price,
                             f"take_profit_triggered at ${take_profit:.2f}")
             self._trailing_stops.pop(ticker, None)
+            self._clear_persisted_trailing_stop(ticker)
             return {"ticker": ticker, "action": "take_profit", "price": current_price,
                     "pnl_pct": pnl_pct}
 
@@ -371,6 +456,7 @@ class PositionManager:
                 current_trailing = self._trailing_stops.get(ticker)
                 if current_trailing is None or new_stop > current_trailing:
                     self._trailing_stops[ticker] = new_stop
+                    self._persist_trailing_stop(ticker, new_stop)
                     log.info("Trailing stop updated: %s → $%.2f", ticker, new_stop)
                     self._log_event(ticker, "HOLD", current_price,
                                     f"trailing_stop_updated to ${new_stop:.2f}")

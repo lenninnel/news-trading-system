@@ -575,6 +575,19 @@ class Database:
                 except sqlite3.OperationalError:
                     pass  # column already exists
 
+            # Migrate existing DBs: persist trailing-stop state so the
+            # PositionManager._trailing_stops dict survives daemon restarts.
+            # Before this column existed (≤ 2026-05-11), any trailing
+            # progress was lost on restart and the trail had to re-establish
+            # from scratch on the next 60s cycle.
+            try:
+                conn.execute(
+                    "ALTER TABLE portfolio_positions "
+                    "ADD COLUMN trailing_stop REAL"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -941,6 +954,41 @@ class Database:
                 """,
                 (ticker, shares, avg_price, current_value, now),
             )
+
+    @_retry_on_locked
+    def set_trailing_stop(self, ticker: str, trailing_stop: "float | None") -> None:
+        """Persist or clear the trailing-stop for *ticker*.
+
+        Writes only the trailing_stop column, leaving shares/avg_price/
+        current_value untouched. Pass ``None`` to clear (NULL out) the
+        value when a trail is deactivated or the position is being closed.
+
+        Silently no-ops if the position row doesn't exist — the caller
+        (PositionManager) only ever sets a trail for tickers that came
+        from get_portfolio(), so a missing row means the position was
+        already closed by a concurrent write and the in-memory dict has
+        a stale entry. Returning silently is safer than raising.
+        """
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE portfolio_positions SET trailing_stop = ? "
+                "WHERE ticker = ?",
+                (trailing_stop, ticker),
+            )
+
+    def get_trailing_stops(self) -> dict:
+        """Return ``{ticker: trailing_stop}`` for every position that has one.
+
+        Used by PositionManager at startup to rehydrate its in-memory
+        ``_trailing_stops`` dict so trailing progress survives daemon
+        restarts. Positions with NULL trailing_stop are excluded.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ticker, trailing_stop FROM portfolio_positions "
+                "WHERE trailing_stop IS NOT NULL"
+            ).fetchall()
+            return {row["ticker"]: float(row["trailing_stop"]) for row in rows}
 
     @_retry_on_locked
     def delete_portfolio_position(self, ticker: str) -> None:
