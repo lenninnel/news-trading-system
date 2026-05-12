@@ -418,6 +418,158 @@ def get_strategy_performance() -> list[dict]:
     return rows
 
 
+# Caps mirrored from execution/portfolio_manager.py — duplicated here to keep
+# the read-only API free of trading-code imports.
+_MAX_POSITIONS    = 8
+_MAX_PER_STRATEGY = 4
+_MAX_PER_SECTOR   = 4
+_MAX_DEPLOYED_PCT = 0.60
+_MAX_SECTOR_PCT   = 0.40
+
+
+@app.get("/api/state")
+def state() -> dict:
+    """Consolidated current-state view for dashboard monitoring.
+
+    Joins live positions with metadata (strategy/sector) and the most-recent
+    BUY row (for SL/TP), aggregates by sector and strategy, and reports
+    deployment vs MAX_DEPLOYED_PCT.
+    """
+    account_row = _query_one(
+        "SELECT account_balance FROM risk_calculations ORDER BY id DESC LIMIT 1"
+    )
+    account_balance = (account_row or {}).get("account_balance") or 10_000.0
+
+    rows = _query(
+        """
+        SELECT
+            pp.ticker, pp.shares, pp.avg_price, pp.current_value, pp.updated_at,
+            pm.strategy, pm.sector, pm.entry_date,
+            (SELECT th.stop_loss   FROM trade_history th
+              WHERE th.ticker = pp.ticker AND th.action = 'BUY'
+              ORDER BY th.id DESC LIMIT 1) AS stop_loss,
+            (SELECT th.take_profit FROM trade_history th
+              WHERE th.ticker = pp.ticker AND th.action = 'BUY'
+              ORDER BY th.id DESC LIMIT 1) AS take_profit
+        FROM portfolio_positions pp
+        LEFT JOIN position_metadata pm ON pm.ticker = pp.ticker
+        WHERE pp.shares > 0
+        ORDER BY pp.ticker
+        """
+    )
+
+    positions = []
+    for r in rows:
+        shares        = r.get("shares") or 0
+        avg_price     = r.get("avg_price") or 0.0
+        current_value = r.get("current_value") or 0.0
+        # Fall back to entry when DB has no quote update yet (current_value=0).
+        current_price = (current_value / shares) if (shares and current_value) else avg_price
+        cost          = avg_price * shares
+        market_value  = current_price * shares
+        pnl           = market_value - cost
+        pnl_pct       = (pnl / cost * 100) if cost else 0.0
+        sl            = r.get("stop_loss")
+        tp            = r.get("take_profit")
+        sl_dist_pct   = ((current_price - sl) / current_price * 100) if (sl and current_price) else None
+        tp_dist_pct   = ((tp - current_price) / current_price * 100) if (tp and current_price) else None
+        positions.append({
+            "ticker":           r.get("ticker"),
+            "shares":           shares,
+            "entry":            round(avg_price, 2),
+            "current":          round(current_price, 2),
+            "market_value":     round(market_value, 2),
+            "pnl":              round(pnl, 2),
+            "pnl_pct":          round(pnl_pct, 2),
+            "strategy":         r.get("strategy"),
+            "sector":           r.get("sector"),
+            "entry_date":       r.get("entry_date"),
+            "stop_loss":        sl,
+            "take_profit":      tp,
+            "sl_distance_pct":  round(sl_dist_pct, 2) if sl_dist_pct is not None else None,
+            "tp_distance_pct":  round(tp_dist_pct, 2) if tp_dist_pct is not None else None,
+            "updated_at":       r.get("updated_at"),
+        })
+
+    sectors_agg: dict[str, dict] = {}
+    for p in positions:
+        sec = p.get("sector") or "Other"
+        bucket = sectors_agg.setdefault(sec, {"count": 0, "value": 0.0})
+        bucket["count"] += 1
+        bucket["value"] += p["market_value"]
+    sectors = [
+        {
+            "sector":    k,
+            "count":     v["count"],
+            "value":     round(v["value"], 2),
+            "pct":       round((v["value"] / account_balance * 100) if account_balance else 0, 2),
+            "max_count": _MAX_PER_SECTOR,
+            "max_pct":   round(_MAX_SECTOR_PCT * 100, 2),
+        }
+        for k, v in sorted(sectors_agg.items())
+    ]
+
+    strats_agg: dict[str, int] = {}
+    for p in positions:
+        s = p.get("strategy") or "Unknown"
+        strats_agg[s] = strats_agg.get(s, 0) + 1
+    strategies = [
+        {"strategy": k, "count": v, "max_count": _MAX_PER_STRATEGY}
+        for k, v in sorted(strats_agg.items())
+    ]
+
+    deployed_value = sum(p["market_value"] for p in positions)
+    deployment_pct = (deployed_value / account_balance * 100) if account_balance else 0.0
+
+    # Drawdown halt feature (commit 55d0086) tracks the all-time peak in
+    # portfolio_peak (single-row halt state) and logs transitions to
+    # drawdown_events. The old placeholder table `drawdown_state` was
+    # never created, so this used to always return null. Use the live
+    # account_balance (latest risk_calculations row, fed from IBKR
+    # NetLiquidation) as the "current" so drawdown_pct stays fresh between
+    # halt events. Keep the legacy keys (peak/current/drawdown_pct/
+    # halt_triggered) plus halt-context fields for the dashboard tile.
+    drawdown: dict | None = None
+    peak_row = _query_one("SELECT * FROM portfolio_peak WHERE id = 1")
+    if peak_row:
+        peak_val = peak_row.get("peak_value") or 0.0
+        current = account_balance if peak_val > 0 else None
+        dd_pct = (
+            (peak_val - current) / peak_val
+            if peak_val > 0 and current is not None
+            else None
+        )
+        drawdown = {
+            "peak":             peak_val,
+            "peak_observed_at": peak_row.get("peak_observed_at"),
+            "current":          current,
+            "drawdown_pct":     dd_pct,
+            "halt_triggered":   bool(peak_row.get("halted") or 0),
+            "halted_at":        peak_row.get("halted_at"),
+            "halted_value":     peak_row.get("halted_value"),
+            "halt_reason":      peak_row.get("halt_reason"),
+        }
+
+    updated_row = _query_one("SELECT MAX(updated_at) AS u FROM portfolio_positions")
+    updated_at = (updated_row or {}).get("u")
+
+    return {
+        "account_balance": round(account_balance, 2),
+        "deployment": {
+            "value":   round(deployed_value, 2),
+            "pct":     round(deployment_pct, 2),
+            "max_pct": round(_MAX_DEPLOYED_PCT * 100, 2),
+        },
+        "position_count": len(positions),
+        "max_positions":  _MAX_POSITIONS,
+        "sectors":        sectors,
+        "strategies":     strategies,
+        "positions":      positions,
+        "drawdown":       drawdown,
+        "updated_at":     updated_at,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Streamlit reverse proxy (catch-all — must be last route)
 # ---------------------------------------------------------------------------
