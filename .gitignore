@@ -10,20 +10,17 @@ venv/
 # Generated backtest artifacts
 backtest/results/*.json
 backtest_results/*.json
+backtest/*.html
 
 # Runtime logs
 logs/*.log
-
-# Stale tooling configs (e.g. Railway URL)
-.mcp.json
-# Generated outputs
-backtest/results/*.json
-backtest_results/*.json
-logs/*.log
 *.log
 
-# Local config
+# Stale tooling configs
 .mcp.json
+
+# Claude Code cache
+.claude/
 
 # Research files (live outside repo)
 nts_research/
