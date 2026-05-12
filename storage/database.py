@@ -427,6 +427,35 @@ class Database:
                     violation_type   TEXT    NOT NULL,
                     ticker           TEXT,
                     details          TEXT,
+                    strategy         TEXT,
+                    amount_usd       REAL,
+                    reason           TEXT,
+                    created_at       TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portfolio_peak (
+                    id                   INTEGER PRIMARY KEY,
+                    peak_value           REAL    NOT NULL,
+                    peak_observed_at     TEXT    NOT NULL,
+                    halted               INTEGER NOT NULL DEFAULT 0,
+                    halted_at            TEXT,
+                    halted_value         REAL,
+                    halted_drawdown_pct  REAL,
+                    halt_reason          TEXT,
+                    unlocked_at          TEXT,
+                    unlocked_by          TEXT,
+                    unlock_reason        TEXT,
+                    updated_at           TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS drawdown_events (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type       TEXT    NOT NULL,
+                    peak_value       REAL,
+                    current_value    REAL,
+                    drawdown_pct     REAL,
+                    actor            TEXT,
+                    reason           TEXT,
                     created_at       TEXT    NOT NULL
                 );
 
@@ -526,6 +555,22 @@ class Database:
                 try:
                     conn.execute(
                         f"ALTER TABLE risk_calculations ADD COLUMN {col} {typedef}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
+            # Migrate existing DBs: add violation detail columns. Before
+            # 2026-05-12 only (violation_type, ticker, details) existed and
+            # PortfolioManager._log_violation crashed because the method
+            # was never implemented — every cap-blocked signal was lost.
+            for col, typedef in [
+                ("strategy",   "TEXT"),
+                ("amount_usd", "REAL"),
+                ("reason",     "TEXT"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE portfolio_violations ADD COLUMN {col} {typedef}"
                     )
                 except sqlite3.OperationalError:
                     pass  # column already exists
@@ -1230,6 +1275,314 @@ class Database:
                 (action, reason, activated_by, now),
             )
             return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # Portfolio violations (cap-block audit trail) and drawdown halt
+    # ------------------------------------------------------------------
+
+    @_retry_on_locked
+    def log_portfolio_violation(
+        self,
+        ticker: str,
+        violation_type: str,
+        reason: str,
+        strategy: "str | None" = None,
+        amount_usd: "float | None" = None,
+        details: "dict | None" = None,
+    ) -> int:
+        """Persist a PortfolioManager cap-block / gate event.
+
+        The table schema existed since 2026-04 but no insert method was wired
+        up; every PortfolioManager._log_violation call crashed silently with
+        "'Database' object has no attribute 'log_portfolio_violation'" and
+        dropped the record. This restores the audit trail used by
+        _count_violations_today and the cap-block dashboards.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        details_json = json.dumps(details) if details else None
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO portfolio_violations
+                    (violation_type, ticker, details, strategy,
+                     amount_usd, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (violation_type, ticker, details_json, strategy,
+                 amount_usd, reason, now),
+            )
+            return cur.lastrowid
+
+    # ── Drawdown halt state ──────────────────────────────────────────
+
+    def get_drawdown_state(self) -> dict:
+        """Return the current peak/halt state.
+
+        Returns dict with keys: peak_value, peak_observed_at, halted (bool),
+        halted_at, halted_value, halted_drawdown_pct, halt_reason,
+        unlocked_at, unlocked_by, unlock_reason, updated_at. All fields
+        are None / 0 when no row exists yet (peak not initialized).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM portfolio_peak WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return {
+                    "peak_value":          None,
+                    "peak_observed_at":    None,
+                    "halted":              False,
+                    "halted_at":           None,
+                    "halted_value":        None,
+                    "halted_drawdown_pct": None,
+                    "halt_reason":         None,
+                    "unlocked_at":         None,
+                    "unlocked_by":         None,
+                    "unlock_reason":       None,
+                    "updated_at":          None,
+                }
+            d = dict(row)
+            d["halted"] = bool(d.get("halted") or 0)
+            return d
+
+    @_retry_on_locked
+    def update_portfolio_peak(
+        self,
+        current_value: float,
+        threshold: float,
+    ) -> dict:
+        """Ratchet the peak NetLiq up and trigger halt on threshold breach.
+
+        Semantics:
+          • Peak only goes UP — never reset by a lower current_value.
+          • If a peak already exists and current_value / peak indicates a
+            drawdown > threshold, set halted=1 (one-shot — does not flip
+            back on recovery; manual unlock only).
+          • Returns a dict describing the new state plus a `newly_halted`
+            bool so the caller can fire a one-time alert.
+
+        Args:
+            current_value: Live NetLiquidation in USD.
+            threshold:     Drawdown fraction that triggers halt (e.g. 0.10).
+        """
+        if current_value is None or current_value <= 0:
+            state = self.get_drawdown_state()
+            state["newly_halted"] = False
+            state["drawdown_pct"] = 0.0
+            return state
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM portfolio_peak WHERE id = 1"
+            ).fetchone()
+
+            if row is None:
+                # First call ever — seed the peak at current value.
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_peak
+                        (id, peak_value, peak_observed_at, halted, updated_at)
+                    VALUES (1, ?, ?, 0, ?)
+                    """,
+                    (current_value, now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO drawdown_events
+                        (event_type, peak_value, current_value,
+                         drawdown_pct, actor, reason, created_at)
+                    VALUES ('peak_init', ?, ?, 0.0, 'system',
+                            'peak seeded on first observation', ?)
+                    """,
+                    (current_value, current_value, now),
+                )
+                return {
+                    "peak_value":          current_value,
+                    "peak_observed_at":    now,
+                    "halted":              False,
+                    "halted_at":           None,
+                    "halted_value":        None,
+                    "halted_drawdown_pct": None,
+                    "halt_reason":         None,
+                    "updated_at":          now,
+                    "drawdown_pct":        0.0,
+                    "newly_halted":        False,
+                }
+
+            d            = dict(row)
+            peak         = float(d["peak_value"])
+            already_halt = bool(d.get("halted") or 0)
+
+            new_peak  = max(peak, current_value)
+            ratcheted = new_peak > peak
+            drawdown  = (new_peak - current_value) / new_peak if new_peak > 0 else 0.0
+
+            should_halt   = (drawdown > threshold) and not already_halt
+            newly_halted  = should_halt
+
+            if ratcheted:
+                conn.execute(
+                    """
+                    UPDATE portfolio_peak
+                       SET peak_value       = ?,
+                           peak_observed_at = ?,
+                           updated_at       = ?
+                     WHERE id = 1
+                    """,
+                    (new_peak, now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO drawdown_events
+                        (event_type, peak_value, current_value,
+                         drawdown_pct, actor, reason, created_at)
+                    VALUES ('peak_update', ?, ?, ?, 'system',
+                            'new high NetLiq', ?)
+                    """,
+                    (new_peak, current_value, drawdown, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE portfolio_peak SET updated_at = ? WHERE id = 1",
+                    (now,),
+                )
+
+            if should_halt:
+                halt_reason = (
+                    f"NetLiq ${current_value:,.0f} is {drawdown:.2%} below peak "
+                    f"${new_peak:,.0f} (threshold {threshold:.0%})"
+                )
+                conn.execute(
+                    """
+                    UPDATE portfolio_peak
+                       SET halted              = 1,
+                           halted_at           = ?,
+                           halted_value        = ?,
+                           halted_drawdown_pct = ?,
+                           halt_reason         = ?,
+                           updated_at          = ?
+                     WHERE id = 1
+                    """,
+                    (now, current_value, drawdown, halt_reason, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO drawdown_events
+                        (event_type, peak_value, current_value,
+                         drawdown_pct, actor, reason, created_at)
+                    VALUES ('halt_triggered', ?, ?, ?, 'system', ?, ?)
+                    """,
+                    (new_peak, current_value, drawdown, halt_reason, now),
+                )
+
+            return {
+                "peak_value":          new_peak,
+                "peak_observed_at":    now if ratcheted else d["peak_observed_at"],
+                "halted":              already_halt or newly_halted,
+                "halted_at":           now if newly_halted else d.get("halted_at"),
+                "halted_value":        current_value if newly_halted else d.get("halted_value"),
+                "halted_drawdown_pct": drawdown if newly_halted else d.get("halted_drawdown_pct"),
+                "halt_reason":         (
+                    f"NetLiq ${current_value:,.0f} is {drawdown:.2%} below peak "
+                    f"${new_peak:,.0f} (threshold {threshold:.0%})"
+                    if newly_halted else d.get("halt_reason")
+                ),
+                "updated_at":          now,
+                "drawdown_pct":        drawdown,
+                "newly_halted":        newly_halted,
+            }
+
+    @_retry_on_locked
+    def unlock_drawdown_halt(
+        self,
+        unlocked_by: str,
+        reason: "str | None" = None,
+    ) -> bool:
+        """Clear an active halt. Returns True if a halt was actually cleared."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT halted FROM portfolio_peak WHERE id = 1"
+            ).fetchone()
+            if row is None or not (row["halted"] or 0):
+                return False
+            conn.execute(
+                """
+                UPDATE portfolio_peak
+                   SET halted              = 0,
+                       halted_at           = NULL,
+                       halted_value        = NULL,
+                       halted_drawdown_pct = NULL,
+                       halt_reason         = NULL,
+                       unlocked_at         = ?,
+                       unlocked_by         = ?,
+                       unlock_reason       = ?,
+                       updated_at          = ?
+                 WHERE id = 1
+                """,
+                (now, unlocked_by, reason, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO drawdown_events
+                    (event_type, peak_value, current_value,
+                     drawdown_pct, actor, reason, created_at)
+                SELECT 'halt_cleared', peak_value, NULL, NULL, ?, ?, ?
+                  FROM portfolio_peak WHERE id = 1
+                """,
+                (unlocked_by, reason, now),
+            )
+            return True
+
+    @_retry_on_locked
+    def reset_drawdown_peak(
+        self,
+        new_peak: float,
+        reset_by: str,
+        reason: "str | None" = None,
+    ) -> dict:
+        """Manually reset the peak (e.g. after a deposit / withdrawal).
+
+        Also clears any active halt. Use sparingly — the whole point of
+        the peak is that it ratchets without operator intervention.
+        """
+        if new_peak <= 0:
+            raise ValueError("new_peak must be > 0")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO portfolio_peak
+                    (id, peak_value, peak_observed_at, halted,
+                     unlocked_at, unlocked_by, unlock_reason, updated_at)
+                VALUES (1, ?, ?, 0, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    peak_value          = excluded.peak_value,
+                    peak_observed_at    = excluded.peak_observed_at,
+                    halted              = 0,
+                    halted_at           = NULL,
+                    halted_value        = NULL,
+                    halted_drawdown_pct = NULL,
+                    halt_reason         = NULL,
+                    unlocked_at         = excluded.unlocked_at,
+                    unlocked_by         = excluded.unlocked_by,
+                    unlock_reason       = excluded.unlock_reason,
+                    updated_at          = excluded.updated_at
+                """,
+                (new_peak, now, now, reset_by, reason, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO drawdown_events
+                    (event_type, peak_value, current_value,
+                     drawdown_pct, actor, reason, created_at)
+                VALUES ('peak_reset', ?, NULL, NULL, ?, ?, ?)
+                """,
+                (new_peak, reset_by, reason, now),
+            )
+        # Re-read outside the write transaction so the commit is visible.
+        return self.get_drawdown_state()
 
     @_retry_on_locked
     def log_scheduler_run(

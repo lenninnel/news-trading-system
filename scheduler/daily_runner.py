@@ -1267,6 +1267,7 @@ class DailyScheduler:
                     "Session account balance from IBKR: $%.2f (NetLiquidation)",
                     value,
                 )
+                self._update_drawdown_peak(value)
                 return value
             log.warning(
                 "IBKR returned zero portfolio_value — using configured balance",
@@ -1276,6 +1277,42 @@ class DailyScheduler:
                 "IBKR balance fetch failed (using configured): %s", exc,
             )
         return _configured_account_balance()
+
+    def _update_drawdown_peak(self, current_value: float) -> None:
+        """Ratchet portfolio peak and fire a one-time Telegram alert on halt.
+
+        Wired into every session balance fetch so the peak tracks live
+        NetLiquidation without a separate cron. The DB call is best-effort
+        — a failure here must not break the session.
+        """
+        try:
+            from config.settings import DRAWDOWN_HALT_THRESHOLD
+            from storage.database import Database
+            db = Database()
+            state = db.update_portfolio_peak(current_value, DRAWDOWN_HALT_THRESHOLD)
+        except Exception as exc:
+            log.warning("Drawdown peak update failed (non-fatal): %s", exc)
+            return
+
+        dd = state.get("drawdown_pct") or 0.0
+        peak = state.get("peak_value") or 0.0
+        log.info(
+            "Drawdown state: peak=$%.0f current=$%.0f dd=%.2f%% halted=%s",
+            peak, current_value, dd * 100, state.get("halted"),
+        )
+
+        if state.get("newly_halted") and self._tg:
+            try:
+                self._tg._send(
+                    "\U0001f6d1 *DRAWDOWN HALT TRIGGERED*\n"
+                    f"NetLiq: ${current_value:,.0f}\n"
+                    f"Peak: ${peak:,.0f}\n"
+                    f"Drawdown: {dd:.2%}\n\n"
+                    "New BUYs are blocked. SELLs / stops / TPs still fire.\n"
+                    "Manual unlock: `python3 -m execution.drawdown_halt --unlock`"
+                )
+            except Exception as exc:
+                log.warning("Drawdown halt Telegram alert failed: %s", exc)
 
     # ── Weekly job dispatch ───────────────────────────────────────────
 

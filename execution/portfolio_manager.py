@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config.settings import DB_PATH
+from config.settings import DB_PATH, DRAWDOWN_HALT_THRESHOLD
 from data.alpaca_data import AlpacaDataClient
 from execution.paper_trader import PaperTrader
 from storage.database import Database
@@ -227,6 +227,15 @@ class PortfolioManager:
         """
         ticker   = ticker.upper()
         strategy = strategy.lower().replace("-", "_")
+
+        # 0. Drawdown halt — BUY-only block. Designed 2026-05-01 / shipped
+        #    2026-05-12. Manual unlock only (see execution.drawdown_halt
+        #    CLI). PositionManager-driven SELLs / stops / TPs bypass this
+        #    gate entirely because they never call can_add_position.
+        halted, dd_reason = self._check_drawdown_halt()
+        if halted:
+            self._log_violation(ticker, strategy, amount_usd, "drawdown_halt", dd_reason)
+            return False, dd_reason
 
         positions = self._open_positions_with_meta()
         tickers   = [p["ticker"] for p in positions]
@@ -759,6 +768,25 @@ class PortfolioManager:
             )
         except Exception as exc:
             log.warning("Could not persist portfolio violation: %s", exc)
+
+    def _check_drawdown_halt(self) -> tuple[bool, str]:
+        """Return (halted, reason). Reason is empty when not halted.
+
+        Reads from portfolio_peak — the peak is maintained by the daily
+        scheduler (`_fetch_session_account_balance`) which calls
+        Database.update_portfolio_peak each session. Any DB error here
+        is non-fatal: better to allow a trade than to block on a transient
+        read error (kill switch covers true emergencies).
+        """
+        try:
+            state = self._db.get_drawdown_state()
+        except Exception as exc:
+            log.warning("Drawdown state read failed (allowing trade): %s", exc)
+            return False, ""
+        if not state.get("halted"):
+            return False, ""
+        reason = state.get("halt_reason") or "Drawdown halt active"
+        return True, f"Drawdown halt: {reason} — manual unlock required"
 
     def _count_violations_today(self, date_str: str) -> int:
         with self._connect() as conn:
