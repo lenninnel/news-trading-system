@@ -9,6 +9,7 @@ Start:  uvicorn api.main:app --host 0.0.0.0 --port 8001
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import sys
@@ -17,6 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
 
 # Ensure project root is importable
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -213,15 +216,14 @@ def signals(
 
 @app.get("/api/portfolio")
 def portfolio() -> dict:
-    # Try Alpaca first
-    alpaca_data = _try_alpaca_portfolio()
-    if alpaca_data:
-        return alpaca_data
-
-    # Fallback to local DB
     positions = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
 
     total_value = sum(p.get("current_value", 0) or 0 for p in positions)
+
+    account_row = _query_one(
+        "SELECT account_balance FROM risk_calculations ORDER BY id DESC LIMIT 1"
+    )
+    account_balance = account_row["account_balance"] if account_row else None
 
     # Daily PnL from trade_history
     today_str = date.today().isoformat()
@@ -231,7 +233,7 @@ def portfolio() -> dict:
         (today_str,),
     )
     daily_pnl = pnl_row["daily_pnl"] if pnl_row else 0.0
-    daily_pnl_pct = (daily_pnl / total_value * 100) if total_value else 0.0
+    daily_pnl_pct = (daily_pnl / account_balance * 100) if account_balance else 0.0
 
     pos_list = []
     for p in positions:
@@ -254,11 +256,13 @@ def portfolio() -> dict:
         (p.get("avg_price", 0) or 0) * (p.get("shares", 0) or 0)
         for p in positions
     )
-    account_row = _query_one(
-        "SELECT account_balance FROM risk_calculations ORDER BY id DESC LIMIT 1"
-    )
-    account_balance = account_row["account_balance"] if account_row else 10_000.0
-    cash = account_balance - total_invested
+    if account_balance is None:
+        logger.warning(
+            "portfolio endpoint: no risk_calculations rows, cash defaulting to 0"
+        )
+        cash = 0.0
+    else:
+        cash = account_balance - total_invested
 
     return {
         "value": round(total_value, 2),
@@ -267,56 +271,6 @@ def portfolio() -> dict:
         "positions": pos_list,
         "cash": round(cash, 2),
     }
-
-
-def _try_alpaca_portfolio() -> dict | None:
-    """Try reading portfolio from Alpaca API. Returns dict or None."""
-    try:
-        import alpaca_trade_api as tradeapi
-
-        key = os.environ.get("ALPACA_API_KEY", "")
-        secret = os.environ.get("ALPACA_SECRET_KEY", "")
-        mode = os.environ.get("ALPACA_MODE", "paper").lower()
-        if not key or not secret or "DISABLED" in key:
-            return None
-        base_url = (
-            "https://api.alpaca.markets"
-            if mode == "live"
-            else "https://paper-api.alpaca.markets"
-        )
-        api = tradeapi.REST(
-            key_id=key, secret_key=secret,
-            base_url=base_url, api_version="v2",
-        )
-        account = api.get_account()
-        positions = api.list_positions()
-
-        portfolio_value = float(account.portfolio_value)
-        last_equity = float(account.last_equity)
-        daily_pnl = portfolio_value - last_equity
-        daily_pnl_pct = (daily_pnl / last_equity * 100) if last_equity else 0
-
-        pos_list = []
-        for p in positions:
-            pos_list.append({
-                "ticker": p.symbol,
-                "shares": int(p.qty),
-                "entry": float(p.avg_entry_price),
-                "current": float(p.current_price),
-                "pnl_pct": round(float(p.unrealized_plpc) * 100, 1),
-            })
-
-        cash = float(account.cash)
-
-        return {
-            "value": round(portfolio_value, 2),
-            "daily_pnl": round(daily_pnl, 2),
-            "daily_pnl_pct": round(daily_pnl_pct, 2),
-            "positions": pos_list,
-            "cash": round(cash, 2),
-        }
-    except Exception:
-        return None
 
 
 @app.get("/api/trades")
