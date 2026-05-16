@@ -44,11 +44,36 @@ def _isolate_portfolio_positions():
 
 # ── helpers ──────────────────────────────────────────────────────────
 
-def _make_trader(portfolio=None, trade_history=None):
-    """Return a mock trader with configurable portfolio and trade history."""
+def _make_trader(portfolio=None, trade_history=None, fill_outcome="filled"):
+    """Return a mock trader with configurable portfolio and trade history.
+
+    ``track_trade`` returns a dict matching the IBKRTrader contract.
+    ``fill_outcome`` controls what kind of result the broker returns:
+      "filled"    — trade_id set, no skipped marker (normal close path)
+      "stuck"     — extended SELL timed out after STOP_MAX_WAIT
+      "cancelled" — IBKR cancelled the order
+      "timeout"   — fast-poll ceiling reached (BUY only; legacy)
+    """
     trader = MagicMock()
     trader.get_portfolio.return_value = portfolio or []
     trader.get_trade_history.return_value = trade_history or []
+
+    def _track(*, ticker, action, shares, price, **_kwargs):
+        if fill_outcome == "filled":
+            return {
+                "trade_id": 1, "ticker": ticker, "action": action,
+                "shares": shares, "price": price, "pnl": 0.0,
+                "total_value": shares * price,
+            }
+        return {
+            "trade_id": None, "ticker": ticker, "action": action,
+            "shares": shares, "price": price, "pnl": 0.0, "total_value": 0.0,
+            "skipped": True,
+            "skip_reason": f"IBKR order {fill_outcome}: test",
+            "outcome": fill_outcome,
+        }
+
+    trader.track_trade.side_effect = _track
     return trader
 
 
@@ -112,6 +137,65 @@ class TestStopLoss:
 
         trader.track_trade.assert_called_once()
         assert results[0]["action"] == "stop_loss"
+
+    def test_stop_loss_stuck_alerts_and_skips_next_cycle(self):
+        """When the SELL hits IBKR's STOP_MAX_WAIT and comes back ``stuck``:
+        - PM sends an "ORDER STUCK" Telegram alert (NOT "Stop-loss hit"),
+        - the next 60s cycle is skipped for that ticker so we don't pile
+          a duplicate order on top of the in-flight one. Regression for
+          VRT 2026-05-15 (false "Closed position" alert + retry slippage).
+        """
+        portfolio, history = _make_position(
+            ticker="VRT", shares=10, avg_price=400.0,
+            stop_loss=380.0, take_profit=440.0,
+        )
+        trader = _make_trader(
+            portfolio=portfolio, trade_history=history,
+            fill_outcome="stuck",
+        )
+        notifier = MagicMock()
+        pm = PositionManager(trader=trader, notifier=notifier)
+
+        with patch.object(pm, "_fetch_current_price", return_value=370.0):
+            results = pm._check_all_positions()
+
+        alert_msg = notifier.send_price_alert.call_args[0][0]
+        assert "STUCK" in alert_msg.upper()
+        assert "VRT" in alert_msg
+        # Critical: the false "Stop-loss hit / Closed position" wording
+        # must NOT be in the alert when the order hasn't actually filled.
+        assert "Stop-loss hit" not in alert_msg
+        assert results[0]["action"] == "stop_loss_stuck"
+
+        # Second cycle: trader should NOT be asked to close again — the
+        # cooldown suppresses duplicate orders against the in-flight SELL.
+        trader.track_trade.reset_mock()
+        with patch.object(pm, "_fetch_current_price", return_value=370.0):
+            second = pm._check_all_positions()
+        trader.track_trade.assert_not_called()
+        assert second == []  # cooldown skip yields no actions
+
+    def test_stop_loss_cancelled_does_not_alert(self):
+        """Cancelled / failed SELL should not send a 'Stop-loss hit' alert;
+        the next 60s cycle will re-evaluate and retry naturally if the
+        position is still in violation. Regression for false-closure alerts.
+        """
+        portfolio, history = _make_position(
+            ticker="AAPL", shares=10, avg_price=200.0,
+            stop_loss=190.0, take_profit=220.0,
+        )
+        trader = _make_trader(
+            portfolio=portfolio, trade_history=history,
+            fill_outcome="cancelled",
+        )
+        notifier = MagicMock()
+        pm = PositionManager(trader=trader, notifier=notifier)
+
+        with patch.object(pm, "_fetch_current_price", return_value=189.0):
+            results = pm._check_all_positions()
+
+        notifier.send_price_alert.assert_not_called()
+        assert results == []
 
 
 # ── test: take-profit triggers close ─────────────────────────────────

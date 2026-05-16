@@ -627,3 +627,101 @@ class TestCachedUSOpenPortfolioGate:
         assert reg_kwargs["ticker"] == "AAPL"
         assert reg_kwargs["strategy"] == "momentum"
         assert result["execution"] is not None
+
+
+# ===========================================================================
+# EOD BUY guardrail (Bug 2, 2026-05-16)
+# ===========================================================================
+
+class TestEODBuyGuardrail:
+    """EOD session emits BUYs after the US close. IBKR returns Warning 399
+    and holds them for the next session; our 30s timeout then cancels every
+    one (12-for-12 cancellation, week of 2026-05-12). The fix is to log
+    the signal but skip the placeOrder. SELLs (stops/TPs/exits) remain
+    enabled because closing a position at EOD is still meaningful.
+    """
+
+    def _make_coordinator(self, *, direction="BUY"):
+        from unittest.mock import MagicMock
+        from orchestrator.coordinator import Coordinator
+
+        c = Coordinator.__new__(Coordinator)
+        c.db = MagicMock()
+        c.db.get_cached_signal.return_value = {
+            "signal": "WEAK BUY" if direction == "BUY" else "WEAK SELL",
+            "confidence": 0.42,
+            "price_at_signal": 100.0,
+            "strategy": "momentum",
+            "sentiment_score": 0.2,
+        }
+        c.db.get_portfolio_position.return_value = (
+            None if direction == "BUY"
+            else {"ticker": "AAPL", "shares": 10, "avg_price": 100.0}
+        )
+
+        c.market_data = MagicMock()
+        c.market_data.fetch.return_value = {"price": 100.5, "degraded": False}
+
+        c.signal_logger = MagicMock()
+        c.signal_logger.get_pending_forward_signals.return_value = []
+
+        c.debate_agent = MagicMock()
+        c.debate_agent.is_enabled.return_value = False
+
+        c.risk_agent = MagicMock()
+        c.risk_agent.run.return_value = {
+            "skipped": False,
+            "direction": direction,
+            "shares": 10,
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        }
+
+        c.paper_trader = MagicMock()
+        c.paper_trader.track_trade.return_value = {
+            "trade_id": 999, "price": 100.5,
+        }
+
+        c._portfolio_manager = MagicMock()
+        c._portfolio_manager.can_add_position.return_value = (True, "")
+        c._has_alpaca_position = lambda _t: False
+        return c
+
+    def test_eod_buy_skipped(self):
+        """EOD session + BUY direction → track_trade NOT called and
+        execution is None on the returned result. The signal still gets
+        logged via _log_signal_event (downstream of the gate)."""
+        import asyncio
+        c = self._make_coordinator(direction="BUY")
+
+        result = asyncio.run(c._execute_forward_signals_async(
+            "AAPL",
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+            session="EOD",
+        ))
+
+        c.paper_trader.track_trade.assert_not_called()
+        c._portfolio_manager.register_position.assert_not_called()
+        assert result["execution"] is None
+
+    def test_eod_sell_still_fires(self):
+        """EOD session + SELL direction → track_trade IS called.
+        Stops/TPs/exits must still execute at EOD."""
+        import asyncio
+        c = self._make_coordinator(direction="SELL")
+
+        asyncio.run(c._execute_forward_signals_async(
+            "AAPL",
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+            session="EOD",
+        ))
+
+        c.paper_trader.track_trade.assert_called_once()
+        kwargs = c.paper_trader.track_trade.call_args.kwargs
+        assert kwargs["action"] == "SELL"

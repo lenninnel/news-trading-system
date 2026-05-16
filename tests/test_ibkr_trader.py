@@ -351,6 +351,103 @@ class TestIBKROrders:
         assert trader.close_position("AAPL") is False
 
 
+# ── Differentiated order timeout (Bug 1, 2026-05-16) ────────────────────────
+
+class TestDifferentiatedOrderTimeout:
+    """SELLs (stop/TP/exit) wait longer than BUYs and do not auto-cancel
+    on timeout. Background: VRT stop on 2026-05-15 took >30s to confirm,
+    the original code cancelled and retried, and the retry filled $6/share
+    worse (~$471 of slippage). See ibkr_trader.STOP_MAX_WAIT.
+    """
+
+    def test_stop_order_extended_timeout(self):
+        """SELL that fills after the BUY ceiling but before STOP_MAX_WAIT
+        is treated as a normal fill — no skipped marker, DB writes happen.
+        """
+        from execution import ibkr_trader as mod
+
+        trader, mock_ib, mock_db = _make_trader()
+        mock_db.get_portfolio_position.return_value = {
+            "shares": 10, "avg_price": 200.0,
+        }
+
+        # Simulate a fill that arrives between the (shrunken) BUY ceiling
+        # and the (shrunken) SELL ceiling: status flips to Filled on the
+        # 3rd poll, well after the BUY ceiling would have fired.
+        mock_trade = MagicMock()
+        statuses = iter(["PendingSubmit", "PreSubmitted", "Filled", "Filled"])
+        type(mock_trade.orderStatus).status = property(lambda _self: next(statuses))
+        mock_trade.orderStatus.avgFillPrice = 358.30
+        mock_trade.log = []
+        mock_ib.placeOrder.return_value = mock_trade
+
+        # Shrink constants so the test finishes in ms while still proving
+        # that SELL uses STOP_MAX_WAIT and BUY would have given up.
+        with patch.object(mod, "ORDER_FILL_TIMEOUT", 0.01), \
+             patch.object(mod, "ORDER_POLL_INTERVAL", 0.005), \
+             patch.object(mod, "STOP_EXTENDED_TIMEOUT", 0.02), \
+             patch.object(mod, "STOP_MAX_WAIT", 0.5), \
+             patch.object(mod, "STOP_SLOW_POLL_INTERVAL", 0.005):
+            result = trader.track_trade("AAPL", "SELL", 10, 360.0)
+
+        assert result.get("skipped") is not True
+        assert result["price"] == 358.30
+        assert result["pnl"] == round((358.30 - 200.0) * 10, 2)
+        mock_ib.cancelOrder.assert_not_called()  # never auto-cancel a slow SELL
+        mock_db.log_trade_history.assert_called_once()
+
+    def test_stop_order_timeout_no_retry(self):
+        """SELL still PreSubmitted past STOP_MAX_WAIT returns ``stuck`` and
+        does NOT cancel the in-flight order — the caller must alert the
+        user instead, never auto-retry.
+        """
+        from execution import ibkr_trader as mod
+
+        trader, mock_ib, mock_db = _make_trader()
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "PreSubmitted"  # never terminal
+        mock_trade.log = []
+        mock_ib.placeOrder.return_value = mock_trade
+
+        with patch.object(mod, "ORDER_FILL_TIMEOUT", 0.01), \
+             patch.object(mod, "ORDER_POLL_INTERVAL", 0.005), \
+             patch.object(mod, "STOP_EXTENDED_TIMEOUT", 0.02), \
+             patch.object(mod, "STOP_MAX_WAIT", 0.05), \
+             patch.object(mod, "STOP_SLOW_POLL_INTERVAL", 0.005):
+            result = trader.track_trade("AAPL", "SELL", 10, 360.0)
+
+        assert result["skipped"] is True
+        assert result["outcome"] == "stuck"
+        assert "stuck" in result["skip_reason"].lower()
+        # Critical: a stuck SELL must NOT be auto-cancelled — the
+        # cancel-and-retry pattern cost $471 on VRT (2026-05-15).
+        mock_ib.cancelOrder.assert_not_called()
+        mock_db.log_trade_history.assert_not_called()
+        mock_db.set_portfolio_position.assert_not_called()
+
+    def test_buy_order_30s_unchanged(self):
+        """BUY entries keep the original behaviour: cancel + skip after
+        ORDER_FILL_TIMEOUT. Failing to enter is recoverable on the next
+        session, unlike failing to exit a position.
+        """
+        from execution import ibkr_trader as mod
+
+        trader, mock_ib, mock_db = _make_trader()
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Submitted"  # never terminal
+        mock_trade.log = []
+        mock_ib.placeOrder.return_value = mock_trade
+
+        with patch.object(mod, "ORDER_FILL_TIMEOUT", 0.05), \
+             patch.object(mod, "ORDER_POLL_INTERVAL", 0.005):
+            result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+
+        assert result["skipped"] is True
+        assert result["outcome"] == "timeout"
+        mock_ib.cancelOrder.assert_called_once_with(mock_trade.order)
+        mock_db.log_trade_history.assert_not_called()
+
+
 # ── Market hours ────────────────────────────────────────────────────────────
 
 class TestIBKRMarketHours:
