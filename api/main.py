@@ -168,6 +168,20 @@ def status() -> dict:
             tzinfo=timezone.utc,
         ).isoformat()
 
+    # Sessions that actually ran today (UTC). Row exists = session
+    # started. We don't currently track completion separately; if a
+    # session crashed mid-flight that's a different alarm path.
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    sessions_today_rows = _query(
+        "SELECT session, started_at FROM session_runs "
+        "WHERE run_date = ? ORDER BY started_at ASC",
+        (today_utc,),
+    )
+    sessions_today = [
+        {"session": r["session"], "started_at": r["started_at"]}
+        for r in sessions_today_rows
+    ]
+
     return {
         "running": True,
         "uptime_seconds": uptime,
@@ -177,6 +191,7 @@ def status() -> dict:
         "next_run_at": next_run_at,
         "watchlist": watchlist,
         "mode": mode,
+        "sessions_today": sessions_today,
     }
 
 
