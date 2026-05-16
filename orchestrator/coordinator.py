@@ -291,6 +291,20 @@ class Coordinator:
             return "SELL"
         return "HOLD"
 
+    @staticmethod
+    def _is_eod_buy(session: str | None, action: str | None) -> bool:
+        """Return True if this is a BUY emitted by the EOD session.
+
+        EOD BUY signals are advisory only: the EOD session runs after
+        the US close, when IBKR routes new BUYs as "Warning 399, order
+        held for next session". Those orders sit PreSubmitted overnight,
+        get cancelled by our 30s timeout, and never execute (12-for-12
+        cancellation week of 2026-05-12). The role of EOD is monitoring
+        and analytics, not entry — so we log the signal but skip the
+        IBKR placeOrder call. SELLs (stops/TPs/exits) remain enabled.
+        """
+        return session == "EOD" and (action or "").upper() == "BUY"
+
     def _log_signal_event(self, result: dict, *, session: str | None = None) -> None:
         """Extract signal context and log it. Never raises."""
         try:
@@ -500,29 +514,36 @@ class Coordinator:
                                     ticker, pm_reason,
                                 )
                         if not pm_blocked:
-                            execution = self.paper_trader.track_trade(
-                                ticker=ticker,
-                                action=risk["direction"],
-                                shares=risk["shares"],
-                                price=price,
-                                stop_loss=risk["stop_loss"],
-                                take_profit=risk["take_profit"],
-                            )
-                            if execution and execution.get("trade_id"):
-                                try:
-                                    if risk["direction"] == "BUY":
-                                        self._portfolio_manager.register_position(
-                                            ticker=ticker,
-                                            strategy="PEAD",
-                                            entry_price=execution.get("price", price),
+                            if self._is_eod_buy(session, risk["direction"]):
+                                log.info(
+                                    "[%s] EOD BUY signals are advisory only; "
+                                    "skipping execution.",
+                                    ticker,
+                                )
+                            else:
+                                execution = self.paper_trader.track_trade(
+                                    ticker=ticker,
+                                    action=risk["direction"],
+                                    shares=risk["shares"],
+                                    price=price,
+                                    stop_loss=risk["stop_loss"],
+                                    take_profit=risk["take_profit"],
+                                )
+                                if execution and execution.get("trade_id"):
+                                    try:
+                                        if risk["direction"] == "BUY":
+                                            self._portfolio_manager.register_position(
+                                                ticker=ticker,
+                                                strategy="PEAD",
+                                                entry_price=execution.get("price", price),
+                                            )
+                                        else:
+                                            self._portfolio_manager.clear_position_meta(ticker)
+                                    except Exception as exc:
+                                        log.warning(
+                                            "[%s] PortfolioManager metadata update failed: %s",
+                                            ticker, exc,
                                         )
-                                    else:
-                                        self._portfolio_manager.clear_position_meta(ticker)
-                                except Exception as exc:
-                                    log.warning(
-                                        "[%s] PortfolioManager metadata update failed: %s",
-                                        ticker, exc,
-                                    )
 
         # Store forward signal for execution session
         if combined_signal not in ("HOLD", "CONFLICTING"):
@@ -1271,6 +1292,13 @@ class Coordinator:
                             print(f"\n  [SKIPPED] PortfolioManager: {pm_reason}")
                 if pm_blocked:
                     execution = None
+                elif self._is_eod_buy(session, risk["direction"]):
+                    log.info(
+                        "[%s] EOD BUY signals are advisory only; "
+                        "skipping execution.",
+                        ticker,
+                    )
+                    execution = None
                 else:
                     execution = self.paper_trader.track_trade(
                         ticker=ticker,
@@ -1703,7 +1731,15 @@ class Coordinator:
                                     "[%s] PortfolioManager blocked: %s",
                                     ticker, reason,
                                 )
-                        if not pm_blocked:
+                        if pm_blocked:
+                            pass
+                        elif self._is_eod_buy(session, risk["direction"]):
+                            log.info(
+                                "[%s] EOD BUY signals are advisory only; "
+                                "skipping execution.",
+                                ticker,
+                            )
+                        else:
                             execution = self.paper_trader.track_trade(
                                 ticker=ticker,
                                 action=risk["direction"],
@@ -2256,7 +2292,15 @@ class Coordinator:
                                         "[%s] PortfolioManager blocked: %s",
                                         ticker, pm_reason,
                                     )
-                            if not pm_blocked:
+                            if pm_blocked:
+                                pass
+                            elif self._is_eod_buy(session, risk["direction"]):
+                                log.info(
+                                    "[%s] EOD BUY signals are advisory only; "
+                                    "skipping execution.",
+                                    ticker,
+                                )
+                            else:
                                 execution = self.paper_trader.track_trade(
                                     ticker=ticker,
                                     action=risk["direction"],
