@@ -43,6 +43,13 @@ _MARKET_CLOSE_LOCAL = (16, 0)   # 4:00 PM ET
 _TRAILING_ACTIVATION_PCT = 2.0   # position must be up >2% to activate
 _TRAILING_LOCK_PCT = 1.0         # trail locks in at least 1% gain
 
+# Stuck-order cooldown: after a stop/TP SELL hits IBKR's STOP_MAX_WAIT and
+# is left in flight, we don't want to evaluate the same position again on
+# the next 60s cycle (which would submit a duplicate order). Wait this
+# many seconds before re-evaluating so the original has a chance to fill
+# or be cleared manually.
+_STUCK_ORDER_COOLDOWN_S = 600.0
+
 
 class PositionManager:
     """
@@ -73,6 +80,12 @@ class PositionManager:
         # (portfolio_positions.trailing_stop column) is the persistence
         # layer used to survive daemon restarts. Rehydrated below.
         self._trailing_stops: dict[str, float] = {}
+
+        # Stuck-order cooldown: ticker → monotonic timestamp of the most
+        # recent ORDER STUCK alert. While a ticker is in cooldown, we
+        # skip evaluation so we don't submit a duplicate SELL on top of
+        # the in-flight one (which IBKR did not cancel for us).
+        self._stuck_orders: dict[str, float] = {}
 
         # Signal logger for audit trail
         from analytics.signal_logger import SignalLogger
@@ -409,39 +422,42 @@ class PositionManager:
         stop_loss = pos.get("stop_loss")
         take_profit = pos.get("take_profit")
 
+        # Stuck-order cooldown: if a recent SELL hit IBKR's STOP_MAX_WAIT
+        # ceiling without confirming, sit out this cycle so we don't pile
+        # a duplicate on top of the in-flight order. Cooldown elapses
+        # after _STUCK_ORDER_COOLDOWN_S, by which point either the
+        # original filled or the user intervened manually.
+        last_stuck = self._stuck_orders.get(ticker)
+        if last_stuck is not None and (time.monotonic() - last_stuck) < _STUCK_ORDER_COOLDOWN_S:
+            remaining = _STUCK_ORDER_COOLDOWN_S - (time.monotonic() - last_stuck)
+            log.info(
+                "[%s] Skipping eval - stuck-order cooldown (%.0fs remaining)",
+                ticker, remaining,
+            )
+            return None
+
         # Use trailing stop if it has been set, otherwise fall back to original
         effective_stop = self._trailing_stops.get(ticker, stop_loss)
 
         # 1. Stop-loss check
         if effective_stop and current_price <= effective_stop:
             pnl_pct = (current_price - avg_price) / avg_price * 100
-            self._close_position(ticker, shares, current_price)
-            msg = f"\U0001f534 Stop-loss hit: {ticker} {pnl_pct:+.1f}%"
-            self._send_alert(msg)
-            self._log_event(ticker, "SELL", current_price,
-                            f"stop_loss_triggered at ${effective_stop:.2f}")
-            # Clean up trailing stop (memory + DB). The DB clear is a
-            # belt-and-braces — _close_position → _sync_position deletes
-            # the whole row on a full close, but if the SELL fails we
-            # still want the stale trailing_stop wiped so the next cycle
-            # re-trails from current price.
-            self._trailing_stops.pop(ticker, None)
-            self._clear_persisted_trailing_stop(ticker)
-            return {"ticker": ticker, "action": "stop_loss", "price": current_price,
-                    "pnl_pct": pnl_pct}
+            result = self._close_position(ticker, shares, current_price)
+            return self._handle_close_result(
+                result, ticker, current_price, pnl_pct,
+                trigger="stop_loss", level=effective_stop,
+                alert_emoji="\U0001f534", alert_label="Stop-loss",
+            )
 
         # 2. Take-profit check
         if take_profit and current_price >= take_profit:
             pnl_pct = (current_price - avg_price) / avg_price * 100
-            self._close_position(ticker, shares, current_price)
-            msg = f"\u2705 Take-profit hit: {ticker} {pnl_pct:+.1f}%"
-            self._send_alert(msg)
-            self._log_event(ticker, "SELL", current_price,
-                            f"take_profit_triggered at ${take_profit:.2f}")
-            self._trailing_stops.pop(ticker, None)
-            self._clear_persisted_trailing_stop(ticker)
-            return {"ticker": ticker, "action": "take_profit", "price": current_price,
-                    "pnl_pct": pnl_pct}
+            result = self._close_position(ticker, shares, current_price)
+            return self._handle_close_result(
+                result, ticker, current_price, pnl_pct,
+                trigger="take_profit", level=take_profit,
+                alert_emoji="\u2705", alert_label="Take-profit",
+            )
 
         # 3. Trailing stop: activate when position is up >2%
         if avg_price > 0:
@@ -469,24 +485,100 @@ class PositionManager:
     # Trade execution
     # ------------------------------------------------------------------
 
-    def _close_position(self, ticker: str, shares: int, price: float) -> None:
+    def _close_position(
+        self, ticker: str, shares: int, price: float,
+    ) -> dict | None:
         """Sell all shares via the configured broker.
 
-        Never raises. Timeouts and other broker errors are logged as
-        warnings so the monitor loop keeps running — we'd rather
-        retry on the next cycle than tear down the daemon thread.
+        Returns the broker result dict (or ``None`` on exception). The
+        caller inspects ``outcome``/``skipped`` to decide alerting and
+        bookkeeping. Never raises — broker errors are logged as warnings
+        so the monitor loop keeps running.
         """
         try:
-            self._trader.track_trade(
+            result = self._trader.track_trade(
                 ticker=ticker, action="SELL", shares=shares, price=price,
             )
-            log.info("Closed position: %s %d shares @ $%.2f", ticker, shares, price)
+            log.info("Close requested: %s %d shares @ $%.2f", ticker, shares, price)
+            return result
         except TimeoutError as exc:
             log.warning(
                 "Close position timed out for %s (non-fatal): %s", ticker, exc,
             )
+            return None
         except Exception as exc:
             log.warning("Failed to close %s (non-fatal): %s", ticker, exc)
+            return None
+
+    def _handle_close_result(
+        self,
+        result: dict | None,
+        ticker: str,
+        current_price: float,
+        pnl_pct: float,
+        *,
+        trigger: str,
+        level: float,
+        alert_emoji: str,
+        alert_label: str,
+    ) -> dict | None:
+        """Dispatch alerts and bookkeeping based on the SELL outcome.
+
+        - filled  → fire the normal "<label> hit" Telegram alert, clear
+          trailing-stop state, return the trigger dict.
+        - stuck   → fire an "ORDER STUCK" alert, register cooldown so the
+          next cycles don't pile duplicate orders on the in-flight SELL.
+          DO NOT clear trailing-stop state — the original is still live
+          and may yet fill.
+        - cancelled / timeout / None → log only. The next 60s cycle will
+          re-evaluate and retry naturally if conditions still hold.
+        """
+        filled = bool(
+            result and result.get("trade_id") and not result.get("skipped")
+        )
+        outcome = (result or {}).get("outcome")
+
+        if filled:
+            msg = f"{alert_emoji} {alert_label} hit: {ticker} {pnl_pct:+.1f}%"
+            self._send_alert(msg)
+            self._log_event(
+                ticker, "SELL", current_price,
+                f"{trigger}_triggered at ${level:.2f}",
+            )
+            # Belt-and-braces: a full close also wipes the
+            # portfolio_positions row via _sync_position, but clear the
+            # trailing stop explicitly so a partial-fill or stale row
+            # never leaves a dangling trail.
+            self._trailing_stops.pop(ticker, None)
+            self._clear_persisted_trailing_stop(ticker)
+            return {
+                "ticker": ticker, "action": trigger,
+                "price": current_price, "pnl_pct": pnl_pct,
+            }
+
+        if outcome == "stuck":
+            self._stuck_orders[ticker] = time.monotonic()
+            msg = (
+                f"⚠️ ORDER STUCK: {ticker} {alert_label} SELL still "
+                f"PreSubmitted after 5min. Order NOT cancelled — check IBKR "
+                f"Gateway manually."
+            )
+            self._send_alert(msg)
+            self._log_event(
+                ticker, "SELL", current_price,
+                f"{trigger}_order_stuck at ${level:.2f}",
+            )
+            return {
+                "ticker": ticker, "action": f"{trigger}_stuck",
+                "price": current_price, "pnl_pct": pnl_pct,
+            }
+
+        reason = (result or {}).get("skip_reason") or "no broker result"
+        log.info(
+            "[%s] %s SELL did not fill (%s); next cycle will retry",
+            ticker, alert_label, reason,
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Price fetching

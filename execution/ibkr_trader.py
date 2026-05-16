@@ -48,6 +48,18 @@ UNSUPPORTED_IBKR: set[str] = set()
 # round-trip plus a few seconds of slack for slow paper sessions.
 ORDER_FILL_TIMEOUT = 30.0
 ORDER_POLL_INTERVAL = 0.5
+
+# Stop-loss / take-profit SELLs use an extended wait. IBKR fill confirmation
+# for closing orders can lag 30-60s in volatile markets; cancelling at 30s
+# and retrying cost $471 of slippage on VRT (2026-05-15) when the original
+# would have filled at $364.30 but the retry hit $358.30. Strategy: fast-poll
+# until STOP_EXTENDED_TIMEOUT, then slow-poll at STOP_SLOW_POLL_INTERVAL up to
+# STOP_MAX_WAIT total. If still not filled, return ("stuck", …) so the caller
+# alerts the user instead of auto-cancelling.
+STOP_EXTENDED_TIMEOUT = 120.0
+STOP_MAX_WAIT = 300.0
+STOP_SLOW_POLL_INTERVAL = 10.0
+
 _TERMINAL_FILLED = {"Filled"}
 _TERMINAL_CANCELLED = {"Cancelled", "Inactive", "ApiCancelled"}
 
@@ -478,9 +490,22 @@ class IBKRTrader:
         if shares < 1:
             raise ValueError(f"shares must be >= 1, got {shares}")
 
-        # Order timeout = ORDER_FILL_TIMEOUT + a small margin for the
-        # qualifyContracts round-trip and the post-fill DB write.
-        dispatch_timeout = ORDER_FILL_TIMEOUT + 20.0
+        # SELL = stop/TP/exit, which IBKR can take 30-60s to confirm.
+        # We give it STOP_MAX_WAIT before declaring it stuck; we never
+        # auto-cancel a stuck SELL because doing so causes us to retry
+        # against a worse price (VRT, 2026-05-15: $471 of slippage).
+        # BUY = fresh entry; cancel + skip after 30s is fine, the next
+        # session can re-evaluate.
+        is_sell = action == "SELL"
+        if is_sell:
+            wait_kwargs = {
+                "timeout": STOP_MAX_WAIT,
+                "slow_poll_after": STOP_EXTENDED_TIMEOUT,
+            }
+            dispatch_timeout = STOP_MAX_WAIT + 20.0
+        else:
+            wait_kwargs = {}
+            dispatch_timeout = ORDER_FILL_TIMEOUT + 20.0
 
         def _impl() -> dict:
             contract = self._Stock(ticker, "SMART", "USD")
@@ -488,7 +513,7 @@ class IBKRTrader:
 
             order = self._MarketOrder(action, shares)
             trade = self._ib.placeOrder(contract, order)
-            outcome, detail = self._wait_for_order_terminal(trade)
+            outcome, detail = self._wait_for_order_terminal(trade, **wait_kwargs)
 
             if outcome != "filled":
                 self._handle_unfilled(trade, ticker, outcome, detail)
@@ -499,6 +524,7 @@ class IBKRTrader:
                     "pnl": 0.0, "total_value": 0.0,
                     "skipped": True,
                     "skip_reason": f"IBKR order {outcome}: {detail}",
+                    "outcome": outcome,
                 }
 
             fill_price = trade.orderStatus.avgFillPrice or price
@@ -623,7 +649,13 @@ class IBKRTrader:
         return self._run_in_ib_loop(_impl, timeout=15.0)
 
     def close_position(self, ticker: str) -> bool:
-        """Close an open position by submitting a market order for the opposite side."""
+        """Close an open position by submitting a market order for the opposite side.
+
+        For long positions (the common case) this submits a SELL, which
+        uses the extended wait semantics — a stop/exit can take up to 60s
+        to confirm in volatile markets and auto-cancelling triggers a
+        worse-priced retry (see ``STOP_EXTENDED_TIMEOUT``).
+        """
         def _impl() -> bool:
             positions = self._ib.positions()
             for pos in positions:
@@ -636,7 +668,14 @@ class IBKRTrader:
                     self._ib.qualifyContracts(contract)
                     order = self._MarketOrder(side, abs(qty))
                     trade = self._ib.placeOrder(contract, order)
-                    outcome, detail = self._wait_for_order_terminal(trade)
+                    if side == "SELL":
+                        outcome, detail = self._wait_for_order_terminal(
+                            trade,
+                            timeout=STOP_MAX_WAIT,
+                            slow_poll_after=STOP_EXTENDED_TIMEOUT,
+                        )
+                    else:
+                        outcome, detail = self._wait_for_order_terminal(trade)
                     if outcome == "filled":
                         log.info(
                             "IBKR ORDER FILLED: %s %d shares of %s",
@@ -646,7 +685,9 @@ class IBKRTrader:
                     self._handle_unfilled(trade, ticker, outcome, detail)
                     return False
             return False
-        return self._run_in_ib_loop(_impl, timeout=ORDER_FILL_TIMEOUT + 20.0)
+        # SELL path may wait up to STOP_MAX_WAIT; BUY path 30s. Use the
+        # larger window so the dispatch never strands a slow SELL.
+        return self._run_in_ib_loop(_impl, timeout=STOP_MAX_WAIT + 20.0)
 
     def place_order(
         self,
@@ -792,20 +833,30 @@ class IBKRTrader:
     def _wait_for_order_terminal(
         self, trade, timeout: float | None = None,
         poll: float | None = None,
+        slow_poll_after: float | None = None,
+        slow_poll: float | None = None,
     ) -> tuple[str, str]:
         """Poll ``trade.orderStatus.status`` until terminal or timeout.
 
         Returns (outcome, detail):
             ("filled",    last_status)
             ("cancelled", reason from trade.log[-1].message, or status)
-            ("timeout",   last_status)
+            ("timeout",   last_status)   — fast-poll ceiling (BUY semantics)
+            ("stuck",     last_status)   — slow-poll ceiling (SELL semantics)
+
+        When ``slow_poll_after`` is set, polling switches from ``poll`` to
+        ``slow_poll`` once that many seconds have elapsed, and the final
+        ceiling outcome is ``stuck`` rather than ``timeout`` so the caller
+        knows not to auto-cancel — the order may yet fill.
 
         ``timeout`` / ``poll`` resolve to the module-level constants when
         ``None`` so test patches of those constants take effect.
         """
         eff_timeout = ORDER_FILL_TIMEOUT if timeout is None else timeout
         eff_poll = ORDER_POLL_INTERVAL if poll is None else poll
-        deadline = time.monotonic() + eff_timeout
+        eff_slow_poll = STOP_SLOW_POLL_INTERVAL if slow_poll is None else slow_poll
+        start = time.monotonic()
+        deadline = start + eff_timeout
         while True:
             status = getattr(trade.orderStatus, "status", "") or ""
             if status in _TERMINAL_FILLED:
@@ -820,18 +871,42 @@ class IBKRTrader:
                     reason = ""
                 return ("cancelled", reason or status)
             if time.monotonic() >= deadline:
-                return ("timeout", status)
+                return (
+                    "stuck" if slow_poll_after is not None else "timeout",
+                    status,
+                )
+            if (slow_poll_after is not None
+                    and (time.monotonic() - start) >= slow_poll_after):
+                interval = eff_slow_poll
+            else:
+                interval = eff_poll
             try:
-                self._ib.sleep(eff_poll)
+                self._ib.sleep(interval)
             except Exception:
-                time.sleep(eff_poll)
+                time.sleep(interval)
 
     def _handle_unfilled(
         self, trade, ticker: str, outcome: str, detail: str,
     ) -> None:
-        """Log + (on timeout) cancel an order that didn't fill."""
+        """Log + (on BUY timeout) cancel an order that didn't fill.
+
+        Outcomes:
+            cancelled — IBKR already cancelled; log only.
+            stuck     — SELL still PreSubmitted past STOP_MAX_WAIT.
+                        DO NOT cancel; the in-flight order is likely a
+                        slow fill and cancelling it triggers a worse-priced
+                        retry (VRT 2026-05-15 lost $471 this way).
+            timeout   — fast-poll ceiling (BUY only). Cancel + move on.
+        """
         if outcome == "cancelled":
             log.warning("IBKR ORDER CANCELLED: %s — %s", ticker, detail)
+            return
+        if outcome == "stuck":
+            log.warning(
+                "IBKR ORDER STUCK: %s — status=%s after %.0fs, NOT cancelling. "
+                "Manual intervention required.",
+                ticker, detail, STOP_MAX_WAIT,
+            )
             return
         # timeout
         try:
