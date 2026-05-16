@@ -15,9 +15,8 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 
 # Ensure project root is importable
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -570,39 +569,3 @@ def state() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Streamlit reverse proxy (catch-all — must be last route)
-# ---------------------------------------------------------------------------
-
-_STREAMLIT_BASE = "http://localhost:8501"
-
-
-@app.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "DELETE"])
-async def proxy_streamlit(path: str, request: Request) -> StreamingResponse:
-    """Forward non-/api/* requests to Streamlit running on port 8501."""
-    import httpx
-
-    url = f"{_STREAMLIT_BASE}/{path}"
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(
-            method=request.method,
-            url=url,
-            params=dict(request.query_params),
-            headers=headers,
-            content=await request.body(),
-        )
-    # Strip hop-by-hop headers
-    excluded = {"transfer-encoding", "connection", "content-encoding"}
-    resp_headers = {
-        k: v for k, v in resp.headers.items() if k.lower() not in excluded
-    }
-    return StreamingResponse(
-        content=iter([resp.content]),
-        status_code=resp.status_code,
-        headers=resp_headers,
-    )
