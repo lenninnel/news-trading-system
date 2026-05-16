@@ -380,20 +380,6 @@ class Database:
                     created_at            TEXT    NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS scheduler_logs (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_at           TEXT    NOT NULL,
-                    tickers          TEXT,
-                    success_count    INTEGER NOT NULL DEFAULT 0,
-                    fail_count       INTEGER NOT NULL DEFAULT 0,
-                    elapsed_s        REAL,
-                    total_elapsed_s  REAL,
-                    errors           TEXT,
-                    status           TEXT,
-                    notes            TEXT,
-                    created_at       TEXT    NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS health_checks (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_at           TEXT    NOT NULL,
@@ -411,14 +397,6 @@ class Database:
                     action           TEXT    NOT NULL,
                     reason           TEXT,
                     activated_by     TEXT,
-                    created_at       TEXT    NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    snapshot_at      TEXT    NOT NULL,
-                    total_value      REAL,
-                    positions        TEXT,
                     created_at       TEXT    NOT NULL
                 );
 
@@ -1631,31 +1609,6 @@ class Database:
             )
         # Re-read outside the write transaction so the commit is visible.
         return self.get_drawdown_state()
-
-    @_retry_on_locked
-    def log_scheduler_run(
-        self, run_at: str, tickers: list, success_count: int,
-        fail_count: int, elapsed_s: float, total_elapsed_s: float,
-        errors: list, status: str, notes: str = "",
-    ) -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._file_lock, self._write_lock, self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO scheduler_logs
-                    (run_at, tickers, success_count, fail_count, elapsed_s,
-                     total_elapsed_s, errors, status, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_at, json.dumps(tickers), success_count, fail_count,
-                 elapsed_s, total_elapsed_s, json.dumps(errors), status,
-                 notes, now),
-            )
-            return cur.lastrowid
-
-    # ------------------------------------------------------------------
-    # Generic SQL helper
-    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Signal cache (US_PRE → US_OPEN fast path)

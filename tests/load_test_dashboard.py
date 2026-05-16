@@ -153,22 +153,6 @@ def seed_database(db_path: str, n_rows: int = SEED_ROWS) -> dict[str, int]:
     counts["strategy_signals"]     = n_rows
     counts["strategy_performance"] = n_rows
 
-    # ── scheduler_logs ────────────────────────────────────────────────────────
-    for i in range(min(n_rows, 100)):
-        run_at = (datetime.now(timezone.utc) - timedelta(days=i)).isoformat()
-        db.log_scheduler_run(
-            run_at=run_at,
-            tickers=TICKERS,
-            success_count=random.randint(3, 10),
-            fail_count=random.randint(0, 2),
-            elapsed_s=random.uniform(30, 120),
-            total_elapsed_s=random.uniform(30, 120),
-            errors=[],
-            status="success",
-            notes="Daily run summary",
-        )
-    counts["scheduler_logs"] = min(n_rows, 100)
-
     return counts
 
 
@@ -191,8 +175,6 @@ _DASHBOARD_QUERIES = {
         "ORDER BY s.id DESC LIMIT 50",
     "technical_latest":
         "SELECT * FROM technical_signals ORDER BY id DESC LIMIT 20",
-    "scheduler_history":
-        "SELECT * FROM scheduler_logs ORDER BY id DESC LIMIT 30",
     "ticker_history_AAPL":
         "SELECT * FROM runs WHERE ticker='AAPL' ORDER BY id DESC LIMIT 50",
     "headline_scores_recent":

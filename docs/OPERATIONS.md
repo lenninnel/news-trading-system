@@ -92,14 +92,6 @@ Each run ends with one of three statuses:
 
 Via the dashboard — go to the **Overview** page and look at the last run timestamp.
 
-Via the database directly:
-
-```bash
-sqlite3 news_trading.db \
-  "SELECT run_at, status, signals_generated, trades_executed, duration_seconds \
-   FROM scheduler_logs ORDER BY id DESC LIMIT 5;"
-```
-
 ---
 
 ## 3. Monitoring Performance

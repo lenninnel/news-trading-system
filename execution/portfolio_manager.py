@@ -23,7 +23,6 @@ Sector groups
 CLI
 ---
   python3 -m execution.portfolio_manager --balance 10000
-  python3 -m execution.portfolio_manager --balance 10000 --save-snapshot
 """
 
 from __future__ import annotations
@@ -543,37 +542,6 @@ class PortfolioManager:
         return actions
 
     # ------------------------------------------------------------------
-    # Snapshot persistence
-    # ------------------------------------------------------------------
-
-    def save_snapshot(self) -> int:
-        """Persist the current portfolio state to portfolio_snapshots and return ID."""
-        now      = datetime.now(timezone.utc).isoformat()
-        div      = self.get_diversification_metrics()
-        risk     = self.check_risk_limits()
-
-        # Today's violation count
-        today = datetime.now().strftime("%Y-%m-%d")
-        violations_today = self._count_violations_today(today)
-
-        max_conc = risk["max_concentration"]
-
-        return self._db.log_portfolio_snapshot(
-            snapshot_at       = now,
-            open_positions    = div["open_positions"],
-            total_value       = div["total_value"],
-            deployed_pct      = div["deployed_pct"],
-            cash_reserve      = div["cash_reserve"],
-            portfolio_beta    = risk["beta"],
-            portfolio_vol     = risk["volatility"],
-            avg_correlation   = risk["avg_correlation"],
-            max_concentration = max_conc,
-            sector_json       = json.dumps(div["by_sector"]),
-            strategy_json     = json.dumps(div["by_strategy"]),
-            violations_today  = violations_today,
-        )
-
-    # ------------------------------------------------------------------
     # Capacity summary (for CLI and display)
     # ------------------------------------------------------------------
 
@@ -939,19 +907,10 @@ def main() -> None:
         metavar="USD",
         help="Account balance for deployment % calculations (default: 10000).",
     )
-    parser.add_argument(
-        "--save-snapshot",
-        action="store_true",
-        help="Persist a portfolio_snapshots row after printing.",
-    )
     args = parser.parse_args()
 
     pm = PortfolioManager(account_balance=args.balance)
     _print_portfolio_state(pm)
-
-    if args.save_snapshot:
-        snap_id = pm.save_snapshot()
-        print(f"  Snapshot saved (id={snap_id})\n")
 
 
 if __name__ == "__main__":

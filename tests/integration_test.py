@@ -226,13 +226,6 @@ class TestDatabaseLayer(IntegrationTestBase):
         es_id = db.log_emergency_stop("stop_trading", "test", "pytest")
         self.assertIsInstance(es_id, int)
 
-        # Scheduler log
-        sl_id = db.log_scheduler_run(
-            datetime.now(timezone.utc).isoformat(),
-            ["AAPL"], 1, 0, 0.0, 5.2, [], "success", "Test run",
-        )
-        self.assertIsInstance(sl_id, int)
-
     def test_all_tables_created(self):
         import sqlite3
         from storage.database import Database
@@ -245,8 +238,8 @@ class TestDatabaseLayer(IntegrationTestBase):
         expected = {
             "runs", "headline_scores", "technical_signals", "combined_signals",
             "risk_calculations", "strategy_signals", "strategy_performance",
-            "scheduler_logs", "health_checks", "emergency_stops",
-            "portfolio_snapshots", "portfolio_violations", "price_alerts",
+            "health_checks", "emergency_stops",
+            "portfolio_violations", "price_alerts",
             "optimization_results", "backtest_results", "screener_results",
             "backtest_strategy_comparison",
         }

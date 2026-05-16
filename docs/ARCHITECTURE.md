@@ -493,24 +493,6 @@ Complete paper-trade log.
 | take_profit | REAL | |
 | pnl | REAL | Realised P&L (SELL trades only) |
 
-### Table: `scheduler_logs`
-
-Daily scheduler run summaries.
-
-| Column | Type | Notes |
-|---|---|---|
-| id | INTEGER PK | |
-| run_at | TEXT | ISO-8601 UTC start time |
-| tickers | TEXT | JSON array of analysed tickers |
-| signals_generated | INTEGER | |
-| trades_executed | INTEGER | |
-| portfolio_value | REAL | Total portfolio at end of run |
-| duration_seconds | REAL | Wall-clock run time |
-| errors | TEXT | JSON array of error strings |
-| status | TEXT | success / partial / failed |
-| summary | TEXT | Human-readable one-pager |
-| created_at | TEXT | ISO-8601 UTC |
-
 ### Table: `backtest_results`
 
 Historical backtest run summaries.

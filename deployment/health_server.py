@@ -69,15 +69,8 @@ def _check_newsapi() -> tuple[bool, str]:
 
 def _last_scheduler_run() -> str | None:
     """Return ISO timestamp of the most recent scheduler run, or None."""
-    try:
-        from storage.database import Database
-        db = Database()
-        rows = db._select(
-            "SELECT run_at FROM scheduler_logs ORDER BY id DESC LIMIT 1"
-        )
-        return rows[0]["run_at"] if rows else None
-    except Exception:
-        return None
+    # scheduler_logs table removed 2026-05-16; see git history
+    return None
 
 
 @app.get("/health")

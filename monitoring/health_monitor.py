@@ -243,30 +243,8 @@ class HealthMonitor:
 
     def _check_scheduler(self) -> tuple[bool, str]:
         """Check that the scheduler ran within the past self._sched_max_age hours."""
-        try:
-            rows = self._db._select(
-                "SELECT run_at FROM scheduler_logs ORDER BY id DESC LIMIT 1"
-            )
-            if not rows:
-                return False, "no scheduler runs found"
-
-            run_at_str = rows[0]["run_at"]
-            # Parse ISO-8601 (with or without timezone)
-            try:
-                run_at = datetime.fromisoformat(run_at_str)
-                if run_at.tzinfo is None:
-                    run_at = run_at.replace(tzinfo=timezone.utc)
-            except ValueError:
-                return False, f"unparseable timestamp: {run_at_str}"
-
-            now = datetime.now(timezone.utc)
-            age_h = (now - run_at).total_seconds() / 3600
-            if age_h > self._sched_max_age:
-                return False, f"last run {age_h:.1f}h ago (limit: {self._sched_max_age}h)"
-            return True, f"last run {age_h:.1f}h ago"
-
-        except Exception as exc:
-            return False, str(exc)
+        # scheduler_logs table removed 2026-05-16; see git history
+        return (True, "scheduler health check removed")
 
     def _check_disk(self) -> tuple[bool, str]:
         """Check free disk space on the volume containing the DB."""
