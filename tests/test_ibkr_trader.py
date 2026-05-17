@@ -32,6 +32,9 @@ def _make_trader(ib=None, **env_overrides):
     mock_db.log_trade_history.return_value = 42
     with patch.dict(os.environ, env_overrides, clear=False):
         trader = IBKRTrader(db=mock_db, ib=mock_ib)
+    # Patch _new_ib_client so reconnect()'s "discard old, build new"
+    # pattern lands on the same mock instead of a real ib_insync.IB().
+    trader._new_ib_client = MagicMock(return_value=mock_ib)
     # Inject mock Stock/MarketOrder so track_trade/close_position work
     trader._Stock = MagicMock()
     trader._MarketOrder = MagicMock()
@@ -104,12 +107,6 @@ class TestIBKRReconnection:
         mock_ib.isConnected.side_effect = Exception("socket error")
         assert trader.is_connected() is False
 
-    @pytest.mark.skip(
-        reason="Broken under post-2026-05-11 threading model — "
-               "mocks don't model IB event-loop thread dispatch "
-               "(see reference_ibkr_threading.md). "
-               "TODO: rewrite mocks to model the dispatch thread."
-    )
     def test_reconnect_success(self):
         """reconnect disconnects then reconnects successfully."""
         trader, mock_ib, _ = _make_trader()
@@ -135,12 +132,6 @@ class TestIBKRReconnection:
         # disconnect should NOT be called — no reconnect needed
         mock_ib.disconnect.assert_not_called()
 
-    @pytest.mark.skip(
-        reason="Broken under post-2026-05-11 threading model — "
-               "mocks don't model IB event-loop thread dispatch "
-               "(see reference_ibkr_threading.md). "
-               "TODO: rewrite mocks to model the dispatch thread."
-    )
     def test_ensure_connected_triggers_reconnect(self):
         """ensure_connected triggers reconnect on stale connection."""
         trader, mock_ib, _ = _make_trader()
