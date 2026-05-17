@@ -1,0 +1,10 @@
+[Unit]
+Description=NTS daily SQLite backup timer
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+Unit=nts-backup.service
+
+[Install]
+WantedBy=timers.target
