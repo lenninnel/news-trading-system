@@ -736,9 +736,11 @@ class DailyScheduler:
         print(f"[scheduler] Daemon started — full watchlist: "
               f"{', '.join(self._full_watchlist)}", flush=True)
 
-        # Startup sanity: purge ghost positions AND trades with stale prices.
-        # The $200 threshold catches test-fixture prices ($150) while leaving
-        # all real trades intact (cheapest watchlist stock is well above $200).
+        # Startup sanity: purge ghost positions AND trades with known
+        # test-fixture prices. Mechanism is an exact-match whitelist
+        # (see scripts/clean_ghost_trades.py:_KNOWN_TEST_PRICES) NOT a
+        # <$200 threshold — the threshold approach deleted real TOL/XOM
+        # trades on 2026-05-05 (fixed in commit 0bf2ba0).
         try:
             from scripts.clean_ghost_trades import clean_ghost_data, _resolve_db_path
             db_path = _resolve_db_path()
@@ -747,7 +749,7 @@ class DailyScheduler:
             n_trades = result["deleted_trades"]
             if n_pos or n_trades:
                 log.warning(
-                    "[startup] Ghost cleanup: deleted %d positions, %d trades (price < $200)",
+                    "[startup] Ghost cleanup: deleted %d positions, %d trades (fixture-price match)",
                     n_pos, n_trades,
                 )
                 print(f"[scheduler] Startup cleanup: removed {n_pos} ghost positions, "
@@ -760,7 +762,7 @@ class DailyScheduler:
                         )
                         self._tg._send(
                             f"\u26a0\ufe0f *Startup ghost cleanup*\n"
-                            f"Deleted {n_pos} positions, {n_trades} trades (price < $200)\n"
+                            f"Deleted {n_pos} positions, {n_trades} trades (fixture-price match)\n"
                             f"Positions: {details or 'none'}"
                         )
                     except Exception:
