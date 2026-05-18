@@ -271,16 +271,25 @@ _XETRA_TICKERS: list[str] = []
 #   "execution" — validate yesterday's EOD signals, execute if conditions hold
 #   "monitor"   — lightweight position check only, no new signals
 #
-# Schedule: 7 runs per weekday, all times UTC
+# Schedule: 8 runs per weekday, all times UTC.
+# Times come from config/sessions.py (single source of truth shared
+# with api/main.py); per-session metadata stays here.
+from config.sessions import SCHEDULE as _BASE_SCHEDULE
+
+_SESSION_METADATA = {
+    "XETRA_PRE":      {"tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
+    "XETRA_OPEN":     {"tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
+    "PREMARKET_SCAN": {"tickers": None,           "workers": 1, "eod": False, "session_type": "scanner"},
+    "US_PRE":         {"tickers": None,           "workers": 3, "eod": False, "session_type": "signal"},
+    "PEAD_OPEN":      {"tickers": None,           "workers": 3, "eod": False, "session_type": "signal"},
+    "US_OPEN":        {"tickers": None,           "workers": 3, "eod": False, "session_type": "execution"},
+    "MIDDAY":         {"tickers": None,           "workers": 3, "eod": False, "session_type": "monitor"},
+    "EOD":            {"tickers": None,           "workers": 3, "eod": True,  "session_type": "signal"},
+}
+
 SCHEDULE = [
-    {"name": "XETRA_PRE",     "hour": 6,  "minute": 45, "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
-    {"name": "XETRA_OPEN",    "hour": 7,  "minute": 0,  "tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "signal"},
-    {"name": "PREMARKET_SCAN","hour": 13, "minute": 0,  "tickers": None,            "workers": 1, "eod": False, "session_type": "scanner"},
-    {"name": "US_PRE",        "hour": 13, "minute": 15, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
-    {"name": "PEAD_OPEN",     "hour": 13, "minute": 45, "tickers": None,            "workers": 3, "eod": False, "session_type": "signal"},
-    {"name": "US_OPEN",       "hour": 14, "minute": 30, "tickers": None,            "workers": 3, "eod": False, "session_type": "execution"},
-    {"name": "MIDDAY",        "hour": 18, "minute": 0,  "tickers": None,            "workers": 3, "eod": False, "session_type": "monitor"},
-    {"name": "EOD",           "hour": 22, "minute": 15, "tickers": None,            "workers": 3, "eod": True,  "session_type": "signal"},
+    {**entry, **_SESSION_METADATA[entry["name"]]}
+    for entry in _BASE_SCHEDULE
 ]
 
 # ── Weekly jobs ──────────────────────────────────────────────────────────────

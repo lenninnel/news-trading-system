@@ -27,6 +27,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from config.settings import DB_PATH  # noqa: E402
+from config.sessions import SCHEDULE as _SCHEDULE  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -78,18 +79,6 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
 def _query_one(sql: str, params: tuple = ()) -> dict | None:
     rows = _query(sql, params)
     return rows[0] if rows else None
-
-
-# ---------------------------------------------------------------------------
-# Schedule constants (mirrored from scheduler — no imports from scheduler)
-# ---------------------------------------------------------------------------
-
-_SCHEDULE = [
-    {"name": "XETRA_OPEN", "hour": 7, "minute": 0},
-    {"name": "US_OPEN", "hour": 14, "minute": 30},
-    {"name": "MIDDAY", "hour": 18, "minute": 0},
-    {"name": "EOD", "hour": 22, "minute": 15},
-]
 
 
 def _load_watchlist() -> list[str]:
