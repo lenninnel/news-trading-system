@@ -134,9 +134,12 @@ def status() -> dict:
     last, nxt = _last_and_next_session()
     today = date.today()
 
-    # Check signal_events for the actual last run
+    # Check signal_events for the actual last run.
+    # Filter out PositionManager/etc. rows that have session=NULL —
+    # we want the last row that actually belonged to a named session.
     last_event = _query_one(
-        "SELECT session, timestamp FROM signal_events ORDER BY id DESC LIMIT 1"
+        "SELECT session, timestamp FROM signal_events "
+        "WHERE session IS NOT NULL ORDER BY id DESC LIMIT 1"
     )
 
     last_session_name = None
@@ -312,9 +315,12 @@ def trades(limit: int = Query(default=50, ge=1, le=200)) -> dict:
 def performance() -> dict:
     today_str = date.today().isoformat()
 
-    # Total trades
+    # Total CLOSED trades. trade_history contains both BUY (open
+    # position) and SELL (closed) rows; only SELL with realized pnl
+    # belongs in the win-rate denominator.
     trades_row = _query_one(
-        "SELECT COUNT(*) AS cnt FROM trade_history"
+        "SELECT COUNT(*) AS cnt FROM trade_history "
+        "WHERE action = 'SELL' AND pnl IS NOT NULL"
     )
     total_trades = trades_row["cnt"] if trades_row else 0
 
@@ -358,7 +364,7 @@ def performance() -> dict:
         "signals_today": signals_today,
         "strong_buy_today": strong_buy_today,
         "sessions_today": sessions_today,
-        "sessions_total": 4,
+        "sessions_total": len(_SCHEDULE),
     }
 
 
