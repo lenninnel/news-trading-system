@@ -37,6 +37,17 @@ DST_DIR = Path(
 RETENTION_DAYS = int(os.environ.get("NTS_BACKUP_RETENTION_DAYS", "14"))
 MIN_BYTES = int(os.environ.get("NTS_BACKUP_MIN_BYTES", "1000000"))
 
+# R2 off-host replication config. rclone is installed user-local at
+# ~/bin/rclone (no sudo); reference via explicit path so systemd
+# --user context doesn't depend on PATH inheritance.
+RCLONE_BIN = os.environ.get(
+    "NTS_RCLONE_BIN",
+    str(Path.home() / "bin" / "rclone"),
+)
+R2_ENABLED = os.environ.get("NTS_BACKUP_R2_ENABLED", "true").lower() == "true"
+R2_REMOTE = os.environ.get("NTS_BACKUP_R2_REMOTE", "r2:nts-backup/daily")
+R2_RETENTION_DAYS = int(os.environ.get("NTS_BACKUP_R2_RETENTION_DAYS", "14"))
+
 
 def _log(msg: str) -> None:
     """Single-line timestamped log — journalctl-friendly."""
@@ -97,6 +108,51 @@ def main() -> int:
         return 1
 
     _log(f"backup ok size={size} bytes")
+
+    # ── R2 replication (fail-soft) ──────────────────────────────
+    # R2 push failures log WARN but never fail the backup. Local
+    # integrity is the primary success criterion; off-host is
+    # secondary disaster-recovery insurance.
+    #
+    # --s3-no-check-bucket: bucket-scoped tokens deny CreateBucket
+    # (which rclone calls by default before copy). The bucket exists;
+    # skip the check.
+    if R2_ENABLED:
+        import subprocess
+        _log(f"R2 push start: {dst_path.name} -> {R2_REMOTE}/")
+        try:
+            result = subprocess.run(
+                [RCLONE_BIN, "copy", str(dst_path), R2_REMOTE + "/",
+                 "--s3-no-check-bucket",
+                 "--retries", "2", "--low-level-retries", "2",
+                 "--timeout", "60s"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                _log(f"WARN R2 push failed (rc={result.returncode}): "
+                     f"{result.stderr.strip()[:300]}")
+            else:
+                _log("R2 push ok")
+                prune_result = subprocess.run(
+                    [RCLONE_BIN, "delete", R2_REMOTE + "/",
+                     "--s3-no-check-bucket",
+                     "--min-age", f"{R2_RETENTION_DAYS}d",
+                     "--include", "news_trading_*.db"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if prune_result.returncode != 0:
+                    _log(f"WARN R2 prune failed: "
+                         f"{prune_result.stderr.strip()[:200]}")
+                else:
+                    _log("R2 prune ok")
+        except subprocess.TimeoutExpired:
+            _log("WARN R2 push timed out after 120s")
+        except FileNotFoundError:
+            _log(f"WARN R2 push skipped: rclone not found at {RCLONE_BIN}")
+        except Exception as exc:
+            _log(f"WARN R2 push exception: {exc!r}")
+    else:
+        _log("R2 push disabled (NTS_BACKUP_R2_ENABLED=false)")
 
     # Prune older backups
     cutoff = date.today() - timedelta(days=RETENTION_DAYS)
