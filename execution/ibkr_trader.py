@@ -469,6 +469,8 @@ class IBKRTrader:
         price: float,
         stop_loss: float | None = None,
         take_profit: float | None = None,
+        strategy: str | None = None,
+        intended_price: float | None = None,
         **kwargs: Any,
     ) -> dict:
         """Submit a market order to IBKR, wait for fill, sync locally."""
@@ -530,9 +532,49 @@ class IBKRTrader:
             fill_price = trade.orderStatus.avgFillPrice or price
             pnl = self._sync_position(ticker, action, shares, fill_price)
 
+            # Telemetry capture for execution-quality split.  Each value is
+            # isolated so a single failure (e.g. malformed CommissionReport
+            # on an exotic order) cannot block the trade record itself.
+            _intended_val = None
+            try:
+                _intended_val = intended_price if intended_price is not None else price
+            except Exception as exc:
+                log.warning("[%s] intended_price capture failed (non-fatal): %s", ticker, exc)
+            _executed_val = None
+            try:
+                _executed_val = fill_price
+            except Exception as exc:
+                log.warning("[%s] executed_price capture failed (non-fatal): %s", ticker, exc)
+            _commission_val: float | None = None
+            try:
+                fills = getattr(trade, "fills", None) or []
+                total = 0.0
+                seen_any = False
+                for f in fills:
+                    cr = getattr(f, "commissionReport", None)
+                    if cr is None:
+                        continue
+                    c = getattr(cr, "commission", None)
+                    if c is None:
+                        continue
+                    total += float(c)
+                    seen_any = True
+                _commission_val = total if seen_any else None
+            except Exception as exc:
+                log.warning("[%s] commission parse failed (non-fatal): %s", ticker, exc)
+            _strategy_val = None
+            try:
+                _strategy_val = strategy
+            except Exception as exc:
+                log.warning("[%s] strategy capture failed (non-fatal): %s", ticker, exc)
+
             trade_id = self._db.log_trade_history(
                 ticker=ticker, action=action, shares=shares, price=fill_price,
                 stop_loss=stop_loss, take_profit=take_profit, pnl=pnl,
+                strategy=_strategy_val,
+                commission=_commission_val,
+                intended_price=_intended_val,
+                executed_price=_executed_val,
             )
 
             log.info(

@@ -361,9 +361,26 @@ class PriceMonitor:
         """Sell all shares of *pos* at *price* via PaperTrader."""
         ticker = pos["ticker"]
         shares = pos["shares"]
+        # Carry the entry strategy onto the exit row.  Failure-soft —
+        # an unreadable position_metadata.strategy must not block the SELL.
+        entry_strategy: str | None = None
+        try:
+            import sqlite3
+            with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+                row = conn.execute(
+                    "SELECT strategy FROM position_metadata WHERE ticker = ?",
+                    (ticker.upper(),),
+                ).fetchone()
+            if row and row[0]:
+                entry_strategy = row[0]
+        except Exception as exc:
+            log.warning(
+                "[%s] entry-strategy lookup failed (non-fatal): %s", ticker, exc,
+            )
         try:
             trade_id = self._paper_trader.track_trade(
                 ticker=ticker, action="SELL", shares=shares, price=price,
+                strategy=entry_strategy, intended_price=price,
             )
             log.info(
                 "Auto-closed %s × %d sh @ $%.2f  (trade #%s)",

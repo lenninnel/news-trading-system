@@ -484,14 +484,29 @@ Complete paper-trade log.
 | Column | Type | Notes |
 |---|---|---|
 | id | INTEGER PK | |
-| timestamp | TEXT | ISO-8601 UTC |
+| created_at | TEXT | ISO-8601 UTC |
 | ticker | TEXT | |
 | action | TEXT | BUY / SELL |
 | shares | INTEGER | |
-| price | REAL | Execution price |
+| price | REAL | Execution price (kept for backward compat; equals `executed_price` for new rows) |
 | stop_loss | REAL | |
 | take_profit | REAL | |
 | pnl | REAL | Realised P&L (SELL trades only) |
+| strategy | TEXT | Per-trade attribution captured at execution time. One of `Momentum`, `Pullback`, `NewsCatalyst`, `Combined`, `PEAD`. `NULL` for trades recorded before 2026-05-20 — queries that group by strategy must handle the NULL bucket explicitly (e.g. via `COALESCE(strategy, 'unknown')`). |
+| commission | REAL | Broker commission for the fill, in account currency. Populated for IBKR fills; `NULL` for paper trades and any trade where the broker did not return a `CommissionReport`. |
+| intended_price | REAL | Price the strategy saw at signal-trigger time (before the broker round-trip). Compared against `executed_price` to quantify slippage. `NULL` on historical rows. |
+| executed_price | REAL | Actual fill price returned by the broker. Equals `price` for new rows; both columns retained so legacy queries against `price` continue to work. `NULL` on historical rows. |
+
+#### `strategy` values
+
+- **`Momentum`** / **`Pullback`** / **`NewsCatalyst`** — single-strategy attribution, used if a trade is ever placed directly from one of those strategies without going through the cluster fusion. The system currently routes everything through the cluster, so these labels are reserved for future direct-strategy execution paths.
+- **`Combined`** — the trade was triggered by the cluster-fused ensemble verdict over Momentum + Pullback + NewsCatalyst votes. Every trade emitted from `Coordinator.run_combined` / `Coordinator.run_combined_us_open` carries this label, including the `FUSION_FALLBACK` path. This bucket is intentionally distinct from `Momentum`/`Pullback`/`NewsCatalyst`: it represents the ensemble, not any individual contributor.
+- **`PEAD`** — emitted by the post-earnings-announcement-drift strategy (`PEADStrategy`); a pure-data path that bypasses the cluster.
+- **`NULL`** — pre-2026-05-20 historical rows, or any trade where attribution capture failed (the trade still records — telemetry is failure-soft, never blocks execution).
+
+#### Historical caveat
+
+Rows written before the migration (2026-05-20) have `NULL` for `strategy`, `commission`, `intended_price`, and `executed_price`. The migration is purely additive: existing rows are never updated. Analytics that span the migration boundary must either filter `WHERE strategy IS NOT NULL` or, for groupings, bucket the historical rows separately (the `NULL` bucket is not the same as the `Combined` bucket).
 
 ### Table: `backtest_results`
 

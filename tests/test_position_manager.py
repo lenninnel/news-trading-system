@@ -111,9 +111,11 @@ class TestStopLoss:
         with patch.object(pm, "_fetch_current_price", return_value=189.0):
             results = pm._check_all_positions()
 
-        # Should have sold
+        # Should have sold. _close_position also threads attribution +
+        # intended_price onto the SELL — see DEV-Q-001-INFRA P1.
         trader.track_trade.assert_called_once_with(
             ticker="AAPL", action="SELL", shares=10, price=189.0,
+            strategy=None, intended_price=189.0,
         )
         # Telegram alert sent
         notifier.send_price_alert.assert_called_once()
@@ -217,6 +219,7 @@ class TestTakeProfit:
 
         trader.track_trade.assert_called_once_with(
             ticker="MSFT", action="SELL", shares=5, price=445.0,
+            strategy=None, intended_price=445.0,
         )
         alert_msg = notifier.send_price_alert.call_args[0][0]
         assert "Take-profit" in alert_msg

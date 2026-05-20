@@ -81,6 +81,8 @@ class PaperTrader:
         price: float,
         stop_loss: "float | None" = None,
         take_profit: "float | None" = None,
+        strategy: "str | None" = None,
+        intended_price: "float | None" = None,
         **kwargs: Any,
     ) -> dict:
         """
@@ -175,6 +177,26 @@ class PaperTrader:
                         current_value=round(remaining * price, 2),
                     )
 
+        # Each new-column value is captured in its own try/except so a
+        # telemetry hiccup (e.g. position_metadata lookup) NEVER blocks
+        # the trade record itself.
+        _strategy = None
+        try:
+            _strategy = strategy
+        except Exception as exc:
+            log.warning("trade_history.strategy capture failed (non-fatal): %s", exc)
+        _intended = None
+        try:
+            _intended = intended_price if intended_price is not None else price
+        except Exception as exc:
+            log.warning("trade_history.intended_price capture failed (non-fatal): %s", exc)
+        # Paper trades have no broker round-trip — executed price equals
+        # the price the caller passed; commission is unknown (None).
+        _executed = None
+        try:
+            _executed = price
+        except Exception as exc:
+            log.warning("trade_history.executed_price capture failed (non-fatal): %s", exc)
         trade_id = self._db.log_trade_history(
             ticker=ticker,
             action=action,
@@ -183,6 +205,10 @@ class PaperTrader:
             stop_loss=stop_loss,
             take_profit=take_profit,
             pnl=pnl,
+            strategy=_strategy,
+            commission=None,
+            intended_price=_intended,
+            executed_price=_executed,
         )
 
         return {

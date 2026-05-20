@@ -485,6 +485,30 @@ class PositionManager:
     # Trade execution
     # ------------------------------------------------------------------
 
+    def _resolve_entry_strategy(self, ticker: str) -> str | None:
+        """Look up the strategy that opened this position.
+
+        Reads position_metadata.strategy.  Returns None if the row is
+        missing, the column is unset, or the lookup raises — callers
+        treat None as "attribution unknown" and the SELL still records.
+        """
+        if self._db is None:
+            return None
+        try:
+            import sqlite3
+            with sqlite3.connect(self._db.db_path, timeout=5.0) as conn:
+                row = conn.execute(
+                    "SELECT strategy FROM position_metadata WHERE ticker = ?",
+                    (ticker.upper(),),
+                ).fetchone()
+            if row and row[0]:
+                return row[0]
+        except Exception as exc:
+            log.warning(
+                "[%s] entry-strategy lookup failed (non-fatal): %s", ticker, exc,
+            )
+        return None
+
     def _close_position(
         self, ticker: str, shares: int, price: float,
     ) -> dict | None:
@@ -496,8 +520,12 @@ class PositionManager:
         so the monitor loop keeps running.
         """
         try:
+            # Carry the entry strategy onto the exit row so attribution
+            # surfaces in the per-strategy PnL views.  Failure-soft.
+            entry_strategy = self._resolve_entry_strategy(ticker)
             result = self._trader.track_trade(
                 ticker=ticker, action="SELL", shares=shares, price=price,
+                strategy=entry_strategy, intended_price=price,
             )
             log.info("Close requested: %s %d shares @ $%.2f", ticker, shares, price)
             return result
