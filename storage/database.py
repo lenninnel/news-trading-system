@@ -566,6 +566,23 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+            # Migrate existing DBs: strategy attribution + execution-quality
+            # split on trade_history.  Existing rows keep NULL; populated at
+            # execution for new trades.  `price` is preserved as-is for
+            # backward compat (continues to mirror the executed fill price).
+            for col, typedef in [
+                ("strategy",       "TEXT"),
+                ("commission",     "REAL"),
+                ("intended_price", "REAL"),
+                ("executed_price", "REAL"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE trade_history ADD COLUMN {col} {typedef}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -991,18 +1008,34 @@ class Database:
         stop_loss: "float | None" = None,
         take_profit: "float | None" = None,
         pnl: float = 0.0,
+        strategy: "str | None" = None,
+        commission: "float | None" = None,
+        intended_price: "float | None" = None,
+        executed_price: "float | None" = None,
     ) -> int:
         """
         Append an immutable trade record and return its auto-generated ID.
 
         Args:
-            ticker:      Stock ticker symbol.
-            action:      "BUY" or "SELL".
-            shares:      Number of shares traded.
-            price:       Fill price per share.
-            stop_loss:   Stop-loss price (None if not set).
-            take_profit: Take-profit price (None if not set).
-            pnl:         Realised PnL (0.0 for buys).
+            ticker:         Stock ticker symbol.
+            action:         "BUY" or "SELL".
+            shares:         Number of shares traded.
+            price:          Fill price per share (kept for backward compat;
+                            mirrors ``executed_price`` for new rows).
+            stop_loss:      Stop-loss price (None if not set).
+            take_profit:    Take-profit price (None if not set).
+            pnl:            Realised PnL (0.0 for buys).
+            strategy:       Attribution at execution time.  One of
+                            "Momentum" | "Pullback" | "NewsCatalyst" |
+                            "Combined" | "PEAD".  None for historical rows.
+            commission:     Broker commission for the fill, in account
+                            currency.  None when unknown (paper trades).
+            intended_price: Price at signal-trigger time, captured by the
+                            caller before the broker round-trip.  Together
+                            with executed_price quantifies slippage.
+            executed_price: Actual fill price returned by the broker.  Equals
+                            ``price`` for new rows; both retained so legacy
+                            queries against ``price`` keep working.
 
         Returns:
             The integer primary key of the newly inserted row.
@@ -1012,10 +1045,12 @@ class Database:
             cur = conn.execute(
                 """
                 INSERT INTO trade_history
-                    (ticker, action, shares, price, stop_loss, take_profit, pnl, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, action, shares, price, stop_loss, take_profit, pnl, created_at,
+                     strategy, commission, intended_price, executed_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ticker, action, shares, price, stop_loss, take_profit, pnl, now),
+                (ticker, action, shares, price, stop_loss, take_profit, pnl, now,
+                 strategy, commission, intended_price, executed_price),
             )
             return cur.lastrowid
 

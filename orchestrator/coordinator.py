@@ -28,6 +28,30 @@ SELL       HOLD       WEAK SELL
 BUY        SELL       CONFLICTING
 SELL       BUY        CONFLICTING
 HOLD       *          HOLD
+
+Per-trade strategy attribution (trade_history.strategy)
+-------------------------------------------------------
+At every ``paper_trader.track_trade`` call site we resolve which strategy
+"owns" the trade and pass it as ``strategy=...`` so trade_history captures
+attribution at the moment of execution.  Resolution rules:
+
+    PEAD path (run_combined PEAD branch)         → "PEAD"
+    PEAD-overridden cluster (run_combined_us_open
+        when ``strat_name == "PEAD"``)           → "PEAD"
+    Cluster-fused run_combined                   → "Combined"
+    Cluster-fused run_combined_us_open           → "Combined"
+    Cached US_OPEN executor                      → passes through
+        ``strat_name`` (already resolved from
+        ``signal_events.strategy`` / forward
+        signal at line ~2263; "Combined", "PEAD",
+        or a single-strategy label as recorded).
+
+The cluster-fused paths cover signal_path ∈ {CLUSTER, CLUSTER_PARTIAL,
+FUSION_FALLBACK} — every path that takes votes from Momentum + Pullback +
+NewsCatalyst and emits an ensemble verdict.  This is intentionally
+distinct from ``strat_name`` (= router primary), which still drives the
+SL/TP override and the per-strategy portfolio caps but does *not*
+identify the signal source.
 """
 
 from __future__ import annotations
@@ -521,6 +545,9 @@ class Coordinator:
                                     ticker,
                                 )
                             else:
+                                # PEAD-emitted trade: pure data-driven, single
+                                # strategy.  intended_price == the signal-time
+                                # market price (passed in `price`).
                                 execution = self.paper_trader.track_trade(
                                     ticker=ticker,
                                     action=risk["direction"],
@@ -528,6 +555,8 @@ class Coordinator:
                                     price=price,
                                     stop_loss=risk["stop_loss"],
                                     take_profit=risk["take_profit"],
+                                    strategy="PEAD",
+                                    intended_price=price,
                                 )
                                 if execution and execution.get("trade_id"):
                                     try:
@@ -1300,6 +1329,17 @@ class Coordinator:
                     )
                     execution = None
                 else:
+                    # Cluster-fused path (run_combined): the signal that
+                    # triggered this trade is the ensemble verdict over
+                    # Momentum + Pullback + NewsCatalyst votes (signal_path
+                    # is one of CLUSTER, CLUSTER_PARTIAL, FUSION_FALLBACK),
+                    # so the per-trade attribution is "Combined".  Note
+                    # this is *intentionally* distinct from `strat_name`
+                    # (= router primary), which still drives SL/TP and the
+                    # per-strategy portfolio caps.
+                    trade_strategy = (
+                        "PEAD" if strat_name == "PEAD" else "Combined"
+                    )
                     execution = self.paper_trader.track_trade(
                         ticker=ticker,
                         action=risk["direction"],
@@ -1307,6 +1347,8 @@ class Coordinator:
                         price=price,
                         stop_loss=risk["stop_loss"],
                         take_profit=risk["take_profit"],
+                        strategy=trade_strategy,
+                        intended_price=price,
                     )
                     if execution and execution.get("trade_id"):
                         try:
@@ -1740,6 +1782,14 @@ class Coordinator:
                                 ticker,
                             )
                         else:
+                            # Cluster-fused path (run_combined_us_open).
+                            # Same attribution rule as run_combined above:
+                            # the actual signal is the ensemble verdict, so
+                            # per-trade strategy = "Combined" (or "PEAD" if
+                            # PEAD overrode the cluster, line ~1565).
+                            trade_strategy = (
+                                "PEAD" if strat_name == "PEAD" else "Combined"
+                            )
                             execution = self.paper_trader.track_trade(
                                 ticker=ticker,
                                 action=risk["direction"],
@@ -1747,6 +1797,8 @@ class Coordinator:
                                 price=price,
                                 stop_loss=risk["stop_loss"],
                                 take_profit=risk["take_profit"],
+                                strategy=trade_strategy,
+                                intended_price=price,
                             )
                             # Register / clear position metadata so the
                             # per-strategy and per-sector caps actually
@@ -2301,6 +2353,12 @@ class Coordinator:
                                     ticker,
                                 )
                             else:
+                                # Cached US_OPEN executor — `strat_name` was
+                                # resolved from cached signal_events.strategy
+                                # (or the forward signal's strategy_name) at
+                                # line ~2263, so it already reflects the true
+                                # source of the original signal ("Combined"
+                                # for cluster-fused, "PEAD" for PEAD, etc.).
                                 execution = self.paper_trader.track_trade(
                                     ticker=ticker,
                                     action=risk["direction"],
@@ -2308,6 +2366,8 @@ class Coordinator:
                                     price=current_price,
                                     stop_loss=risk["stop_loss"],
                                     take_profit=risk["take_profit"],
+                                    strategy=strat_name if strat_name != "unknown" else None,
+                                    intended_price=current_price,
                                 )
                                 log.info(
                                     "[%s] Cached signal executed: %s %d shares @ %.2f",

@@ -106,6 +106,8 @@ class AlpacaTrader:
         price: float,
         stop_loss: "float | None" = None,
         take_profit: "float | None" = None,
+        strategy: "str | None" = None,
+        intended_price: "float | None" = None,
         **kwargs: Any,
     ) -> dict:
         """
@@ -257,6 +259,21 @@ class AlpacaTrader:
         # Sync position to local DB
         pnl = self._sync_position(ticker, action, shares, fill_price)
 
+        _intended_val = None
+        try:
+            _intended_val = intended_price if intended_price is not None else price
+        except Exception as exc:
+            log.warning("intended_price capture failed (non-fatal): %s", exc)
+        _executed_val = None
+        try:
+            _executed_val = fill_price
+        except Exception as exc:
+            log.warning("executed_price capture failed (non-fatal): %s", exc)
+        _strategy_val = None
+        try:
+            _strategy_val = strategy
+        except Exception as exc:
+            log.warning("strategy capture failed (non-fatal): %s", exc)
         trade_id = self._db.log_trade_history(
             ticker=ticker,
             action=action,
@@ -265,6 +282,10 @@ class AlpacaTrader:
             stop_loss=stop_loss,
             take_profit=take_profit,
             pnl=pnl,
+            strategy=_strategy_val,
+            commission=None,
+            intended_price=_intended_val,
+            executed_price=_executed_val,
         )
 
         log.info(
