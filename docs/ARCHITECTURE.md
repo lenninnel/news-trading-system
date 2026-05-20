@@ -508,6 +508,15 @@ Complete paper-trade log.
 
 Rows written before the migration (2026-05-20) have `NULL` for `strategy`, `commission`, `intended_price`, and `executed_price`. The migration is purely additive: existing rows are never updated. Analytics that span the migration boundary must either filter `WHERE strategy IS NOT NULL` or, for groupings, bucket the historical rows separately (the `NULL` bucket is not the same as the `Combined` bucket).
 
+#### SELL-leg attribution (round-trip consistency)
+
+For cluster-fused trades `trade_history.strategy` ("Combined") and `position_metadata.strategy` (router primary — Momentum / Pullback) intentionally diverge. The two columns answer different questions:
+
+- **`trade_history.strategy`** = *research attribution* — which signal source produced this trade. This is what PnL grouping, backtest comparisons, and forward-attribution reports should join on. Both legs of a round-trip carry the same value: the SELL leg looks up the most-recent open BUY's `trade_history.strategy` (failure-soft — `NULL` on miss) so the exit row mirrors the entry.
+- **`position_metadata.strategy`** = *cap accounting* — which strategy bucket the open position consumes for the per-strategy `PortfolioManager` cap (4-per-strategy at time of writing). This is set at BUY time from the router primary so that fused trades still consume their primary strategy's slot, and is NOT used for SELL attribution.
+
+If you want "all PnL attributed to Combined since X" you query `trade_history`. If you want "how many open Momentum positions am I carrying right now" you query `position_metadata`.
+
 ### Table: `backtest_results`
 
 Historical backtest run summaries.

@@ -486,11 +486,21 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def _resolve_entry_strategy(self, ticker: str) -> str | None:
-        """Look up the strategy that opened this position.
+        """Look up the *research attribution* of the BUY that opened this
+        position so the matching SELL carries the same label.
 
-        Reads position_metadata.strategy.  Returns None if the row is
-        missing, the column is unset, or the lookup raises — callers
-        treat None as "attribution unknown" and the SELL still records.
+        Reads the most recent ``trade_history`` BUY for this ticker — NOT
+        ``position_metadata.strategy``.  The two intentionally diverge for
+        cluster-fused trades: trade_history.strategy is ``"Combined"`` (the
+        ensemble verdict that triggered the trade), while
+        position_metadata.strategy is the router primary used for the
+        per-strategy portfolio caps.  Per-trade research attribution
+        belongs on trade_history; the cap accounting belongs on
+        position_metadata.  See docs/ARCHITECTURE.md → trade_history.
+
+        Returns None when there is no matching BUY, the column is unset,
+        or the lookup raises — callers treat None as "attribution unknown"
+        and the SELL still records.
         """
         if self._db is None:
             return None
@@ -498,7 +508,10 @@ class PositionManager:
             import sqlite3
             with sqlite3.connect(self._db.db_path, timeout=5.0) as conn:
                 row = conn.execute(
-                    "SELECT strategy FROM position_metadata WHERE ticker = ?",
+                    "SELECT strategy FROM trade_history "
+                    "WHERE ticker = ? AND action = 'BUY' AND strategy IS NOT NULL "
+                    "ORDER BY created_at DESC, id DESC "
+                    "LIMIT 1",
                     (ticker.upper(),),
                 ).fetchone()
             if row and row[0]:

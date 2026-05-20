@@ -346,15 +346,102 @@ class TestFailureSoft:
     def test_position_manager_strategy_lookup_failure_does_not_block_sell(
         self, tmp_db,
     ):
-        """A poisoned position_metadata read returns None from the lookup
+        """A poisoned trade_history read returns None from the lookup
         helper and the SELL still records (with strategy=NULL)."""
         from monitoring.position_manager import PositionManager
-        # Build a PositionManager with the bare minimum to call the helper
         pm = PositionManager.__new__(PositionManager)
         pm._db = tmp_db
-        # Drop the position_metadata table so the SELECT raises
+        # Drop trade_history so the SELECT raises — the lookup now reads
+        # from trade_history (not position_metadata) per the P1-fix.
         with sqlite3.connect(tmp_db.db_path) as c:
-            c.execute("DROP TABLE IF EXISTS position_metadata")
+            c.execute("DROP TABLE IF EXISTS trade_history")
             c.commit()
         result = pm._resolve_entry_strategy("META")
         assert result is None  # warning logged, no exception escaped
+
+
+# ── 6. SELL attribution mirrors BUY ─────────────────────────────────
+
+
+class TestSellMirrorsBuy:
+    """SELL leg of a round-trip must carry the same research attribution
+    as the BUY that opened the position.  For cluster-fused trades the
+    BUY's trade_history.strategy is ``"Combined"`` while
+    position_metadata.strategy is the router primary ("Momentum" /
+    "Pullback"); the SELL lookup must follow trade_history, not
+    position_metadata, so the two legs match for PnL grouping.
+    """
+
+    def test_sell_uses_buy_strategy_not_position_metadata(self, tmp_db):
+        """Simulate the fused-trade asymmetry and verify the SELL picks
+        up the BUY's "Combined" label, not the router primary on
+        position_metadata.
+        """
+        from monitoring.position_manager import PositionManager
+        # 1. Open a BUY tagged "Combined" (cluster-fused attribution).
+        tmp_db.log_trade_history(
+            ticker="META", action="BUY", shares=3, price=502.10,
+            stop_loss=485.0, take_profit=525.0, pnl=0.0,
+            strategy="Combined", intended_price=501.85, executed_price=502.10,
+        )
+        # 2. Seed position_metadata with the router primary — the same
+        #    asymmetry that exists in production for fused trades.
+        with sqlite3.connect(tmp_db.db_path) as c:
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS position_metadata ("
+                "ticker TEXT PRIMARY KEY, strategy TEXT NOT NULL DEFAULT 'unknown', "
+                "sector TEXT NOT NULL DEFAULT 'Other', "
+                "entry_date TEXT NOT NULL, entry_price REAL NOT NULL DEFAULT 0)"
+            )
+            c.execute(
+                "INSERT INTO position_metadata "
+                "(ticker, strategy, sector, entry_date, entry_price) "
+                "VALUES ('META', 'Momentum', 'Communication Services', "
+                "'2026-05-20T12:00:00+00:00', 502.10)"
+            )
+            c.commit()
+        pm = PositionManager.__new__(PositionManager)
+        pm._db = tmp_db
+        assert pm._resolve_entry_strategy("META") == "Combined"
+
+    def test_no_open_buy_returns_none(self, tmp_db):
+        """If trade_history has no matching BUY (or none with a non-NULL
+        strategy), the lookup returns None and the SELL still records
+        with strategy=NULL."""
+        from monitoring.position_manager import PositionManager
+        pm = PositionManager.__new__(PositionManager)
+        pm._db = tmp_db
+        assert pm._resolve_entry_strategy("NEVER_BOUGHT") is None
+
+    def test_uses_most_recent_buy_when_multiple(self, tmp_db):
+        """Re-opened positions: the most recent BUY's strategy wins."""
+        from monitoring.position_manager import PositionManager
+        # First round-trip — Pullback BUY then SELL.
+        tmp_db.log_trade_history(
+            ticker="AAPL", action="BUY", shares=2, price=260.0,
+            strategy="Pullback",
+        )
+        tmp_db.log_trade_history(
+            ticker="AAPL", action="SELL", shares=2, price=270.0,
+            strategy="Pullback",
+        )
+        # New BUY — different attribution.
+        tmp_db.log_trade_history(
+            ticker="AAPL", action="BUY", shares=3, price=275.0,
+            strategy="Combined",
+        )
+        pm = PositionManager.__new__(PositionManager)
+        pm._db = tmp_db
+        assert pm._resolve_entry_strategy("AAPL") == "Combined"
+
+    def test_null_strategy_buys_ignored(self, tmp_db):
+        """Historical BUYs (strategy IS NULL) must not satisfy the lookup
+        — those rows pre-date attribution and would mis-tag the SELL."""
+        from monitoring.position_manager import PositionManager
+        # Legacy BUY: strategy NULL (the pre-migration state).
+        tmp_db.log_trade_history(
+            ticker="XOM", action="BUY", shares=5, price=110.0,
+        )
+        pm = PositionManager.__new__(PositionManager)
+        pm._db = tmp_db
+        assert pm._resolve_entry_strategy("XOM") is None

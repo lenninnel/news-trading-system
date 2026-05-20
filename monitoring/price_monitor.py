@@ -361,14 +361,21 @@ class PriceMonitor:
         """Sell all shares of *pos* at *price* via PaperTrader."""
         ticker = pos["ticker"]
         shares = pos["shares"]
-        # Carry the entry strategy onto the exit row.  Failure-soft —
-        # an unreadable position_metadata.strategy must not block the SELL.
+        # Carry the BUY's research attribution onto the exit row.  We read
+        # the latest open BUY's trade_history.strategy — NOT
+        # position_metadata.strategy: for cluster-fused round-trips those
+        # two intentionally differ ("Combined" on trade_history vs. the
+        # router primary on position_metadata, which drives the
+        # per-strategy caps).  See docs/ARCHITECTURE.md.  Failure-soft.
         entry_strategy: str | None = None
         try:
             import sqlite3
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 row = conn.execute(
-                    "SELECT strategy FROM position_metadata WHERE ticker = ?",
+                    "SELECT strategy FROM trade_history "
+                    "WHERE ticker = ? AND action = 'BUY' AND strategy IS NOT NULL "
+                    "ORDER BY created_at DESC, id DESC "
+                    "LIMIT 1",
                     (ticker.upper(),),
                 ).fetchone()
             if row and row[0]:
