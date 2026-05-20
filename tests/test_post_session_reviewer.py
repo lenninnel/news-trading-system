@@ -48,7 +48,7 @@ from agents.post_session_reviewer import PostSessionReviewer
 
 
 SAMPLE_REVIEW = (
-    "📊 EOD REVIEW — 2026-04-11\n\n"
+    "📊 POST-SESSION REVIEW — EOD (2026-04-11)\n\n"
     "🔄 Sessions: 7/7 completed\n"
     "💼 Positions: 2 open | P&L: $+125.50\n"
     "📈 Trades: 3 executed today\n\n"
@@ -148,7 +148,7 @@ def test_review_passes_haiku_model_and_timeout(monkeypatch, tmp_path):
     assert call.kwargs["timeout"] == psr.TIMEOUT_SECONDS
     assert "system" in call.kwargs
     # Review system prompt mentions the fixed format
-    assert "EOD REVIEW" in call.kwargs["system"]
+    assert "POST-SESSION REVIEW" in call.kwargs["system"]
 
 
 # ── Exception / timeout handling ────────────────────────────────────────
@@ -463,7 +463,7 @@ def test_scheduler_run_post_session_review_happy_path(monkeypatch):
     fake_reviewer = MagicMock()
 
     async def fake_review(session, tickers, signals):
-        return "📊 EOD REVIEW — stub text"
+        return "📊 POST-SESSION REVIEW — EOD stub text"
 
     fake_reviewer.review = fake_review
     monkeypatch.setattr(
@@ -492,7 +492,7 @@ def test_scheduler_run_post_session_review_happy_path(monkeypatch):
     # Telegram sent the review text
     tg._send.assert_called_once()
     sent_text = tg._send.call_args[0][0]
-    assert "EOD REVIEW" in sent_text
+    assert "POST-SESSION REVIEW" in sent_text
 
     # SignalLogger got one row with the right fields
     mock_log.log.assert_called_once()
@@ -501,7 +501,7 @@ def test_scheduler_run_post_session_review_happy_path(monkeypatch):
     assert logged["strategy"] == "PostSessionReviewer"
     assert logged["signal"] == "REVIEW"
     assert logged["ticker"] == "SESSION"  # sentinel
-    assert "EOD REVIEW" in logged["bull_case"]
+    assert "POST-SESSION REVIEW" in logged["bull_case"]
 
 
 def test_scheduler_review_swallows_agent_failure(monkeypatch):

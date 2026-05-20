@@ -71,7 +71,7 @@ _SYSTEM_PROMPT = (
     "already in the template. Maximum 200 words total.\n\n"
     "Return ONLY this structure, filling in the placeholders. If a flag has "
     "no matches, write 'None' on the FLAGS line for that category.\n\n"
-    "📊 EOD REVIEW — {date}\n\n"
+    "📊 POST-SESSION REVIEW — {session} ({date})\n\n"
     "🔄 Sessions: {sessions_done}/{total_sessions} completed\n"
     "💼 Positions: {position_count} open | P&L: {daily_pnl_str}\n"
     "📈 Trades: {trade_count} executed today\n\n"
@@ -355,12 +355,13 @@ def _build_user_prompt(session: str, tickers: list[str], signals: list[dict],
     sessions_done = state["sessions_done"]
 
     # Top of prompt: fill the template vars for the system prompt's
-    # "{date}" / "{sessions_done}" placeholders. Claude will then
-    # replicate them literally into the output block.
+    # "{session}" / "{date}" / "{sessions_done}" placeholders. Claude
+    # will then replicate them literally into the output block.
     return (
         f"SESSION: {session} ({today_str})\n"
         f"\n"
         f"Fill these template vars into the header:\n"
+        f"  session={session}\n"
         f"  date={today_str}\n"
         f"  sessions_done={sessions_done}\n"
         f"  total_sessions={TOTAL_SESSIONS}\n"

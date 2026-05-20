@@ -81,6 +81,22 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
     return rows[0] if rows else None
 
 
+def _add_business_days(ts: datetime, n: int) -> datetime:
+    """Return *ts* shifted forward by *n* weekdays (Mon–Fri).
+
+    Holidays are not skipped — outcome_tracker's yfinance ±3-day fetch
+    window absorbs holiday edge cases at fill time. Mirrors the
+    frontend's addTradingDays helper so the two stay aligned.
+    """
+    result = ts
+    added = 0
+    while added < n:
+        result = result + timedelta(days=1)
+        if result.weekday() < 5:
+            added += 1
+    return result
+
+
 def _load_watchlist() -> list[str]:
     """Load watchlist from config/watchlist.yaml without importing scheduler."""
     try:
@@ -215,9 +231,20 @@ def signals(
         tuple(params + [limit]),
     )
 
-    # Normalise trade_executed to bool
+    # Normalise trade_executed to bool; compute outcome_Nd_due_at on
+    # the fly from timestamp + business-day offset (no schema column).
     for r in rows:
         r["trade_executed"] = bool(r.get("trade_executed"))
+        try:
+            ts = datetime.fromisoformat(r["timestamp"])
+        except (TypeError, ValueError):
+            r["outcome_3d_due_at"] = None
+            r["outcome_5d_due_at"] = None
+            r["outcome_10d_due_at"] = None
+            continue
+        r["outcome_3d_due_at"] = _add_business_days(ts, 3).isoformat()
+        r["outcome_5d_due_at"] = _add_business_days(ts, 5).isoformat()
+        r["outcome_10d_due_at"] = _add_business_days(ts, 10).isoformat()
     return rows
 
 
