@@ -26,11 +26,13 @@ Schema bookkeeping:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from storage.database import Database
@@ -574,3 +576,358 @@ class TestCoordinatorWiresPEADStrategyWithWriter:
                 "SELECT count(*) FROM pead_signal_log WHERE ticker='BEAT'"
             ).fetchone()
         assert count == 1
+
+
+# ── Q-004 Fork B follow-up: analyse_ticker_async PEAD-override stamp ──
+#
+# Production dispatches PEAD_OPEN with session_type="signal" so PEAD BUYs
+# that fire go through Coordinator.analyse_ticker_async, NOT
+# _run_pead_only_async.  The Q-004 task wired phase-2 stamping only in
+# _run_pead_only_async; this follow-up mirrors the same stamp into
+# analyse_ticker_async's PEAD-override branch, gated on strat_name=="PEAD".
+#
+# The tests below drive the full async pipeline with collaborators
+# stubbed so the PEAD-override branch is the path exercised.  They prove:
+#   • PEAD BUY -> stamp lands -> JOIN to trade_history succeeds.
+#   • Forcing db.update_pead_log_trade_id to raise does NOT break the
+#     trade — the exception is swallowed at the call site.
+#   • A "Combined" trade (strat_name != "PEAD") on the same branch
+#     leaves pead_signal_log untouched (no spurious stamps).
+
+
+def _build_pead_override_coordinator(
+    db: Database,
+    *,
+    pead_log_id: "int | None",
+    fire_pead_buy: bool,
+    trade_id: int = 42,
+):
+    """Build a Coordinator stub wired for analyse_ticker_async coverage.
+
+    Skips __init__ — sets only the attributes that path needs when
+    session_type='signal' and execute=True for a PEAD-eligible ticker.
+    All collaborators are MagicMocks so the only logic that runs is the
+    code inside analyse_ticker_async itself.
+    """
+    from orchestrator.coordinator import Coordinator
+
+    coord = Coordinator.__new__(Coordinator)
+    coord.db = db
+    coord.macro_context = ""
+    coord._pead_enabled = True
+    coord._pead_tickers = {"CASY"}
+
+    # Bypass the real PEAD strategy entirely — _run_pead returns the dict
+    # form (already serialised by Coordinator._run_pead in production).
+    coord._pead_strategy = MagicMock()
+    if fire_pead_buy and pead_log_id is not None:
+        coord._run_pead = MagicMock(return_value={
+            "signal":        "BUY",
+            "confidence":    0.75,
+            "strategy_name": "PEAD",
+            "reasoning":     ["test"],
+            "indicators":    {
+                "pead_log_id":     pead_log_id,
+                "surprise_pct":    24.0,
+                "announce_date":   "2026-05-25",
+                "hold_days":       20,
+                "stop_mode":       "TIME_ONLY",
+                "earnings_source": "ibkr_cache",
+            },
+        })
+    else:
+        coord._run_pead = MagicMock(return_value=None)
+
+    # All feeds return nothing — there is no headline/news content
+    # for sentiment to chew on, so the sentiment_signal will be HOLD.
+    for name in ("news_feed", "reddit_feed", "stocktwits_feed",
+                 "marketaux_feed", "apewisdom_feed", "adanos_feed"):
+        feed = MagicMock()
+        feed.fetch = MagicMock(return_value=[])
+        setattr(coord, name, feed)
+
+    coord.market_data = MagicMock()
+    coord.market_data.fetch = MagicMock(return_value={
+        "price": 150.0, "name": "Test", "currency": "USD",
+    })
+
+    coord.sentiment_agent = MagicMock()
+    coord.sentiment_agent.run = MagicMock(return_value={
+        "sentiment": "neutral", "score": 0, "reason": "t", "headline": "h",
+    })
+
+    coord.technical_agent = MagicMock()
+    coord.technical_agent.run = MagicMock(return_value={
+        "ticker":              "CASY",
+        "signal":              "HOLD",
+        "reasoning":           ["t"],
+        "indicators":          {"price": 150.0},
+        "signal_id":           1,
+        "bars":                pd.DataFrame(),  # empty -> strategy votes skip
+        "volume_confirmed":    False,
+        "adjusted_confidence": 0.5,
+    })
+
+    coord.regime_agent = MagicMock()
+    coord.regime_agent.run = MagicMock(return_value={"regime": "TRENDING_BULL", "vix": None})
+    coord.regime_detector = MagicMock()
+
+    coord.risk_agent = MagicMock()
+    coord.risk_agent.run = MagicMock(return_value={
+        "ticker":            "CASY",
+        "signal":            "BUY",
+        "direction":         "BUY",
+        "position_size_usd": 150.0,
+        "shares":            1,
+        "stop_loss":         140.0,
+        "take_profit":       160.0,
+        "risk_amount":       10.0,
+        "kelly_fraction":    0.05,
+        "stop_pct":          0.067,
+        "skipped":           False,
+        "skip_reason":       None,
+        "event_risk_flag":   "none",
+        "days_to_earnings":  None,
+        "regime":            "TRENDING_BULL",
+        "calc_id":           1,
+    })
+
+    coord.debate_agent = MagicMock()
+    # is_pead == True in the production code skips debate already, but
+    # disable globally so the path is deterministic.
+    coord.debate_agent.is_enabled = MagicMock(return_value=False)
+
+    coord.paper_trader = MagicMock()
+    coord.paper_trader.track_trade = MagicMock(
+        return_value={"trade_id": trade_id, "price": 150.0},
+    )
+
+    coord.signal_logger = MagicMock()
+    coord.signal_logger.store_forward_signal = MagicMock()
+
+    coord._has_alpaca_position = MagicMock(return_value=False)
+
+    coord._portfolio_manager = MagicMock()
+    coord._portfolio_manager.can_add_position = MagicMock(return_value=(True, ""))
+    coord._portfolio_manager.register_position = MagicMock()
+    coord._portfolio_manager.clear_position_meta = MagicMock()
+
+    coord._cluster_detector = MagicMock()
+    coord._momentum_strategy = MagicMock()
+    coord._pullback_strategy = MagicMock()
+    coord._gather_strategy_votes = MagicMock(return_value=[])
+
+    # Force the combined-signal path: when PEAD fires the function calls
+    # combine_signals(sentiment, "BUY", ...) — sentiment is HOLD here so
+    # we land on _SIGNAL_FLOORS["WEAK BUY"]=0.35.  That's BUY-shaped, so
+    # execution proceeds.  No extra patching needed.
+
+    return coord
+
+
+def _seed_phase1_row(db: Database) -> int:
+    """Insert a phase-1 pead_signal_log row and return its log_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    return db.log_pead_signal({
+        "timestamp":       now,
+        "ticker":          "CASY",
+        "session":         "PEAD_OPEN",
+        "signal":          "BUY",
+        "threshold_met":   1,
+        "surprise_pct":    24.0,
+        "announce_date":   "2026-05-25",
+        "confidence":      75.0,
+        "hold_days":       20,
+        "stop_mode":       "TIME_ONLY",
+        "earnings_source": "ibkr_cache",
+        "trade_id":        None,
+        "created_at":      now,
+    })
+
+
+def _run_analyse(coord, ticker="CASY", session="PEAD_OPEN") -> dict:
+    """Drive analyse_ticker_async to completion and return its result."""
+    async def _wrap():
+        return await coord.analyse_ticker_async(
+            ticker,
+            account_balance=10_000.0,
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+            session=session,
+            session_type="signal",
+        )
+
+    # Patch get_days_to_earnings to avoid network — the result doesn't
+    # affect the PEAD-override execution branch (event_risk_flag is set
+    # in the result dict but not used to gate execution).
+    with patch("orchestrator.coordinator.get_days_to_earnings", return_value=None):
+        return asyncio.run(_wrap())
+
+
+class TestAnalyseTickerAsyncStampsTradeIdOnPEADOverride:
+    """End-to-end: PEAD BUY -> analyse_ticker_async fires the trade ->
+    pead_signal_log.trade_id gets stamped -> JOIN to trade_history succeeds.
+    """
+
+    def test_pead_override_buy_stamps_and_joins(self, db):
+        # Seed: a trade_history row that paper_trader will pretend to have
+        # produced (its mocked track_trade returns this row's id).
+        trade_history_id = db.log_trade_history(
+            ticker="CASY", action="BUY", shares=1, price=150.0,
+            stop_loss=140.0, take_profit=160.0, strategy="PEAD",
+        )
+
+        log_id = _seed_phase1_row(db)
+        coord = _build_pead_override_coordinator(
+            db,
+            pead_log_id=log_id,
+            fire_pead_buy=True,
+            trade_id=trade_history_id,
+        )
+
+        result = _run_analyse(coord)
+
+        # Sanity — the PEAD-override branch fired and the trade was placed.
+        assert result["strategy_name"] == "PEAD"
+        assert result["signal_path"] == "FUSION_FALLBACK"
+        assert result["execution"] is not None
+        assert result["execution"]["trade_id"] == trade_history_id
+
+        # The stamp landed.
+        with db._connect() as conn:
+            (stamped,) = conn.execute(
+                "SELECT trade_id FROM pead_signal_log WHERE id = ?", (log_id,),
+            ).fetchone()
+        assert stamped == str(trade_history_id)
+
+        # And the join to trade_history is now intact.
+        with db._connect() as conn:
+            joined = conn.execute(
+                """
+                SELECT psl.id, psl.ticker, psl.signal, th.id AS th_id, th.strategy
+                FROM pead_signal_log psl
+                JOIN trade_history th
+                  ON CAST(psl.trade_id AS INTEGER) = th.id
+                WHERE psl.id = ?
+                """,
+                (log_id,),
+            ).fetchone()
+        assert joined is not None
+        joined = dict(joined)
+        assert joined["th_id"] == trade_history_id
+        assert joined["strategy"] == "PEAD"
+
+
+class TestAnalyseTickerAsyncStampFailureNeverAffectsTrade:
+    """If db.update_pead_log_trade_id raises inside the analyse_ticker_async
+    PEAD-override branch, the trade MUST still complete and no exception
+    may propagate out of the async function.
+    """
+
+    def test_update_exception_swallowed_trade_still_fires(self, db):
+        trade_history_id = db.log_trade_history(
+            ticker="CASY", action="BUY", shares=1, price=150.0,
+            stop_loss=140.0, take_profit=160.0, strategy="PEAD",
+        )
+        log_id = _seed_phase1_row(db)
+        coord = _build_pead_override_coordinator(
+            db,
+            pead_log_id=log_id,
+            fire_pead_buy=True,
+            trade_id=trade_history_id,
+        )
+
+        # Force the stamp to blow up.  The trade has already fired by the
+        # time this is called; the contract is "log and swallow".
+        boom = MagicMock(side_effect=RuntimeError("simulated DB error"))
+        coord.db.update_pead_log_trade_id = boom
+
+        # If the contract is broken, this call raises RuntimeError.
+        result = _run_analyse(coord)
+
+        # The trade completed and the result is intact.
+        assert result["execution"] is not None
+        assert result["execution"]["trade_id"] == trade_history_id
+        assert result["strategy_name"] == "PEAD"
+
+        # The stamp WAS attempted (proves the call site was reached).
+        boom.assert_called_once()
+
+        # The phase-1 row still has trade_id NULL because the stamp raised
+        # before persisting — that's the correct fail-safe outcome.
+        with db._connect() as conn:
+            (stamped,) = conn.execute(
+                "SELECT trade_id FROM pead_signal_log WHERE id = ?", (log_id,),
+            ).fetchone()
+        assert stamped is None
+
+
+class TestAnalyseTickerAsyncNoStampForNonPEADTrades:
+    """A trade that fires through the same branch but with strat_name !=
+    "PEAD" (i.e. a Combined cluster verdict, not a PEAD override) must
+    leave pead_signal_log entirely untouched.
+    """
+
+    def test_combined_trade_does_not_touch_pead_signal_log(self, db):
+        trade_history_id = db.log_trade_history(
+            ticker="CASY", action="BUY", shares=1, price=150.0,
+            stop_loss=140.0, take_profit=160.0, strategy="Combined",
+        )
+        # Seed a phase-1 row anyway — if the stamp were incorrectly
+        # called for a non-PEAD trade, this row's trade_id would change
+        # from NULL.  We want it to STAY NULL.
+        log_id = _seed_phase1_row(db)
+
+        coord = _build_pead_override_coordinator(
+            db,
+            pead_log_id=log_id,
+            fire_pead_buy=False,   # _run_pead returns None
+            trade_id=trade_history_id,
+        )
+
+        # Need at least one strategy vote so the cluster path emits BUY.
+        # MomentumStrategy result: BUY @ 0.70 confidence, with stop/tp so
+        # the SL/TP override branch passes through cleanly.
+        from strategies.base import StrategyResult
+        coord._gather_strategy_votes = MagicMock(return_value=[
+            StrategyResult(
+                signal="BUY", confidence=70.0,
+                indicators={"price": 150.0},
+                stop_loss=140.0, take_profit=160.0,
+                strategy_name="Momentum",
+                reasoning=["test"],
+            ),
+        ])
+
+        # Spy on the stamp method — assert it is NEVER called.
+        spy = MagicMock(side_effect=db.update_pead_log_trade_id)
+        coord.db.update_pead_log_trade_id = spy
+
+        # Force the cluster fusion to emit a BUY so a trade fires.
+        # Sidesteps the cluster detector / vote counting — we just want a
+        # BUY decision with strat_name != "PEAD".
+        coord._fuse_signals = MagicMock(
+            return_value=("WEAK BUY", 0.55, "CLUSTER_PARTIAL"),
+        )
+
+        # And pin strategy_label so strat_name is deterministic and
+        # never accidentally becomes "PEAD".
+        with patch("orchestrator.coordinator.strategy_label", return_value="Momentum"):
+            result = _run_analyse(coord)
+
+        # Sanity — the trade fired with strategy="Combined" attribution.
+        assert result["strategy_name"] == "Momentum"   # router primary
+        assert result["execution"] is not None
+        assert result["execution"]["trade_id"] == trade_history_id
+
+        # The stamp was NEVER called (strat_name != "PEAD" gate).
+        spy.assert_not_called()
+
+        # And the phase-1 row's trade_id is still NULL.
+        with db._connect() as conn:
+            (stamped,) = conn.execute(
+                "SELECT trade_id FROM pead_signal_log WHERE id = ?", (log_id,),
+            ).fetchone()
+        assert stamped is None

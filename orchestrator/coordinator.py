@@ -1874,6 +1874,38 @@ class Coordinator:
                                         ticker, exc,
                                     )
 
+                            # Q-004 Fork B follow-up: stamp pead_signal_log.trade_id
+                            # for PEAD-override trades that fire through
+                            # analyse_ticker_async.  Mirrors the
+                            # _run_pead_only_async stamp (coordinator.py
+                            # ~_run_pead_only_async).  pead_result is defined
+                            # earlier in this function (line ~ self._run_pead
+                            # call).  Wrapped + swallowed: trade has already
+                            # fired; a logging failure must not affect anything
+                            # downstream.  Gated on strat_name == "PEAD" so
+                            # Combined trades never touch pead_signal_log.
+                            if (
+                                strat_name == "PEAD"
+                                and execution
+                                and execution.get("trade_id")
+                            ):
+                                log_id = (
+                                    (pead_result.get("indicators") or {})
+                                    .get("pead_log_id")
+                                    if pead_result else None
+                                )
+                                if log_id is not None:
+                                    try:
+                                        self.db.update_pead_log_trade_id(
+                                            int(log_id),
+                                            str(execution["trade_id"]),
+                                        )
+                                    except Exception as exc:
+                                        log.warning(
+                                            "[%s] PEAD trade_id stamp failed (non-fatal): %s",
+                                            ticker, exc,
+                                        )
+
         elapsed = _time.monotonic() - t0
 
         sentiment_result = {
