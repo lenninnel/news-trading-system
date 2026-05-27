@@ -475,6 +475,21 @@ class Database:
                     comparison       TEXT,
                     created_at       TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS daily_ohlc (
+                    ticker       TEXT    NOT NULL,
+                    date         TEXT    NOT NULL,
+                    open         REAL    NOT NULL,
+                    high         REAL    NOT NULL,
+                    low          REAL    NOT NULL,
+                    close        REAL    NOT NULL,
+                    adj_close    REAL,
+                    volume       INTEGER,
+                    source       TEXT    NOT NULL DEFAULT 'polygon',
+                    quality_flag TEXT,
+                    ingested_at  TEXT    NOT NULL,
+                    PRIMARY KEY (ticker, date)
+                );
                 """
             )
 
@@ -1747,6 +1762,84 @@ class Database:
         if not cached_price or cached_price <= 0 or not current_price or current_price <= 0:
             return True
         return abs(current_price - cached_price) / cached_price > threshold
+
+    # ------------------------------------------------------------------
+    # daily_ohlc (Research-side OHLC store; populated by scripts/ingest_ohlc.py)
+    # ------------------------------------------------------------------
+
+    @_retry_on_locked
+    def upsert_daily_ohlc(self, rows: list[dict]) -> int:
+        """Idempotently insert/update daily OHLC bars.
+
+        Args:
+            rows: list of dicts with keys:
+                ticker, date (YYYY-MM-DD), open, high, low, close,
+                adj_close (nullable), volume (nullable), source (default
+                'polygon'), quality_flag (nullable).
+
+        Returns:
+            Number of rows passed in (insert + update are not distinguished
+            by SQLite ON CONFLICT; the count is the rows attempted).
+        """
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        payload = [
+            (
+                r["ticker"].upper(),
+                r["date"],
+                float(r["open"]),
+                float(r["high"]),
+                float(r["low"]),
+                float(r["close"]),
+                None if r.get("adj_close") is None else float(r["adj_close"]),
+                None if r.get("volume") is None else int(r["volume"]),
+                r.get("source", "polygon"),
+                r.get("quality_flag"),
+                now,
+            )
+            for r in rows
+        ]
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO daily_ohlc
+                    (ticker, date, open, high, low, close, adj_close,
+                     volume, source, quality_flag, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, date) DO UPDATE SET
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    adj_close=excluded.adj_close,
+                    volume=excluded.volume,
+                    source=excluded.source,
+                    quality_flag=excluded.quality_flag,
+                    ingested_at=excluded.ingested_at
+                """,
+                payload,
+            )
+        return len(payload)
+
+    def get_daily_ohlc(
+        self, ticker: str, start: str, end: str,
+    ) -> list[dict]:
+        """Read daily_ohlc rows for `ticker` between `start` and `end` (inclusive),
+        ordered ascending by date.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticker, date, open, high, low, close, adj_close,
+                       volume, source, quality_flag, ingested_at
+                FROM daily_ohlc
+                WHERE ticker = ? AND date BETWEEN ? AND ?
+                ORDER BY date ASC
+                """,
+                (ticker.upper(), start, end),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def _select(self, sql: str, params: tuple = ()) -> list[dict]:
         """Run a raw SELECT and return rows as dicts."""

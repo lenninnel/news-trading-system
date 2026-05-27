@@ -25,6 +25,7 @@ MARKETAUX_API_TOKEN: str = os.environ.get("MARKETAUX_API_TOKEN", "")
 ADANOS_API_KEY: str = os.environ.get("ADANOS_API_KEY", "")
 FRED_API_KEY: str = os.environ.get("FRED_API_KEY", "")
 EODHD_API_TOKEN: str = os.environ.get("EODHD_API_TOKEN", "")
+POLYGON_API_KEY: str = os.environ.get("POLYGON_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Claude model
@@ -112,6 +113,13 @@ CRYPTO_TICKERS: set[str] = {
 # ---------------------------------------------------------------------------
 
 DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
+
+# ---------------------------------------------------------------------------
+# Daily OHLC ingest (Research-side; scripts/ingest_ohlc.py → daily_ohlc table)
+# ---------------------------------------------------------------------------
+
+OHLC_BACKFILL_YEARS: int = 2          # Polygon free tier supports 2yr daily; covers 252d windows
+OHLC_EXTREME_MOVE_PCT: float = 0.50   # soft-flag threshold (quality_flag='EXTREME_MOVE'), NOT a reject
 
 # ---------------------------------------------------------------------------
 # IBKR (Interactive Brokers) — used when TRADING_MODE=ibkr_paper or ibkr_live

@@ -1,0 +1,10 @@
+[Unit]
+Description=NTS daily Polygon OHLC incremental ingest timer
+
+[Timer]
+OnCalendar=*-*-* 22:30:00 UTC
+Persistent=true
+Unit=nts-ohlc-ingest.service
+
+[Install]
+WantedBy=timers.target
