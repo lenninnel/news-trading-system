@@ -189,11 +189,17 @@ class Coordinator:
         # or the Haiku call failed — debate prompts stay legacy.
         self.macro_context = macro_context or ""
 
-        # PEAD strategy (no Claude API needed — pure data)
+        # PEAD strategy (no Claude API needed — pure data).
+        # The signal_log_writer wraps db.log_pead_signal in try/except so
+        # any failure is logged + swallowed (Q-004 Fork B contract: the
+        # sidecar log must NEVER affect signal generation or execution).
         from config.settings import PEAD_ENABLED, PEAD_TICKERS, PEAD_EARNINGS_CACHE_PATH
         self._pead_enabled = PEAD_ENABLED
         self._pead_tickers = set(t.upper() for t in PEAD_TICKERS)
-        self._pead_strategy = PEADStrategy(cache_path=PEAD_EARNINGS_CACHE_PATH)
+        self._pead_strategy = PEADStrategy(
+            cache_path=PEAD_EARNINGS_CACHE_PATH,
+            signal_log_writer=self._write_pead_signal_log,
+        )
 
         # Phase 2b — multi-strategy cluster detector as the combination layer.
         # Momentum/Pullback strategies are stateless, so one instance each is
@@ -436,6 +442,24 @@ class Coordinator:
         except Exception as exc:
             log.warning("Strategy result logging failed (non-fatal): %s", exc)
 
+    def _write_pead_signal_log(self, row: dict) -> "int | None":
+        """Persist one pead_signal_log row.  Never raises.
+
+        Injected into :class:`PEADStrategy` so phase-1 writes go through
+        the coordinator's DB handle.  Any failure (DB locked, disk full,
+        schema drift) is logged at WARN and turned into ``None`` — the
+        caller still returns the BUY result, the trade still fires, and
+        the row that would have been written is simply lost.
+
+        Mirrors the precedent in ``_log_strategy_result``: observability
+        writes can fail without affecting trading.
+        """
+        try:
+            return self.db.log_pead_signal(row)
+        except Exception as exc:
+            log.warning("PEAD signal log write failed (non-fatal): %s", exc)
+            return None
+
     def _run_pead(self, ticker: str, *, session: str | None = None) -> dict | None:
         """Run PEAD strategy for a ticker if eligible. Returns result dict or None."""
         if not self._pead_enabled:
@@ -444,7 +468,11 @@ class Coordinator:
             return None
         from datetime import date as _date
 
-        result = self._pead_strategy.generate_signal(ticker, _date.today())
+        # Pass session through so the phase-1 pead_signal_log row records
+        # which session generated the evaluation (PEAD_OPEN in production).
+        result = self._pead_strategy.generate_signal(
+            ticker, _date.today(), session=session,
+        )
         if result is None:
             return None
         self._log_strategy_result(ticker, result, session=session)
@@ -573,6 +601,33 @@ class Coordinator:
                                             "[%s] PortfolioManager metadata update failed: %s",
                                             ticker, exc,
                                         )
+
+                                    # Phase-2 PEAD log stamp (Q-004 Fork B).
+                                    # Links the phase-1 pead_signal_log row
+                                    # (written at signal time, trade_id=NULL)
+                                    # to the trade_history row that actually
+                                    # filled.  Direct row-id link via
+                                    # indicators['pead_log_id'] stashed by
+                                    # PEADStrategy.generate_signal.
+                                    #
+                                    # Wrapped + swallowed: the trade has
+                                    # already fired; a logging failure here
+                                    # must not affect anything downstream.
+                                    log_id = (
+                                        (pead_result.get("indicators") or {})
+                                        .get("pead_log_id")
+                                    )
+                                    if log_id is not None:
+                                        try:
+                                            self.db.update_pead_log_trade_id(
+                                                int(log_id),
+                                                str(execution["trade_id"]),
+                                            )
+                                        except Exception as exc:
+                                            log.warning(
+                                                "[%s] PEAD trade_id stamp failed (non-fatal): %s",
+                                                ticker, exc,
+                                            )
 
         # Store forward signal for execution session
         if combined_signal not in ("HOLD", "CONFLICTING"):
