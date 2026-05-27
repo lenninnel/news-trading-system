@@ -490,6 +490,39 @@ class Database:
                     ingested_at  TEXT    NOT NULL,
                     PRIMARY KEY (ticker, date)
                 );
+
+                -- One-row-per-migration bookkeeping table.  Intentionally
+                -- lightweight (no framework) — only the PEAD signal log
+                -- registers itself here so we can answer "was this DB
+                -- initialised with the PEAD sidecar?" without parsing
+                -- sqlite_master.
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    migration_name TEXT    NOT NULL UNIQUE,
+                    applied_at     TEXT    NOT NULL
+                );
+
+                -- PEAD signal-attribution sidecar (Q-004 Fork B).
+                -- Observability only — writes are wrapped at every call
+                -- site so a logging failure NEVER affects signal generation
+                -- or trade execution.  Forward-only: history is not
+                -- backfilled, the table fills from deploy forward.
+                CREATE TABLE IF NOT EXISTS pead_signal_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    ticker          TEXT    NOT NULL,
+                    session         TEXT,
+                    signal          TEXT,
+                    threshold_met   INTEGER,
+                    surprise_pct    REAL,
+                    announce_date   TEXT,
+                    confidence      REAL,
+                    hold_days       INTEGER,
+                    stop_mode       TEXT,
+                    earnings_source TEXT,
+                    trade_id        TEXT,
+                    created_at      TEXT    NOT NULL
+                );
                 """
             )
 
@@ -597,6 +630,20 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass  # column already exists
+
+            # Record the PEAD signal-log migration.  Idempotent via
+            # UNIQUE(migration_name) + INSERT OR IGNORE — re-running
+            # _init_schema does NOT add a duplicate row.  Kept deliberately
+            # ad-hoc (no migration framework — out of scope for Q-004).
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations
+                    (migration_name, applied_at)
+                VALUES (?, ?)
+                """,
+                ("20260527_pead_signal_log",
+                 datetime.now(timezone.utc).isoformat()),
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -1082,6 +1129,78 @@ class Database:
                 "SELECT * FROM portfolio_positions ORDER BY ticker"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # PEAD signal log (Q-004 Fork B — observability-only sidecar)
+    # ------------------------------------------------------------------
+    #
+    # These two methods are the ONLY writers to pead_signal_log.  Every
+    # call site MUST wrap them in try/except so a logging failure cannot
+    # propagate, block, or alter PEAD signal generation or execution
+    # (the freeze-safe contract).  Raising from here is fine — the
+    # wrappers swallow it.
+    #
+    # Forward-only: the table starts empty on deploy and fills from
+    # there.  Historical surprise_pct / announce_date were never
+    # persisted (signal_events drops them) and cannot be reconstructed.
+
+    @_retry_on_locked
+    def log_pead_signal(self, row: dict) -> "int | None":
+        """Insert a pead_signal_log row, return the new row id.
+
+        Expected keys in *row* (any may be None except ticker / timestamp /
+        created_at, which are NOT NULL in the schema):
+
+            timestamp, ticker, session, signal, threshold_met,
+            surprise_pct, announce_date, confidence, hold_days,
+            stop_mode, earnings_source, trade_id, created_at
+
+        Returns the auto-generated row id, or None when the row was
+        rejected before INSERT (currently never — kept as Optional so
+        callers can treat 'no id' uniformly).
+        """
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pead_signal_log
+                    (timestamp, ticker, session, signal, threshold_met,
+                     surprise_pct, announce_date, confidence, hold_days,
+                     stop_mode, earnings_source, trade_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("timestamp"),
+                    row.get("ticker"),
+                    row.get("session"),
+                    row.get("signal"),
+                    row.get("threshold_met"),
+                    row.get("surprise_pct"),
+                    row.get("announce_date"),
+                    row.get("confidence"),
+                    row.get("hold_days"),
+                    row.get("stop_mode"),
+                    row.get("earnings_source"),
+                    row.get("trade_id"),
+                    row.get("created_at"),
+                ),
+            )
+            return cur.lastrowid
+
+    @_retry_on_locked
+    def update_pead_log_trade_id(self, log_id: int, trade_id: str) -> None:
+        """Stamp ``trade_id`` onto an existing pead_signal_log row.
+
+        Called at execution time (phase 2) after the broker round-trip
+        returns a trade id, so the row written at signal time (phase 1,
+        when trade_id was None) can be joined back to trade_history.
+        Silently no-ops if *log_id* doesn't exist — the caller has
+        nothing else to do, and raising would just be swallowed.
+        """
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE pead_signal_log SET trade_id = ? WHERE id = ?",
+                (trade_id, log_id),
+            )
 
     # ------------------------------------------------------------------
     # Optimisation runs
