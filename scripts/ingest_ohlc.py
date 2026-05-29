@@ -144,9 +144,9 @@ def _yesterday_utc() -> date:
     return datetime.now(timezone.utc).date() - timedelta(days=1)
 
 
-def backfill_range() -> tuple[str, str]:
+def backfill_range(years: int = OHLC_BACKFILL_YEARS) -> tuple[str, str]:
     end = _yesterday_utc()
-    start = end - timedelta(days=OHLC_BACKFILL_YEARS * 365)
+    start = end - timedelta(days=years * 365)
     return start.isoformat(), end.isoformat()
 
 
@@ -160,7 +160,7 @@ def incremental_range() -> tuple[str, str]:
 # Main
 # ---------------------------------------------------------------------------
 
-def run(mode: str) -> int:
+def run(mode: str, years: int | None = None) -> int:
     if not POLYGON_API_KEY:
         logger.error("POLYGON_API_KEY is not set — refusing to run")
         return 1
@@ -175,7 +175,7 @@ def run(mode: str) -> int:
         return 1
 
     if mode == "backfill":
-        start, end = backfill_range()
+        start, end = backfill_range(years if years is not None else OHLC_BACKFILL_YEARS)
     elif mode == "incremental":
         start, end = incremental_range()
     else:
@@ -251,9 +251,21 @@ def main(argv: list[str] | None = None) -> int:
         "--incremental", action="store_true",
         help="Fetch trailing 7-day window and upsert.",
     )
+    parser.add_argument(
+        "--years", type=int, default=None,
+        help=(
+            "Override backfill depth in years (backfill mode only). "
+            f"Defaults to OHLC_BACKFILL_YEARS={OHLC_BACKFILL_YEARS}. "
+            "Ignored in --incremental mode; the nightly path is unaffected."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.years is not None and args.years <= 0:
+        parser.error("--years must be a positive integer")
+    if args.years is not None and args.incremental:
+        parser.error("--years is only valid with --backfill")
     mode = "backfill" if args.backfill else "incremental"
-    return run(mode)
+    return run(mode, years=args.years)
 
 
 if __name__ == "__main__":
