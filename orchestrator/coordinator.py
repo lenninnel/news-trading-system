@@ -199,6 +199,11 @@ class Coordinator:
         self._pead_strategy = PEADStrategy(
             cache_path=PEAD_EARNINGS_CACHE_PATH,
             signal_log_writer=self._write_pead_signal_log,
+            # Q-005: RECORDED-ONLY Benzinga earnings, logged in parallel
+            # to the live yfinance source.  Fail-safe wrapped (see
+            # _record_benzinga_earnings) — a Benzinga failure NEVER blocks
+            # PEAD signal generation, the yfinance row write, or a trade.
+            benzinga_recorder=self._record_benzinga_earnings,
         )
 
         # Phase 2b — multi-strategy cluster detector as the combination layer.
@@ -459,6 +464,57 @@ class Coordinator:
         except Exception as exc:
             log.warning("PEAD signal log write failed (non-fatal): %s", exc)
             return None
+
+    def _record_benzinga_earnings(
+        self,
+        ticker: str,
+        evaluation_id: str,
+        session: "str | None" = None,
+    ) -> None:
+        """Record a Benzinga earnings row in parallel to yfinance (Q-005).
+
+        RECORDED-ONLY: this writes a second pead_signal_log row
+        (earnings_source='benzinga') paired to the yfinance row of the
+        same evaluation via *evaluation_id*.  Benzinga data is NEVER read
+        by the PEAD signal, sizing, threshold, or trade logic — this is
+        observability to inform a future, gated source decision.
+
+        Fully fail-safe: the entire body is wrapped in try/except →
+        log.warning → return.  ANY Benzinga error/timeout/missing-ticker/
+        parse/DB failure is swallowed here so it can NEVER block, delay,
+        or alter PEAD signal generation, the yfinance row write, or trade
+        execution.  Mirrors the _write_pead_signal_log / _log_strategy_
+        result precedent.  A missing record (e.g. EU names Benzinga does
+        not cover) is a normal no-op miss.
+        """
+        try:
+            from config.settings import POLYGON_API_KEY
+            from data import benzinga_feed
+            from datetime import datetime, timezone
+
+            if not POLYGON_API_KEY:
+                return
+            rec = benzinga_feed.fetch_latest_reported_earnings(
+                ticker, api_key=POLYGON_API_KEY, timeout=4.0,
+            )
+            if not rec:
+                return  # miss (no reported record) — expected for EU names
+            now = datetime.now(timezone.utc).isoformat()
+            self.db.log_benzinga_earnings_row({
+                **rec,
+                "ticker":          ticker,
+                "session":         session,
+                "earnings_source": "benzinga",
+                "evaluation_id":   evaluation_id,
+                "timestamp":       now,
+                "created_at":      now,
+            })
+        except Exception as exc:
+            log.warning(
+                "[%s] Benzinga earnings record failed (non-fatal): %s",
+                ticker, exc,
+            )
+            return
 
     def _run_pead(self, ticker: str, *, session: str | None = None) -> dict | None:
         """Run PEAD strategy for a ticker if eligible. Returns result dict or None."""

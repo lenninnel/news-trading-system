@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -73,6 +74,7 @@ class PEADStrategy(BaseStrategy):
         self,
         cache_path: "str | Path | None" = None,
         signal_log_writer: "Callable[[dict], int | None] | None" = None,
+        benzinga_recorder: "Callable[[str, str, str | None], None] | None" = None,
     ) -> None:
         """
         Args:
@@ -86,10 +88,22 @@ class PEADStrategy(BaseStrategy):
                                (matches the test default — the writer
                                only fires in production once Coordinator
                                injects the DB-backed wrapper).
+            benzinga_recorder: Optional callable
+                               ``(ticker, evaluation_id, session) -> None``
+                               that records a RECORDED-ONLY Benzinga
+                               earnings row in parallel to the yfinance
+                               row (Q-005).  Called AFTER the yfinance row
+                               is written, inside its own try/except.
+                               Defaults to None (test constructors are
+                               unaffected; production injects the
+                               Coordinator's fail-safe wrapper).  Benzinga
+                               data is NEVER read by the signal/sizing/
+                               threshold/trade logic.
         """
         self._cache_path = Path(cache_path) if cache_path else _DEFAULT_CACHE
         self._cache: "dict[str, list[dict]] | None" = None
         self._signal_log_writer = signal_log_writer
+        self._benzinga_recorder = benzinga_recorder
 
     @property
     def name(self) -> str:
@@ -155,6 +169,10 @@ class PEADStrategy(BaseStrategy):
             # Cache wins — yfinance is NOT consulted for tickers that
             # already have IBKR cache entries.  Preserves legacy routing.
             return self._evaluate_from_cache(records, current_date, lookback_days)
+        # NOTE (Finding A, 2026-05-27): the IBKR earnings cache file is absent on the VPS, so PEAD
+        # runs 100% on the yfinance fallback in production. This is an accident of config, NOT a
+        # chosen primary source. Benzinga is recorded in parallel (Q-005) to inform a deliberate,
+        # gated source switch — see Decision Log DL-004 / DL-006.
         return self._evaluate_from_yfinance(ticker, current_date, lookback_days)
 
     @staticmethod
@@ -321,6 +339,7 @@ class PEADStrategy(BaseStrategy):
         announce_date: "str | None",
         confidence: "float | None",
         earnings_source: "str | None",
+        evaluation_id: "str | None" = None,
     ) -> "int | None":
         """Persist one pead_signal_log row via the injected writer.
 
@@ -346,6 +365,9 @@ class PEADStrategy(BaseStrategy):
             "earnings_source": earnings_source,
             "trade_id":        None,
             "created_at":      now,
+            # Q-005 pairing key: links this yfinance row to its sibling
+            # benzinga row from the same PEAD evaluation.
+            "evaluation_id":   evaluation_id,
         }
         try:
             return self._signal_log_writer(row)
@@ -377,6 +399,13 @@ class PEADStrategy(BaseStrategy):
         no-fire case (full-universe logging).
         """
         ticker = ticker.upper()
+
+        # Q-005: one pairing key per evaluation, generated ONCE.  The
+        # yfinance row carries it (below) and the parallel Benzinga row
+        # (if any) is written with the same id, so a self-join on
+        # evaluation_id pairs the two sources for one PEAD evaluation.
+        evaluation_id = uuid.uuid4().hex
+
         eval_data = self._evaluate_earnings(ticker, current_date)
 
         threshold_met   = eval_data["threshold_met"]
@@ -421,7 +450,22 @@ class PEADStrategy(BaseStrategy):
             announce_date=announce,
             confidence=confidence,
             earnings_source=earnings_source,
+            evaluation_id=evaluation_id,
         )
+
+        # Q-005: RECORDED-ONLY parallel Benzinga record, written AFTER the
+        # yfinance row.  Belt-and-braces try/except (the injected recorder
+        # is already fail-safe internally) so that even an unexpected
+        # failure here can NEVER affect the BUY signal or the trade.
+        # Benzinga data is NOT read by any signal/sizing/trade logic.
+        if self._benzinga_recorder is not None:
+            try:
+                self._benzinga_recorder(ticker, evaluation_id, session)
+            except Exception as exc:
+                log.warning(
+                    "[%s] PEAD Benzinga recorder failed (non-fatal): %s",
+                    ticker, exc,
+                )
 
         # Stash the log id on the BUY result so the execution-time path
         # can stamp trade_id onto the same row (phase 2).  No effect on
