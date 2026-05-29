@@ -23,6 +23,10 @@ Rows are FLAGGED, never dropped:
     (low>open, high<close, any non-positive value, etc.).
   - quality_flag='EXTREME_MOVE'      if |close/prev_close - 1| > 50%
     (using the previous bar for that ticker in the fetched series).
+  - quality_flag='TICKER_RECYCLE'    identity break, NOT a corporate action:
+    a recycled symbol whose pre-boundary bars are a different issuer (e.g.
+    META < 2022-06-09). Set out-of-band by scripts/flag_meta_recycle.py; do
+    NOT "clean up" — adj_close cannot bridge a symbol reassignment.
   - quality_flag=NULL                otherwise.
 
 Exit codes:
