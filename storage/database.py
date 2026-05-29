@@ -631,6 +631,31 @@ class Database:
                 except sqlite3.OperationalError:
                     pass  # column already exists
 
+            # Migrate existing DBs: Benzinga earnings comparison columns
+            # (Q-005).  RECORDED-ONLY observability — Benzinga earnings are
+            # logged in parallel to the live yfinance source so a future,
+            # gated source decision can be made on real disagreement data.
+            # These columns are populated only on benzinga rows
+            # (earnings_source='benzinga'); yfinance rows leave them NULL.
+            # evaluation_id is the pairing key shared by the yfinance +
+            # benzinga rows of one PEAD evaluation.  All nullable; the
+            # try/except keeps re-runs idempotent.
+            for col, typedef in [
+                ("evaluation_id", "TEXT"),
+                ("actual_eps",    "REAL"),
+                ("estimate_eps",  "REAL"),
+                ("eps_method",    "TEXT"),
+                ("eps_time",      "TEXT"),
+                ("date_status",   "TEXT"),
+                ("importance",    "INTEGER"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE pead_signal_log ADD COLUMN {col} {typedef}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
             # Record the PEAD signal-log migration.  Idempotent via
             # UNIQUE(migration_name) + INSERT OR IGNORE — re-running
             # _init_schema does NOT add a duplicate row.  Kept deliberately
@@ -642,6 +667,18 @@ class Database:
                 VALUES (?, ?)
                 """,
                 ("20260527_pead_signal_log",
+                 datetime.now(timezone.utc).isoformat()),
+            )
+
+            # Q-005: register the Benzinga-columns migration (same ad-hoc
+            # one-row bookkeeping as above; INSERT OR IGNORE → idempotent).
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations
+                    (migration_name, applied_at)
+                VALUES (?, ?)
+                """,
+                ("20260529_pead_signal_log_benzinga_columns",
                  datetime.now(timezone.utc).isoformat()),
             )
 
@@ -1153,7 +1190,8 @@ class Database:
 
             timestamp, ticker, session, signal, threshold_met,
             surprise_pct, announce_date, confidence, hold_days,
-            stop_mode, earnings_source, trade_id, created_at
+            stop_mode, earnings_source, trade_id, created_at,
+            evaluation_id (Q-005 pairing key; None on legacy callers)
 
         Returns the auto-generated row id, or None when the row was
         rejected before INSERT (currently never — kept as Optional so
@@ -1165,8 +1203,9 @@ class Database:
                 INSERT INTO pead_signal_log
                     (timestamp, ticker, session, signal, threshold_met,
                      surprise_pct, announce_date, confidence, hold_days,
-                     stop_mode, earnings_source, trade_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     stop_mode, earnings_source, trade_id, created_at,
+                     evaluation_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.get("timestamp"),
@@ -1182,9 +1221,68 @@ class Database:
                     row.get("earnings_source"),
                     row.get("trade_id"),
                     row.get("created_at"),
+                    # Q-005: pairing key linking this yfinance row to its
+                    # sibling benzinga row from the same PEAD evaluation.
+                    # None on legacy callers that don't set it.
+                    row.get("evaluation_id"),
                 ),
             )
             return cur.lastrowid
+
+    @_retry_on_locked
+    def log_benzinga_earnings_row(self, row: dict) -> None:
+        """Insert one Benzinga earnings row into pead_signal_log (Q-005).
+
+        RECORDED-ONLY: Benzinga earnings are logged in parallel to the
+        live yfinance source so a future, gated source decision can be
+        made on real disagreement data.  Benzinga data is NEVER read by
+        the PEAD signal, sizing, threshold, or trade logic.
+
+        The PEAD decision columns (signal, threshold_met, confidence,
+        hold_days, stop_mode, trade_id) are deliberately left NULL on
+        benzinga rows — those are PEAD decisions, not recorded earnings
+        data.  earnings_source MUST be 'benzinga'.  The benzinga row is
+        paired to its sibling yfinance row via the shared evaluation_id.
+
+        Expected keys (any may be None except ticker / timestamp /
+        created_at, which are NOT NULL in the schema):
+
+            timestamp, ticker, session, earnings_source, evaluation_id,
+            surprise_pct, announce_date, actual_eps, estimate_eps,
+            eps_method, eps_time, date_status, importance, created_at
+
+        Raising is fine — the call site (Coordinator._record_benzinga_
+        earnings) wraps this in try/except → log.warning → swallow, so a
+        write failure NEVER blocks, delays, or alters PEAD signal
+        generation, the yfinance row write, or trade execution.
+        """
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pead_signal_log
+                    (timestamp, ticker, session, earnings_source,
+                     evaluation_id, surprise_pct, announce_date,
+                     actual_eps, estimate_eps, eps_method, eps_time,
+                     date_status, importance, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("timestamp"),
+                    row.get("ticker"),
+                    row.get("session"),
+                    row.get("earnings_source"),
+                    row.get("evaluation_id"),
+                    row.get("surprise_pct"),
+                    row.get("announce_date"),
+                    row.get("actual_eps"),
+                    row.get("estimate_eps"),
+                    row.get("eps_method"),
+                    row.get("eps_time"),
+                    row.get("date_status"),
+                    row.get("importance"),
+                    row.get("created_at"),
+                ),
+            )
 
     @_retry_on_locked
     def update_pead_log_trade_id(self, log_id: int, trade_id: str) -> None:

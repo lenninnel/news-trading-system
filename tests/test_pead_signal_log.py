@@ -931,3 +931,340 @@ class TestAnalyseTickerAsyncNoStampForNonPEADTrades:
                 "SELECT trade_id FROM pead_signal_log WHERE id = ?", (log_id,),
             ).fetchone()
         assert stamped is None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Q-005 — Benzinga parallel record (RECORDED-ONLY observability)
+# ═════════════════════════════════════════════════════════════════════
+#
+# Benzinga earnings are logged into pead_signal_log as a SECOND row
+# (earnings_source='benzinga') paired to the yfinance row of the same
+# PEAD evaluation via evaluation_id.  Benzinga data is NEVER read by the
+# signal/sizing/threshold/trade logic.  These tests enforce:
+#   * the additive migration (7 columns + the migration bookkeeping row);
+#   * the benzinga-row writer shape (PEAD-decision columns NULL);
+#   * the freeze-safe contract (a forced Benzinga fetch exception must NOT
+#     affect generate_signal, the yfinance row, and must write NO benzinga
+#     row);
+#   * evaluation_id pairing (self-join pairs the two source rows);
+#   * EU/miss (fetch → None) leaves only the yfinance row.
+
+
+def _benzinga_mapped_hit(**overrides) -> dict:
+    """A mapped Benzinga record as fetch_latest_reported_earnings returns
+    it (post ×100 surprise conversion). Values from Q-005 STEP 0 AAPL."""
+    rec = {
+        "announce_date": "2026-04-30",
+        "surprise_pct":  3.61,        # already ×100 (percent units)
+        "actual_eps":    2.01,
+        "estimate_eps":  1.94,
+        "eps_method":    "gaap",
+        "date_status":   "confirmed",
+        "importance":    5,
+        "eps_time":      "AMC",
+    }
+    rec.update(overrides)
+    return rec
+
+
+def _yf_beat_strategy(cache_file, writer, recorder, monkeypatch,
+                      *, surprise=15.0, when=date(2024, 4, 22)):
+    """PEADStrategy on the yfinance path (ticker not in cache) with a
+    mocked yfinance beat and the given benzinga_recorder injected.
+    Returns (strat, ticker)."""
+    import pandas as pd
+    import yfinance as yf
+
+    df = pd.DataFrame(
+        {"Surprise(%)": [surprise]},
+        index=pd.DatetimeIndex([pd.Timestamp(when)]),
+    )
+
+    class FakeTicker:
+        def __init__(self, _ticker):
+            self.earnings_dates = df
+
+    monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    strat = PEADStrategy(
+        cache_path=cache_file,
+        signal_log_writer=writer,
+        benzinga_recorder=recorder,
+    )
+    return strat, "YFBEAT"
+
+
+def _coordinator_recorder(db):
+    """Build the real Coordinator._record_benzinga_earnings fail-safe
+    wrapper bound to *db*, without running __init__ (mirrors the existing
+    TestWriterFailureNeverAffectsSignal.test_coordinator_wrapper pattern)."""
+    from orchestrator.coordinator import Coordinator
+
+    coord = Coordinator.__new__(Coordinator)
+    coord.db = db
+    return coord._record_benzinga_earnings
+
+
+# ── Migration: Benzinga columns + bookkeeping row ────────────────────
+
+
+class TestBenzingaMigration:
+    _NEW_COLS = (
+        "evaluation_id", "actual_eps", "estimate_eps", "eps_method",
+        "eps_time", "date_status", "importance",
+    )
+
+    def test_benzinga_columns_added(self, db):
+        with db._connect() as conn:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(pead_signal_log)"
+            ).fetchall()}
+        for c in self._NEW_COLS:
+            assert c in cols, f"missing column {c}"
+
+    def test_benzinga_migration_row_recorded(self, db):
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT migration_name FROM schema_migrations "
+                "WHERE migration_name='20260529_pead_signal_log_benzinga_columns'"
+            ).fetchall()
+        assert len(rows) == 1
+
+    def test_benzinga_migration_idempotent(self, tmp_path):
+        path = str(tmp_path / "idem_bz.db")
+        Database(path); Database(path); Database(path)
+        import sqlite3
+        with sqlite3.connect(path) as conn:
+            (count,) = conn.execute(
+                "SELECT count(*) FROM schema_migrations "
+                "WHERE migration_name='20260529_pead_signal_log_benzinga_columns'"
+            ).fetchone()
+        assert count == 1
+
+
+# ── DB-level: log_benzinga_earnings_row ──────────────────────────────
+
+
+class TestLogBenzingaEarningsRow:
+    def _row(self) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "timestamp":       now,
+            "ticker":          "AAPL",
+            "session":         "PEAD_OPEN",
+            "earnings_source": "benzinga",
+            "evaluation_id":   "eval-abc",
+            "surprise_pct":    3.61,
+            "announce_date":   "2026-04-30",
+            "actual_eps":      2.01,
+            "estimate_eps":    1.94,
+            "eps_method":      "gaap",
+            "eps_time":        "AMC",
+            "date_status":     "confirmed",
+            "importance":      5,
+            "created_at":      now,
+        }
+
+    def test_roundtrip_capture_fields(self, db):
+        db.log_benzinga_earnings_row(self._row())
+        with db._connect() as conn:
+            r = dict(conn.execute(
+                "SELECT * FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone())
+        for k in ("surprise_pct", "announce_date", "actual_eps", "estimate_eps",
+                  "eps_method", "eps_time", "date_status", "importance",
+                  "evaluation_id", "ticker", "session"):
+            assert r[k] == self._row()[k], f"{k} mismatch"
+        # eps_method is a raw literal string.
+        assert r["eps_method"] == "gaap"
+
+    def test_pead_decision_columns_are_null(self, db):
+        db.log_benzinga_earnings_row(self._row())
+        with db._connect() as conn:
+            r = dict(conn.execute(
+                "SELECT * FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone())
+        # signal/threshold_met/confidence/hold_days/stop_mode/trade_id are
+        # PEAD decisions, not recorded earnings data → NULL on benzinga rows.
+        for k in ("signal", "threshold_met", "confidence", "hold_days",
+                  "stop_mode", "trade_id"):
+            assert r[k] is None, f"{k} should be NULL on a benzinga row"
+
+    def test_null_surprise_allowed(self, db):
+        row = self._row()
+        row["surprise_pct"] = None
+        db.log_benzinga_earnings_row(row)  # must not raise
+
+
+# ── CRITICAL freeze-safe: forced Benzinga fetch exception ────────────
+
+
+class TestBenzingaFailureNeverAffectsPEAD:
+    """The non-negotiable acceptance gate: a forced exception inside the
+    Benzinga fetch must NOT block/alter PEAD signal generation, the
+    yfinance row write, must produce NO benzinga row, and must not
+    propagate."""
+
+    def test_forced_fetch_exception_is_contained(
+        self, db, cache_file, monkeypatch
+    ):
+        from data import benzinga_feed
+
+        # Force the fetch to blow up.
+        def _boom(*a, **k):
+            raise RuntimeError("simulated Benzinga outage")
+
+        monkeypatch.setattr(
+            benzinga_feed, "fetch_latest_reported_earnings", _boom,
+        )
+        # The recorder gates on POLYGON_API_KEY — make it truthy so the
+        # (raising) fetch is actually reached.
+        monkeypatch.setattr("config.settings.POLYGON_API_KEY", "test-key")
+
+        writer = lambda row: db.log_pead_signal(row)
+        recorder = _coordinator_recorder(db)
+        strat, ticker = _yf_beat_strategy(cache_file, writer, recorder, monkeypatch)
+
+        # MUST NOT raise.
+        result = strat.generate_signal(ticker, date(2024, 4, 22), session="PEAD_OPEN")
+
+        # PEAD signal unaffected.
+        assert result is not None
+        assert result.signal == "BUY"
+        assert result.indicators["earnings_source"] == "yfinance_fallback"
+
+        with db._connect() as conn:
+            yf_rows = conn.execute(
+                "SELECT * FROM pead_signal_log WHERE earnings_source='yfinance_fallback'"
+            ).fetchall()
+            bz_count = conn.execute(
+                "SELECT count(*) FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone()[0]
+
+        # The yfinance row was written exactly as before...
+        assert len(yf_rows) == 1
+        assert dict(yf_rows[0])["threshold_met"] == 1
+        # ...and NO benzinga row appears.
+        assert bz_count == 0
+
+    def test_recorder_internal_swallow_returns_none(self, db, monkeypatch):
+        # The coordinator wrapper itself must swallow a fetch exception.
+        from data import benzinga_feed
+
+        monkeypatch.setattr("config.settings.POLYGON_API_KEY", "test-key")
+        monkeypatch.setattr(
+            benzinga_feed, "fetch_latest_reported_earnings",
+            MagicMock(side_effect=RuntimeError("boom")),
+        )
+        recorder = _coordinator_recorder(db)
+        # Must NOT raise and must write nothing.
+        assert recorder("AAPL", "eval-x", "PEAD_OPEN") is None
+        with db._connect() as conn:
+            (n,) = conn.execute(
+                "SELECT count(*) FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone()
+        assert n == 0
+
+
+# ── evaluation_id pairing + benzinga row shape (full path) ───────────
+
+
+class TestBenzingaEvaluationIdPairing:
+    def test_one_evaluation_writes_paired_rows(self, db, cache_file, monkeypatch):
+        from data import benzinga_feed
+
+        monkeypatch.setattr("config.settings.POLYGON_API_KEY", "test-key")
+        monkeypatch.setattr(
+            benzinga_feed, "fetch_latest_reported_earnings",
+            lambda *a, **k: _benzinga_mapped_hit(),
+        )
+        writer = lambda row: db.log_pead_signal(row)
+        recorder = _coordinator_recorder(db)
+        strat, ticker = _yf_beat_strategy(cache_file, writer, recorder, monkeypatch)
+
+        result = strat.generate_signal(ticker, date(2024, 4, 22), session="PEAD_OPEN")
+        assert result is not None and result.signal == "BUY"
+
+        # Self-join on evaluation_id pairs the yfinance + benzinga rows.
+        with db._connect() as conn:
+            pair = conn.execute(
+                """
+                SELECT y.earnings_source AS yf_src, y.surprise_pct AS yf_surprise,
+                       b.earnings_source AS bz_src, b.surprise_pct AS bz_surprise,
+                       b.eps_method      AS bz_method
+                FROM pead_signal_log y
+                JOIN pead_signal_log b
+                  ON y.evaluation_id = b.evaluation_id
+                 AND y.id <> b.id
+                WHERE y.earnings_source='yfinance_fallback'
+                  AND b.earnings_source='benzinga'
+                """
+            ).fetchall()
+        assert len(pair) == 1
+        row = dict(pair[0])
+        assert row["yf_src"] == "yfinance_fallback"
+        assert row["bz_src"] == "benzinga"
+        assert row["bz_surprise"] == pytest.approx(3.61)   # percent units
+        assert row["bz_method"] == "gaap"
+
+    def test_benzinga_row_shape_decision_cols_null(self, db, cache_file, monkeypatch):
+        from data import benzinga_feed
+
+        monkeypatch.setattr("config.settings.POLYGON_API_KEY", "test-key")
+        monkeypatch.setattr(
+            benzinga_feed, "fetch_latest_reported_earnings",
+            lambda *a, **k: _benzinga_mapped_hit(),
+        )
+        writer = lambda row: db.log_pead_signal(row)
+        recorder = _coordinator_recorder(db)
+        strat, ticker = _yf_beat_strategy(cache_file, writer, recorder, monkeypatch)
+        strat.generate_signal(ticker, date(2024, 4, 22), session="PEAD_OPEN")
+
+        with db._connect() as conn:
+            b = dict(conn.execute(
+                "SELECT * FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone())
+
+        # PEAD-decision columns NULL.
+        for k in ("signal", "threshold_met", "confidence", "hold_days",
+                  "stop_mode", "trade_id"):
+            assert b[k] is None, f"{k} should be NULL"
+        # The 6 capture fields populated (+ surprise + announce).
+        assert b["actual_eps"] == 2.01
+        assert b["estimate_eps"] == 1.94
+        assert b["eps_method"] == "gaap"        # raw literal
+        assert b["eps_time"] == "AMC"
+        assert b["date_status"] == "confirmed"
+        assert b["importance"] == 5
+        assert b["surprise_pct"] == pytest.approx(3.61)
+        assert b["session"] == "PEAD_OPEN"
+
+
+# ── EU / miss: fetch → None leaves only the yfinance row ─────────────
+
+
+class TestBenzingaMiss:
+    def test_none_fetch_writes_no_benzinga_row(self, db, cache_file, monkeypatch):
+        from data import benzinga_feed
+
+        monkeypatch.setattr("config.settings.POLYGON_API_KEY", "test-key")
+        # EU name: Benzinga returns no reported record → None.
+        monkeypatch.setattr(
+            benzinga_feed, "fetch_latest_reported_earnings",
+            lambda *a, **k: None,
+        )
+        writer = lambda row: db.log_pead_signal(row)
+        recorder = _coordinator_recorder(db)
+        strat, ticker = _yf_beat_strategy(cache_file, writer, recorder, monkeypatch)
+
+        result = strat.generate_signal(ticker, date(2024, 4, 22), session="PEAD_OPEN")
+        assert result is not None and result.signal == "BUY"
+
+        with db._connect() as conn:
+            yf_n = conn.execute(
+                "SELECT count(*) FROM pead_signal_log WHERE earnings_source='yfinance_fallback'"
+            ).fetchone()[0]
+            bz_n = conn.execute(
+                "SELECT count(*) FROM pead_signal_log WHERE earnings_source='benzinga'"
+            ).fetchone()[0]
+        assert yf_n == 1   # yfinance row intact
+        assert bz_n == 0   # no benzinga row on a miss
