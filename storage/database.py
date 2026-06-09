@@ -523,6 +523,35 @@ class Database:
                     trade_id        TEXT,
                     created_at      TEXT    NOT NULL
                 );
+
+                -- Benzinga PRE-ANNOUNCEMENT estimate snapshot sidecar
+                -- (Q-013 Step 4).  RECORDED-ONLY, fully isolated: nothing in
+                -- the live trading / signal / execution path reads or writes
+                -- this.  A standalone daily timer (scripts/capture_preann_
+                -- estimates.py) snapshots Benzinga's CURRENT consensus
+                -- estimate at T-1 for upcoming reporters, so a FUTURE
+                -- analysis can compare it against Benzinga's historical
+                -- record for the same event and certify whether Benzinga
+                -- preserves the pre-announcement estimate (PIT) or restates
+                -- it.  estimated_eps + raw_json are stored VERBATIM in
+                -- Benzinga's NATIVE units — NO unit conversion, NO surprise
+                -- computation here (unlike the Q-005 live sidecar, which
+                -- ×100s the surprise FRACTION at its mapping boundary).
+                CREATE TABLE IF NOT EXISTS benzinga_estimate_preann_snapshot (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker                TEXT    NOT NULL,
+                    scheduled_report_date TEXT    NOT NULL,  -- Benzinga 'date'
+                    date_status           TEXT,              -- confirmed/projected
+                    capture_timestamp_utc TEXT    NOT NULL,  -- when WE captured (T-1)
+                    estimated_eps         REAL,              -- consensus, VERBATIM
+                    eps_method            TEXT,
+                    importance            INTEGER,
+                    fiscal_period         TEXT,
+                    fiscal_year           TEXT,
+                    benzinga_id           TEXT,
+                    raw_json              TEXT    NOT NULL,   -- full untouched record
+                    UNIQUE(ticker, scheduled_report_date, capture_timestamp_utc)
+                );
                 """
             )
 
@@ -679,6 +708,20 @@ class Database:
                 VALUES (?, ?)
                 """,
                 ("20260529_pead_signal_log_benzinga_columns",
+                 datetime.now(timezone.utc).isoformat()),
+            )
+
+            # Q-013 Step 4: register the Benzinga pre-announcement estimate
+            # snapshot table migration (same ad-hoc one-row bookkeeping;
+            # INSERT OR IGNORE → idempotent, re-running _init_schema does NOT
+            # add a duplicate row).
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations
+                    (migration_name, applied_at)
+                VALUES (?, ?)
+                """,
+                ("20260609_benzinga_estimate_preann_snapshot",
                  datetime.now(timezone.utc).isoformat()),
             )
 
