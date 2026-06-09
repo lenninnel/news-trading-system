@@ -1,0 +1,13 @@
+[Unit]
+Description=NTS Benzinga pre-announcement estimate snapshot capture (Q-013, recorded-only)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trading/news-trading-system
+ExecStart=/home/trading/news-trading-system/.venv/bin/python3 /home/trading/news-trading-system/scripts/capture_preann_estimates.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

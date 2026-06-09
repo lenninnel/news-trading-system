@@ -1,0 +1,13 @@
+[Unit]
+Description=NTS Benzinga pre-announcement estimate snapshot capture timer (daily, T-1 pre-market)
+
+[Timer]
+# 11:00 UTC daily — comfortably before any US BMO announcement and a full
+# T-1 ahead of next-day reporters. Standalone: NOT part of the trading
+# daemon/scheduler session list.
+OnCalendar=*-*-* 11:00:00 UTC
+Persistent=true
+Unit=nts-preann-estimates.service
+
+[Install]
+WantedBy=timers.target
