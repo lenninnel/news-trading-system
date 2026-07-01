@@ -17,6 +17,7 @@ Run with:
     python3 -m pytest tests/test_technical_agent.py -v
 """
 
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -1741,3 +1742,167 @@ class TestFetchMultiTimeframeDirect:
         assert result["timeframe_alignment"] == 0.5
         assert result["rsi_1h"] is None
         assert result["macd_15m_hist"] is None
+
+
+# ===========================================================================
+# 14. DAILY tier sourced from the clean daily_ohlc store (Freeze-Lift Fix D3)
+# ===========================================================================
+
+def _seed_daily_ohlc(db, ticker, closes):
+    """Write ``closes`` into daily_ohlc as consecutive weekday bars ending today.
+
+    Rows are dated backward from today (UTC) over weekdays only, then written
+    ascending — matching the point-in-time store the technical agent reads.
+    Returns the list of (date_str, close) actually written, ascending.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    day = datetime.now(timezone.utc).date()
+    dates = []
+    while len(dates) < len(closes):
+        if day.weekday() < 5:  # Mon–Fri
+            dates.append(day.strftime("%Y-%m-%d"))
+        day -= timedelta(days=1)
+    dates.reverse()  # ascending
+
+    rows = []
+    for d, px in zip(dates, closes):
+        rows.append({
+            "ticker": ticker,
+            "date": d,
+            "open": px * 0.99,
+            "high": px * 1.01,
+            "low": px * 0.98,
+            "close": px,
+            # adj_close deliberately DIFFERENT from close — the adapter must use
+            # raw close, never adj_close.
+            "adj_close": px * 0.80,
+            "volume": 1_000_000,
+            "source": "polygon",
+        })
+    db.upsert_daily_ohlc(rows)
+    return list(zip(dates, closes))
+
+
+class TestDailyOhlcSourcing:
+    """DAILY indicators + the ``price`` field are sourced from daily_ohlc.
+
+    Freeze-Lift Fix 1/4 (D3): the yfinance-class feed returned multi-month-stale
+    closes; the DAILY tier now reads the clean daily_ohlc store, falling back to
+    yfinance only when the store is too thin (< 60 bars).
+    """
+
+    def _make_db(self):
+        import tempfile
+
+        from storage.database import Database
+
+        f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        f.close()
+        return Database(db_path=f.name), f.name
+
+    def test_fetch_history_uses_daily_ohlc_when_rows_present(self):
+        """With enough clean rows, _fetch_history returns a daily_ohlc-sourced
+        DataFrame with the capitalized OHLCV column shape the ``ta`` pipeline
+        expects — and does NOT touch the yfinance feed."""
+        db, path = self._make_db()
+        try:
+            closes = [100.0 + i * 0.25 for i in range(120)]  # >= 60 bars
+            _seed_daily_ohlc(db, "TST", closes)
+
+            mock_yf = MagicMock()  # must never be called for the daily tier
+            agent = TechnicalAgent(db=db, alpaca_client=mock_yf)
+            df = agent._fetch_history("TST")
+
+            # Shape adapter: capitalized columns, DatetimeIndex, ascending.
+            assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+            assert isinstance(df.index, pd.DatetimeIndex)
+            assert df.index.is_monotonic_increasing
+            assert len(df) == len(closes)
+            # Clean store was used — yfinance feed untouched.
+            mock_yf.get_bars.assert_not_called()
+        finally:
+            os.unlink(path)
+
+    def test_close_column_uses_raw_close_not_adj_close(self):
+        """The Close column must carry raw ``close``, never ``adj_close``
+        (adj_close was seeded at 0.80 * close)."""
+        db, path = self._make_db()
+        try:
+            closes = [150.0 + i * 0.1 for i in range(80)]
+            _seed_daily_ohlc(db, "TST", closes)
+            agent = TechnicalAgent(db=db)
+            df = agent._fetch_history("TST")
+            assert abs(float(df["Close"].iloc[-1]) - closes[-1]) < 1e-9
+            # Not the adj_close (which would be ~0.80 * close).
+            assert float(df["Close"].iloc[-1]) > closes[-1] * 0.9
+        finally:
+            os.unlink(path)
+
+    def test_indicators_price_equals_last_daily_ohlc_close(self):
+        """indicators['price'] must equal the last daily_ohlc close for the
+        seeded ticker (the core of the D3 fix)."""
+        db, path = self._make_db()
+        try:
+            closes = [200.0 + i * 0.5 for i in range(90)]
+            written = _seed_daily_ohlc(db, "TST", closes)
+            last_close = written[-1][1]
+
+            agent = TechnicalAgent(db=db)
+            df = agent._fetch_history("TST")
+            indicators = agent._calculate_indicators(df)
+            assert indicators["price"] == last_close
+        finally:
+            os.unlink(path)
+
+    def test_falls_back_to_yfinance_when_insufficient_rows(self, caplog):
+        """With < 60 clean bars, _fetch_history falls back to the yfinance feed
+        and logs the fallback loudly."""
+        db, path = self._make_db()
+        try:
+            closes = [100.0 + i for i in range(30)]  # < 60 bars
+            _seed_daily_ohlc(db, "TST", closes)
+
+            yf_df = _make_uptrend_df(n=250)
+            mock_yf = MagicMock()
+            mock_yf.get_bars.return_value = yf_df
+
+            agent = TechnicalAgent(db=db, alpaca_client=mock_yf)
+            with caplog.at_level(logging.WARNING, logger="agents.technical_agent"):
+                df = agent._fetch_history("TST")
+
+            # Fell back to the yfinance feed.
+            mock_yf.get_bars.assert_called_once_with("TST", "1Day", limit=252)
+            assert df is yf_df
+            # And logged loudly so the regression is visible.
+            assert any(
+                "FALLING BACK" in rec.message and "TST" in rec.message
+                for rec in caplog.records
+            )
+        finally:
+            os.unlink(path)
+
+    def test_no_rows_falls_back(self):
+        """A ticker with zero clean bars falls back to yfinance."""
+        db, path = self._make_db()
+        try:
+            yf_df = _make_simple_df(n=250)
+            mock_yf = MagicMock()
+            mock_yf.get_bars.return_value = yf_df
+            agent = TechnicalAgent(db=db, alpaca_client=mock_yf)
+            df = agent._fetch_history("NOPE")
+            mock_yf.get_bars.assert_called_once_with("NOPE", "1Day", limit=252)
+            assert df is yf_df
+        finally:
+            os.unlink(path)
+
+    def test_magicmock_db_falls_back_cleanly(self):
+        """A MagicMock db handle (as used by existing run() tests) is treated as
+        'no clean data' and falls back to yfinance without error."""
+        yf_df = _make_simple_df(n=250)
+        mock_yf = MagicMock()
+        mock_yf.get_bars.return_value = yf_df
+        agent = TechnicalAgent(db=MagicMock(), alpaca_client=mock_yf)
+        df = agent._fetch_history("AAPL")
+        mock_yf.get_bars.assert_called_once_with("AAPL", "1Day", limit=252)
+        assert df is yf_df
