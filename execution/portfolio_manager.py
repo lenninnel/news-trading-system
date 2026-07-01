@@ -61,6 +61,18 @@ _SECTOR_MAP: dict[str, str] = {
 _SECTOR_CACHE: dict[str, str] = {}   # ticker → normalised sector (process-level cache)
 
 
+# ── Recently-stopped cool-down (Q-016) ─────────────────────────────────────────
+# Block a BUY on a ticker whose LAST closed round-trip ended in a STOP exit
+# within the cool-down window (blind time gate — no downtrend/price condition).
+# Exit-reason is NOT persisted, so the stop is reconstructed live from
+# trade_history: a closing SELL is a STOP when its executed price (fallback:
+# price) is at/below the opening BUY's stop_loss, allowing a small tolerance for
+# gap-throughs.  Named here so N and the tolerance are tunable without hunting
+# magic numbers.
+_COOLDOWN_STOP_TOL = 0.003   # 0.3% below stop_loss still counts as a stop exit
+_COOLDOWN_SESSIONS = 1       # block re-entry within this many trading sessions
+
+
 def _fetch_sector(ticker: str) -> str:
     """Fetch the normalised sector for *ticker* from yfinance.
 
@@ -244,6 +256,16 @@ class PortfolioManager:
             reason = f"Already holding {ticker}"
             self._log_violation(ticker, strategy, amount_usd, "duplicate", reason)
             return False, reason
+
+        # 1b. Recently-stopped cool-down (Q-016). A just-stopped ticker is no
+        #     longer held, so the duplicate gate above cannot catch it; this is
+        #     a per-ticker eligibility gate that blocks a re-entry within
+        #     _COOLDOWN_SESSIONS trading sessions of the last STOP exit. Fails
+        #     OPEN — a guard bug must never block all trading.
+        cooled, cd_reason = self._recently_stopped(ticker)
+        if cooled:
+            self._log_violation(ticker, strategy, amount_usd, "cooldown_stop", cd_reason)
+            return False, cd_reason
 
         # 2. Total position cap
         if len(positions) >= self.MAX_POSITIONS:
@@ -736,6 +758,97 @@ class PortfolioManager:
             )
         except Exception as exc:
             log.warning("Could not persist portfolio violation: %s", exc)
+
+    def _recently_stopped(self, ticker: str) -> tuple[bool, "str | None"]:
+        """Return (blocked, reason) when *ticker*'s LAST closed round-trip ended
+        in a STOP exit within ``_COOLDOWN_SESSIONS`` trading sessions of today.
+
+        Exit-reason is not persisted (Q-015/Q-016 finding), so the stop is
+        reconstructed live from ``trade_history`` — the same method the diagnosis
+        used: FIFO-pair BUYs with SELLs to find the last completed round-trip,
+        then classify it a STOP when the closing SELL's executed price (fallback:
+        ``price``) is at/below the opening BUY's ``stop_loss`` * (1 +
+        ``_COOLDOWN_STOP_TOL``).  Session gap reuses the trading-day counter from
+        ``data.events_feed`` (same-day = 0, next trading day = 1).
+
+        BLIND cool-down: no downtrend/price condition — purely the time gate.
+
+        Fails OPEN on any ambiguity (no closed round-trip, no opening stop_loss,
+        unparseable prices/dates) or read error — a guard bug must never block
+        all trading.
+        """
+        ticker = ticker.upper()
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT action, price, executed_price, stop_loss, created_at "
+                    "FROM trade_history WHERE ticker = ? "
+                    "ORDER BY created_at ASC, id ASC",
+                    (ticker,),
+                ).fetchall()
+        except Exception as exc:
+            log.warning("recently-stopped read failed for %s: %s", ticker, exc)
+            return False, None
+
+        # FIFO-pair BUYs with SELLs to isolate the LAST completed round-trip.
+        open_buys: list = []
+        last_rt: "tuple | None" = None  # (opening_buy_row, closing_sell_row)
+        for r in rows:
+            action = (r["action"] or "").upper()
+            if action == "BUY":
+                open_buys.append(r)
+            elif action == "SELL":
+                if open_buys:
+                    last_rt = (open_buys.pop(0), r)  # FIFO
+        if last_rt is None:
+            return False, None  # never closed a round-trip → nothing to cool down
+
+        buy, sell = last_rt
+        stop = buy["stop_loss"]
+        if stop is None:
+            return False, None  # cannot classify a stop without the opening stop
+
+        close_px = sell["executed_price"]
+        if close_px is None:
+            close_px = sell["price"]
+        if close_px is None:
+            return False, None
+
+        try:
+            stop = float(stop)
+            close_px = float(close_px)
+        except (TypeError, ValueError):
+            return False, None
+        if stop <= 0:
+            return False, None
+
+        # STOP classification — blind, price-vs-stop only.
+        if close_px > stop * (1.0 + _COOLDOWN_STOP_TOL):
+            return False, None  # last exit was a target/other, not a stop
+
+        # Trading-session gap between the stop (SELL date) and today (UTC).
+        try:
+            from data.events_feed import _trading_days_between
+            sell_dt = datetime.fromisoformat(sell["created_at"])
+            if sell_dt.tzinfo is not None:
+                sell_dt = sell_dt.astimezone(timezone.utc)
+            sell_date = sell_dt.date()
+            today = datetime.now(timezone.utc).date()
+            if sell_date > today:
+                return False, None  # future-dated anomaly → fail open
+            gap = _trading_days_between(sell_date, today)
+        except Exception as exc:
+            log.warning("recently-stopped gap calc failed for %s: %s", ticker, exc)
+            return False, None
+
+        if 0 <= gap <= _COOLDOWN_SESSIONS:
+            reason = (
+                f"Cool-down: {ticker} was stopped out on {sell_date.isoformat()} "
+                f"({gap} trading session{'' if gap == 1 else 's'} ago) — blocking "
+                f"re-entry within {_COOLDOWN_SESSIONS} session(s)"
+            )
+            return True, reason
+        return False, None
 
     def _check_drawdown_halt(self) -> tuple[bool, str]:
         """Return (halted, reason). Reason is empty when not halted.
