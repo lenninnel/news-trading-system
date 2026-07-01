@@ -82,6 +82,16 @@ _MAX_RISK_FRACTION      = 0.02   # 2 % account risk per trade
 _TRANSACTION_COST       = 0.001  # 0.1 % per trade
 _REWARD_RISK_RATIO      = 2.0    # 2:1 take-profit
 _MIN_CONFIDENCE         = 30.0   # below this → no position
+
+# ── ATR stop-distance floor (Q-012 Familie 1) ──────────────────────────────────
+# The close-to-close ATR approximation collapses toward 0 on flat/low-vol tape,
+# so `stop_distance = ATR × multiplier` can shrink to ~entry → no downside
+# protection (observed on XOM/CVX/JPM Combined entries, stops only 0.02–0.28%
+# below entry). Floor the stop distance at k = 1.0% of the entry price.
+# k = 1.0% is R's fixed Stage-5 value, anchored just BELOW the P5 of the healthy
+# long-stop distribution (P5 = 1.08%): it lifts ONLY the degenerate <0.3% stops
+# and never touches a healthy stop. Not a range, not configurable.
+_ATR_STOP_FLOOR_PCT     = 0.01   # k = 1.0% of entry — minimum stop distance
 _WIN_PROB_BASE          = 0.50   # base win probability (random)
 _WIN_PROB_RANGE         = 0.30   # additional range driven by confidence
 
@@ -499,6 +509,12 @@ class RiskAgent(BaseAgent):
             return {"atr": None, "atr_available": False}
 
         stop_distance = atr * atr_stop_multiplier
+        # Q-012 Familie 1: floor the stop distance so a near-zero ATR (flat tape)
+        # cannot collapse the stop onto the entry. Applies to BOTH directions
+        # (the max() sits before the BUY/SELL branch below). Only stop_distance
+        # is floored — tp_distance and the 2:1 RR minimum are untouched and
+        # recompute correctly against the floored distance.
+        stop_distance = max(stop_distance, _ATR_STOP_FLOOR_PCT * entry_price)
         tp_distance = atr * atr_tp_multiplier
 
         # Enforce minimum 2:1 reward/risk
