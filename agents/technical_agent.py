@@ -35,6 +35,7 @@ Requires:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -74,6 +75,17 @@ class TechnicalAgent(BaseAgent):
 
     # Enough history for SMA-200 and indicator warm-up
     _DOWNLOAD_PERIOD = "1y"
+
+    # DAILY indicators + the "price" field are sourced from the clean
+    # ``daily_ohlc`` store (Polygon, point-in-time) instead of the stale-prone
+    # yfinance-class feed.  yfinance is kept only as a fallback when the clean
+    # store is too thin to compute the daily indicators.
+    #
+    # ~380 calendar days back guarantees >= 252 trading bars (SMA-200 + buffer).
+    _DAILY_OHLC_LOOKBACK_DAYS = 380
+    # Below this many clean bars we cannot compute SMA-200 etc., so we fall back
+    # to yfinance (and log loudly) rather than serve a degraded daily tier.
+    _MIN_DAILY_OHLC_BARS = 60
 
     def __init__(
         self,
@@ -221,7 +233,10 @@ class TechnicalAgent(BaseAgent):
         """Download OHLCV data and validate the result.
 
         Crypto tickers are routed to Binance.  German/EU tickers are
-        routed to EODHD with yfinance fallback.  All others use Alpaca.
+        routed to EODHD with yfinance fallback.  All other (US/other) stocks
+        source their DAILY bars from the clean ``daily_ohlc`` store (Polygon,
+        point-in-time), falling back to the yfinance-class feed only when the
+        clean store is too thin to compute the daily indicators.
         """
         if ticker.upper() in CRYPTO_TICKERS:
             df = self._binance.get_ohlcv(ticker)
@@ -232,7 +247,25 @@ class TechnicalAgent(BaseAgent):
         if is_german_ticker(ticker):
             return self._fetch_german_history(ticker)
 
-        # US / other stocks: use yfinance
+        # US / other stocks: prefer the clean daily_ohlc store for the DAILY
+        # tier (indicators + the "price" field).  This is the D3 fix — the
+        # yfinance-class feed returned multi-month-stale closes that slipped
+        # under the coordinator's >20% divergence guard.
+        clean_df = self._fetch_daily_ohlc_df(ticker)
+        if clean_df is not None and len(clean_df) >= self._MIN_DAILY_OHLC_BARS:
+            logger.debug(
+                "daily_ohlc returned %d clean bars for %s", len(clean_df), ticker,
+            )
+            return clean_df
+
+        # Fall back to yfinance — log LOUDLY so a silent regression is visible.
+        clean_n = 0 if clean_df is None else len(clean_df)
+        logger.warning(
+            "daily_ohlc insufficient for %s (%d bars < %d) — FALLING BACK to the "
+            "yfinance feed for the daily tier; indicators/price for this ticker "
+            "may use stale-prone data",
+            ticker, clean_n, self._MIN_DAILY_OHLC_BARS,
+        )
         try:
             df = self._yf.get_bars(ticker, "1Day", limit=252)
             if not df.empty:
@@ -242,6 +275,65 @@ class TechnicalAgent(BaseAgent):
             logger.warning("yfinance bars failed for %s: %s", ticker, exc)
 
         raise ValueError(f"No price data returned for ticker '{ticker}'")
+
+    def _fetch_daily_ohlc_df(self, ticker: str) -> pd.DataFrame | None:
+        """Read daily bars from the clean ``daily_ohlc`` store and adapt them to
+        the DataFrame shape ``_calculate_indicators`` expects.
+
+        ``db.get_daily_ohlc`` returns a list-of-dicts with LOWERCASE keys
+        (ticker, date, open, high, low, close, adj_close, volume, ...), ordered
+        ascending by date.  This adapter renames the OHLCV columns to the
+        capitalized form (Open/High/Low/Close/Volume) the ``ta`` pipeline reads
+        via ``safe_column`` and indexes the frame by date (ascending preserved).
+
+        ``close`` — NOT ``adj_close`` — is used for the Close column to match
+        the raw last-close prices the coordinator/guard and the momentum/pullback
+        strategies already run on.
+
+        Returns ``None`` when the store has no usable rows for *ticker* (the
+        caller then falls back to the yfinance feed).
+        """
+        try:
+            end = datetime.now(timezone.utc).date()
+            start = end - timedelta(days=self._DAILY_OHLC_LOOKBACK_DAYS)
+            rows = self._db.get_daily_ohlc(
+                ticker, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+            )
+        except Exception as exc:
+            logger.warning("daily_ohlc read failed for %s: %s", ticker, exc)
+            return None
+
+        # Defensive: a real reader returns a list; a test MagicMock (or any
+        # non-list) is treated as "no clean data" so the caller falls back.
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+        required = {"date", "open", "high", "low", "close", "volume"}
+        missing = required - set(df.columns)
+        if missing:
+            logger.warning(
+                "daily_ohlc rows for %s missing columns %s — falling back to yfinance",
+                ticker, sorted(missing),
+            )
+            return None
+
+        df = df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",  # raw close, not adj_close
+                "volume": "Volume",
+            }
+        )
+        # Date-indexed, ascending (get_daily_ohlc already returns ASC), tz-naive.
+        df.index = pd.to_datetime(df["date"])
+        df.index.name = None
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
 
     def _fetch_german_history(self, ticker: str) -> pd.DataFrame:
         """Fetch OHLCV for a German ticker via EODHD, falling back to yfinance."""
