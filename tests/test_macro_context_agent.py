@@ -1,5 +1,5 @@
 """
-Tests for MacroContextAgent and its integration with the bull/bear debate.
+Tests for MacroContextAgent.
 
 Covers:
     1. Agent respects the ENABLE_MACRO_CONTEXT feature flag.
@@ -7,12 +7,12 @@ Covers:
     3. Happy path: Claude mock returns a valid block → agent returns it.
     4. Timeout handling: slow Claude → agent returns "" (never raises).
     5. Generic exception handling: Claude explodes → agent returns "".
-    6. Integration: BullResearcher / BearResearcher prepend macro_context to
-       the user message (NOT to the system prompt — protects ephemeral cache).
-    7. BullBearDebate.run_async forwards macro_context to both researchers.
-    8. Caching semantics: the scheduler fetches macro_context ONCE per
+    6. Caching semantics: the scheduler fetches macro_context ONCE per
        session, not per ticker — verified by counting Claude calls across
        a multi-ticker batch.
+
+(Q-014: the bull/bear debate — formerly the consumer of macro_context —
+was removed; its integration tests went with it.)
 
 No real network calls — everything is monkeypatched.
 """
@@ -213,167 +213,12 @@ def test_claude_exception_returns_empty_string(monkeypatch):
     assert result == ""
 
 
-# ── Bull/bear debate integration ─────────────────────────────────────────
-
-
-def test_bull_researcher_prepends_macro_context_to_user_message(monkeypatch):
-    """Macro context must land in the user message so the cached system
-    prompt is not invalidated."""
-    from agents.bull_bear_debate import BullResearcher
-
-    mock_client = MagicMock()
-    # Return a valid JSON string in content[0].text
-    mock_client.messages.create.return_value = SimpleNamespace(
-        content=[SimpleNamespace(
-            type="text",
-            text='{"bull_case": "ok", "confidence_boost": 0.1}',
-        )],
-        usage=SimpleNamespace(
-            cache_read_input_tokens=0, cache_creation_input_tokens=0,
-        ),
-    )
-    researcher = BullResearcher(client=mock_client)
-
-    researcher.analyze(
-        ticker="AAPL",
-        signal="BUY",
-        confidence=0.7,
-        technical_data={"rsi": 55},
-        sentiment_data={"signal": "BULL", "avg_score": 0.6},
-        macro_context=SAMPLE_MACRO,
-    )
-
-    call = mock_client.messages.create.call_args
-    user_message = call.kwargs["messages"][0]["content"]
-
-    # Macro block is prepended; ticker data follows after the separator.
-    assert user_message.startswith("MACRO CONTEXT")
-    assert "---" in user_message
-    assert "Ticker: AAPL" in user_message
-
-    # System prompt must remain untouched (cached block only — no macro).
-    system = call.kwargs["system"]
-    if isinstance(system, list):
-        system_text = system[0]["text"]
-    else:
-        system_text = system
-    assert "MACRO CONTEXT" not in system_text
-
-
-def test_bear_researcher_prepends_macro_context(monkeypatch):
-    from agents.bull_bear_debate import BearResearcher
-
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = SimpleNamespace(
-        content=[SimpleNamespace(
-            type="text",
-            text='{"bear_case": "ok", "confidence_penalty": -0.1}',
-        )],
-        usage=SimpleNamespace(
-            cache_read_input_tokens=0, cache_creation_input_tokens=0,
-        ),
-    )
-    researcher = BearResearcher(client=mock_client)
-
-    researcher.analyze(
-        ticker="TSLA",
-        signal="SELL",
-        confidence=0.6,
-        technical_data={"rsi": 72},
-        sentiment_data={"signal": "BEAR", "avg_score": -0.4},
-        macro_context=SAMPLE_MACRO,
-    )
-
-    user_message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
-    assert user_message.startswith("MACRO CONTEXT")
-    assert "Ticker: TSLA" in user_message
-
-
-def test_empty_macro_context_keeps_user_message_unchanged():
-    """Legacy path: empty macro_context → user message matches old format."""
-    from agents.bull_bear_debate import BullResearcher
-
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = SimpleNamespace(
-        content=[SimpleNamespace(
-            type="text",
-            text='{"bull_case": "ok", "confidence_boost": 0.0}',
-        )],
-        usage=SimpleNamespace(
-            cache_read_input_tokens=0, cache_creation_input_tokens=0,
-        ),
-    )
-    researcher = BullResearcher(client=mock_client)
-
-    researcher.analyze(
-        ticker="NVDA", signal="BUY", confidence=0.8,
-        technical_data={}, sentiment_data={},
-        macro_context="",
-    )
-
-    user_message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
-    # No MACRO CONTEXT prefix, no separator
-    assert "MACRO CONTEXT" not in user_message
-    assert "---" not in user_message
-    assert user_message.startswith("Ticker: NVDA")
-
-
-def test_debate_run_async_threads_macro_context_to_both_researchers(monkeypatch):
-    """BullBearDebate.run_async forwards macro_context to bull AND bear."""
-    from agents.bull_bear_debate import BullBearDebate
-
-    bull_mock = MagicMock()
-    bull_mock.analyze.return_value = {"bull_case": "b", "confidence_boost": 0.05}
-    bear_mock = MagicMock()
-    bear_mock.analyze.return_value = {"bear_case": "r", "confidence_penalty": -0.05}
-
-    debate = BullBearDebate(bull=bull_mock, bear=bear_mock)
-
-    asyncio.run(debate.run_async(
-        ticker="META",
-        signal="BUY",
-        confidence=0.7,
-        technical_data={},
-        sentiment_data={},
-        macro_context="MACRO X",
-    ))
-
-    # Both researchers called exactly once, each receiving macro_context="MACRO X"
-    assert bull_mock.analyze.call_count == 1
-    assert bull_mock.analyze.call_args.kwargs["macro_context"] == "MACRO X"
-    assert bear_mock.analyze.call_count == 1
-    assert bear_mock.analyze.call_args.kwargs["macro_context"] == "MACRO X"
-
-
-def test_debate_run_sync_threads_macro_context(monkeypatch):
-    from agents.bull_bear_debate import BullBearDebate
-
-    bull_mock = MagicMock()
-    bull_mock.analyze.return_value = {"bull_case": "b", "confidence_boost": 0.0}
-    bear_mock = MagicMock()
-    bear_mock.analyze.return_value = {"bear_case": "r", "confidence_penalty": 0.0}
-
-    debate = BullBearDebate(bull=bull_mock, bear=bear_mock)
-
-    debate.run(
-        ticker="XOM",
-        signal="BUY",
-        confidence=0.6,
-        technical_data={},
-        sentiment_data={},
-        macro_context="SYNC CONTEXT",
-    )
-
-    assert bull_mock.analyze.call_args.kwargs["macro_context"] == "SYNC CONTEXT"
-    assert bear_mock.analyze.call_args.kwargs["macro_context"] == "SYNC CONTEXT"
-
-
 # ── Session-level caching (fetch once, reuse per-ticker) ─────────────────
 
 
 def test_coordinator_stores_macro_context_for_reuse():
-    """Coordinator holds macro_context as an attribute so per-ticker debate
-    calls read the same string — no re-fetching per ticker."""
+    """Coordinator holds macro_context as an attribute so per-ticker
+    consumers read the same string — no re-fetching per ticker."""
     from orchestrator.coordinator import Coordinator
 
     # Use a full sentinel string so we can assert equality

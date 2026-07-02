@@ -64,7 +64,6 @@ import time as _time
 
 log = logging.getLogger(__name__)
 
-from agents.bull_bear_debate import BullBearDebate, DebateResult
 from agents.regime_agent import RegimeAgent
 from agents.regime_detector import RegimeDetector
 from agents.risk_agent import RiskAgent
@@ -109,10 +108,11 @@ _FUSION_TABLE: dict[tuple[str, str], str] = {
     ("HOLD", "HOLD"): "HOLD",
 }
 
-# Post-debate confidence floors per signal type. Applied after the debate
-# may have lowered confidence — directional signals must stay above their
-# execution gates. HOLD is intentionally absent: strategies emit data-driven
-# HOLD confidence (Phase A) and clamping back to 0.25 erases the variance.
+# Confidence floors per signal type. Applied unconditionally after signal
+# fusion (Q-014: formerly lived inside the bull/bear debate block) —
+# directional signals must stay above their execution gates. HOLD is
+# intentionally absent: strategies emit data-driven HOLD confidence
+# (Phase A) and clamping back to 0.25 erases the variance.
 _SIGNAL_FLOORS: dict[str, float] = {
     "STRONG BUY":  0.60,
     "STRONG SELL": 0.60,
@@ -164,7 +164,6 @@ class Coordinator:
         marketaux_feed: MarketauxFeed | None = None,
         apewisdom_feed: ApeWisdomFeed | None = None,
         adanos_feed: AdanosFeed | None = None,
-        debate_agent: BullBearDebate | None = None,
         macro_context: str = "",
     ) -> None:
         self.db = db or Database()
@@ -176,7 +175,6 @@ class Coordinator:
         self.risk_agent = risk_agent or RiskAgent(db=self.db)
         self.regime_agent = regime_agent or RegimeAgent()
         self.regime_detector = RegimeDetector()
-        self.debate_agent = debate_agent or BullBearDebate()
         self.paper_trader = paper_trader or create_trader(db=self.db)
         self.reddit_feed = reddit_feed or RedditFeed()
         self.stocktwits_feed = stocktwits_feed or StockTwitsFeed()
@@ -186,7 +184,9 @@ class Coordinator:
         self.signal_logger = SignalLogger(db=self.db)
         # Once-per-session macro context injected by the scheduler. Empty
         # string when ENABLE_MACRO_CONTEXT is off, the session is non-US,
-        # or the Haiku call failed — debate prompts stay legacy.
+        # or the Haiku call failed. Currently only recorded via the
+        # macro_context_used flag in signal_events (Q-014 removed its
+        # former consumer, the bull/bear debate prompts).
         self.macro_context = macro_context or ""
 
         # PEAD strategy (no Claude API needed — pure data).
@@ -346,7 +346,6 @@ class Coordinator:
             technical = result.get("technical") or {}
             indicators = technical.get("indicators") or {}
             sentiment = result.get("sentiment") or {}
-            debate = result.get("debate")
 
             price = indicators.get("price")
             sma_50 = indicators.get("sma_50")
@@ -369,18 +368,12 @@ class Coordinator:
 
             execution = result.get("execution") or {}
 
-            # Determine debate outcome
+            # Debate removed (Q-014) — the bull_case/bear_case/debate_outcome
+            # columns stay in the schema but no longer receive debate output.
+            # The scanner path keeps its distinct tag; everything else logs
+            # the pre-existing no-debate value.
             if result.get("is_scanner_candidate"):
                 debate_outcome = "scanner_no_debate"
-            elif debate:
-                if debate.degraded:
-                    debate_outcome = "skipped"
-                elif debate.final_signal == debate.original_signal:
-                    debate_outcome = "agree"
-                elif debate.adjusted_confidence < debate.original_confidence:
-                    debate_outcome = "cautious"
-                else:
-                    debate_outcome = "disagree"
             else:
                 debate_outcome = "skipped"
 
@@ -396,8 +389,8 @@ class Coordinator:
                 "sentiment_score": sentiment_score,
                 "news_score": news_score,
                 "social_score": social_score,
-                "bull_case": debate.bull_case if debate else None,
-                "bear_case": debate.bear_case if debate else None,
+                "bull_case": None,
+                "bear_case": None,
                 "debate_outcome": debate_outcome,
                 "price_at_signal": price,
                 "trade_executed": 1 if execution.get("trade_id") else 0,
@@ -568,7 +561,6 @@ class Coordinator:
                 "technical": {"signal": "N/A", "indicators": {}},
                 "risk": {"skipped": True},
                 "execution": None,
-                "debate": None,
                 "elapsed_s": round(elapsed, 2),
             }
 
@@ -713,7 +705,6 @@ class Coordinator:
             "technical": {"signal": "N/A", "indicators": {}},
             "risk": risk,
             "execution": execution,
-            "debate": None,
             "elapsed_s": round(elapsed, 2),
         }
         self._log_signal_event(final_result, session=session)
@@ -878,6 +869,25 @@ class Coordinator:
             technical_confidence=fallback_technical_confidence,
         )
         return label, conf, "FUSION_FALLBACK"
+
+    @staticmethod
+    def _apply_signal_floor(ticker: str, signal: str, conf: float) -> float:
+        """Clamp confidence to the signal-type minimum floor.
+
+        Applied unconditionally after signal fusion (Q-014: the clamp
+        formerly lived inside the bull/bear debate block and only ran
+        when the debate was enabled). Directional signals must not fall
+        below their execution gates; HOLD has no floor — strategies emit
+        data-driven HOLD confidence and clamping erases the variance.
+        """
+        floor = _SIGNAL_FLOORS.get(signal, 0.0)
+        if conf < floor:
+            log.debug(
+                "[%s] Confidence %.2f below %s floor %.2f — clamping",
+                ticker, conf, signal, floor,
+            )
+            return floor
+        return conf
 
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
@@ -1230,8 +1240,8 @@ class Coordinator:
                 log.warning("[%s] Regime detection failed: %s", ticker, exc)
 
         # --- Strategy votes (Momentum + Pullback + NewsCatalyst) ---
-        # strat_name is kept for downstream labels (debate skip logic, result
-        # dict).  The router-selected name names the "primary" strategy for
+        # strat_name is kept for downstream labels (result dict, logging).
+        # The router-selected name names the "primary" strategy for
         # this ticker even though all votes feed into the cluster detector.
         strat_name = strategy_label(ticker)
         _regime_name = ticker_regime.regime if ticker_regime else None
@@ -1267,50 +1277,8 @@ class Coordinator:
             fallback_technical_confidence=technical.get("adjusted_confidence"),
         )
 
-        # --- Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ---
-        debate_result = None
-        is_pead = strat_name == "PEAD"
-        if self.debate_agent.is_enabled() and not is_pead:
-            if combined_signal == "HOLD" and conf < 0.35:
-                log.info("[%s] Debate skipped — HOLD signal", ticker)
-                debate_result = DebateResult(
-                    ticker=ticker,
-                    original_signal=combined_signal,
-                    original_confidence=conf,
-                    final_signal=combined_signal,
-                    adjusted_confidence=conf,
-                    debate_summary="Debate skipped — HOLD signal.",
-                )
-            else:
-                if verbose:
-                    print(f"\n  [DEBATE] Running bull/bear debate for {ticker}...")
-                debate_result = self.debate_agent.run(
-                    ticker=ticker,
-                    signal=combined_signal,
-                    confidence=conf,
-                    technical_data=technical.get("indicators", {}),
-                    sentiment_data={"signal": sentiment["signal"], "avg_score": sentiment["avg_score"]},
-                    macro_context=self.macro_context,
-                )
-            combined_signal = debate_result.final_signal
-            conf = debate_result.adjusted_confidence
-
-            # Enforce signal-type minimum floors after debate penalty.
-            # The debate can reduce confidence but must not push directional
-            # signals below their execution gates. HOLD has no floor (Phase B)
-            # — strategies emit data-driven HOLD confidence; clamping erases it.
-            floor = _SIGNAL_FLOORS.get(combined_signal, 0.0)
-            if conf < floor:
-                log.debug(
-                    "[%s] Debate pushed confidence %.2f below %s floor %.2f — clamping",
-                    ticker, conf, combined_signal, floor,
-                )
-                conf = floor
-
-            if verbose:
-                print(f"  [DEBATE] {debate_result.debate_summary}")
-                print(f"  [DEBATE] Signal: {debate_result.original_signal} → {debate_result.final_signal}"
-                      f"  Confidence: {debate_result.original_confidence:.0%} → {debate_result.adjusted_confidence:.0%}")
+        # --- Signal-type confidence floors (always applied post-fusion) ---
+        conf = self._apply_signal_floor(ticker, combined_signal, conf)
 
         # --- Persist combined ---
         combined_id = self.db.log_combined_signal(
@@ -1495,7 +1463,6 @@ class Coordinator:
             "regime": regime_info,
             "strategy_name": strat_name,
             "signal_path": signal_path,
-            "debate": debate_result,
         }
 
         # Signal analytics logging (fire-and-forget)
@@ -1516,7 +1483,6 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
-        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
         session_type: str = "signal",
         scanner_candidates: set[str] | None = None,
@@ -1562,7 +1528,6 @@ class Coordinator:
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
-                debate_semaphore=debate_semaphore,
                 session=session,
                 scanner_candidates=scanner_candidates,
             )
@@ -1572,7 +1537,6 @@ class Coordinator:
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
-                debate_semaphore=debate_semaphore,
                 session=session,
             )
         if session_type == "pead":
@@ -1675,8 +1639,8 @@ class Coordinator:
                 log.warning("[%s] Regime detection failed: %s", ticker, exc)
 
         # ── Strategy votes (Momentum + Pullback + NewsCatalyst) ─────────
-        # strat_name is kept for downstream labels (debate skip logic, result
-        # dict).  The router-selected name names the "primary" strategy for
+        # strat_name is kept for downstream labels (result dict, logging).
+        # The router-selected name names the "primary" strategy for
         # this ticker even though all votes feed into the cluster detector.
         strat_name = strategy_label(ticker)
         _regime_name = ticker_regime.regime if ticker_regime else None
@@ -1728,48 +1692,12 @@ class Coordinator:
                 fallback_technical_confidence=technical.get("adjusted_confidence"),
             )
 
-        # ── Bull/Bear Debate (optional — skip for PEAD, pure data-driven) ──
-        debate_result = None
-        is_pead = strat_name == "PEAD"
+        # ── Signal-type confidence floors (always applied post-fusion) ──
+        # Mirrors the sync run_combined() clamp — without this the async
+        # production path lets WEAK BUY drop below the 0.35 execution gate
+        # (observed bug: TSLA WEAK BUY 0.41 → 0.26).
+        conf = self._apply_signal_floor(ticker, combined_signal, conf)
         is_scanner_candidate = ticker.upper() in (scanner_candidates or set())
-        if is_scanner_candidate:
-            log.info("[%s] Scanner candidate (Tier 2) — skipping bull/bear debate", ticker)
-        if self.debate_agent.is_enabled() and not is_pead and not is_scanner_candidate:
-            if combined_signal == "HOLD" and conf < 0.35:
-                log.info("[%s] Debate skipped — HOLD signal", ticker)
-                debate_result = DebateResult(
-                    ticker=ticker,
-                    original_signal=combined_signal,
-                    original_confidence=conf,
-                    final_signal=combined_signal,
-                    adjusted_confidence=conf,
-                    debate_summary="Debate skipped — HOLD signal.",
-                )
-            else:
-                _dsem = debate_semaphore or api_semaphore
-                async with _dsem:
-                    debate_result = await self.debate_agent.run_async(
-                        ticker=ticker,
-                        signal=combined_signal,
-                        confidence=conf,
-                        technical_data=technical.get("indicators", {}),
-                        sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
-                        macro_context=self.macro_context,
-                    )
-            combined_signal = debate_result.final_signal
-            conf = debate_result.adjusted_confidence
-
-            # Enforce signal-type minimum floors after debate penalty.
-            # Mirrors the sync run_combined() clamp — without this the async
-            # production path lets debate-adjusted WEAK BUY drop below the
-            # 0.35 execution gate (observed bug: TSLA WEAK BUY 0.41 → 0.26).
-            floor = _SIGNAL_FLOORS.get(combined_signal, 0.0)
-            if conf < floor:
-                log.debug(
-                    "[%s] Debate pushed confidence %.2f below %s floor %.2f — clamping",
-                    ticker, conf, combined_signal, floor,
-                )
-                conf = floor
 
         # ── Phase 4: DB writes + risk sizing ───────────────────────────
         async with db_lock:
@@ -1989,7 +1917,6 @@ class Coordinator:
             "regime": regime_info,
             "strategy_name": strat_name,
             "signal_path": signal_path,
-            "debate": debate_result,
             "is_scanner_candidate": is_scanner_candidate,
             "elapsed_s": round(elapsed, 2),
         }
@@ -2112,11 +2039,10 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
-        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
     ) -> dict:
         """
-        Lightweight signal refresh — news + sentiment + debate only.
+        Lightweight signal refresh — news + sentiment only.
 
         Skips: technical analysis, position sizing, execution.
         Only updates the forward signal if conviction changed by >10%.
@@ -2169,33 +2095,6 @@ class Coordinator:
             technical_confidence=0.5,
         )
         signal_path = "FUSION_FALLBACK"
-
-        # ── Bull/Bear Debate (optional) ───────────────────────────────
-        debate_result = None
-        if self.debate_agent.is_enabled():
-            if combined_signal == "HOLD" and conf < 0.35:
-                log.info("[%s] Debate skipped — HOLD signal", ticker)
-                debate_result = DebateResult(
-                    ticker=ticker,
-                    original_signal=combined_signal,
-                    original_confidence=conf,
-                    final_signal=combined_signal,
-                    adjusted_confidence=conf,
-                    debate_summary="Debate skipped — HOLD signal.",
-                )
-            else:
-                _dsem = debate_semaphore or api_semaphore
-                async with _dsem:
-                    debate_result = await self.debate_agent.run_async(
-                        ticker=ticker,
-                        signal=combined_signal,
-                        confidence=conf,
-                        technical_data={},
-                        sentiment_data={"signal": sentiment_signal, "avg_score": avg_score},
-                        macro_context=self.macro_context,
-                    )
-            combined_signal = debate_result.final_signal
-            conf = debate_result.adjusted_confidence
 
         # ── Check existing forward signal for conviction delta ────────
         updated_forward = False
@@ -2257,7 +2156,6 @@ class Coordinator:
             "headlines_scored": len(scored),
             "avg_score": avg_score,
             "sentiment_signal": sentiment_signal,
-            "debate": debate_result,
             "updated_forward": updated_forward,
             "elapsed_s": round(elapsed, 2),
         }
@@ -2277,7 +2175,6 @@ class Coordinator:
         api_semaphore: asyncio.Semaphore,
         data_semaphore: asyncio.Semaphore,
         db_lock: asyncio.Lock,
-        debate_semaphore: asyncio.Semaphore | None = None,
         session: str | None = None,
         scanner_candidates: set[str] | None = None,
     ) -> dict:
@@ -2286,13 +2183,11 @@ class Coordinator:
 
         1. Read cached signal from signal_events (max 90 min old).
         2. Fetch current price.
-        3. If price moved >2% since cache, re-run debate only.
-        4. Execute trade based on cached/refreshed signal.
+        3. Execute trade based on the cached signal (adverse price drift
+           >2% still invalidates pending forward signals below).
 
         Falls back to the full pipeline only when no cached signal exists.
         """
-        from storage.database import Database
-
         t0 = _time.monotonic()
         ticker = ticker.upper()
 
@@ -2311,7 +2206,6 @@ class Coordinator:
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
-                debate_semaphore=debate_semaphore,
                 session=session,
                 session_type="signal",
                 scanner_candidates=scanner_candidates,
@@ -2351,46 +2245,12 @@ class Coordinator:
                 "elapsed_s": round(_time.monotonic() - t0, 2),
             }
 
-        # ── Step 3: Staleness check — re-run debate if >2% drift ────────
+        # ── Step 3: Use cached signal as-is ──────────────────────────────
+        # Q-014: the >2% drift debate-refresh is gone with the debate.
+        # Adverse price drift still invalidates pending forward signals
+        # in Step 4 below.
         combined_signal = cached_signal
         conf = cached_conf
-        debate_refreshed = False
-        is_scanner_candidate = ticker.upper() in (scanner_candidates or set())
-
-        if Database.is_price_stale(current_price, cached_price or 0, threshold=0.02):
-            log.info(
-                "[%s] Price stale: cached $%.2f → current $%.2f (>2%%) — refreshing debate",
-                ticker, cached_price or 0, current_price,
-            )
-            if is_scanner_candidate:
-                log.info(
-                    "[%s] Scanner candidate (Tier 2) — skipping debate refresh on drift",
-                    ticker,
-                )
-            elif self.debate_agent.is_enabled() and cached_signal not in ("HOLD",):
-                _dsem = debate_semaphore or api_semaphore
-                async with _dsem:
-                    debate_result = await self.debate_agent.run_async(
-                        ticker=ticker,
-                        signal=cached_signal,
-                        confidence=cached_conf,
-                        technical_data={},
-                        sentiment_data={
-                            "signal": cached_signal,
-                            "avg_score": cached.get("sentiment_score", 0),
-                        },
-                        macro_context=self.macro_context,
-                    )
-                combined_signal = debate_result.final_signal
-                conf = debate_result.adjusted_confidence
-                debate_refreshed = True
-                log.info(
-                    "[%s] Debate refresh: %s %.0f%% → %s %.0f%%",
-                    ticker, cached_signal, cached_conf * 100,
-                    combined_signal, conf * 100,
-                )
-            else:
-                log.info("[%s] Debate disabled or HOLD — using cached signal as-is", ticker)
 
         # ── Step 4: Process pending forward signals ──────────────────────
         pending = self.signal_logger.get_pending_forward_signals(
@@ -2550,7 +2410,7 @@ class Coordinator:
             "risk": risk,
             "execution": execution,
             "forward_signals": forward_results,
-            "cache_status": "refreshed" if debate_refreshed else "hit",
+            "cache_status": "hit",
             "cached_price": cached_price,
             "current_price": current_price,
             "elapsed_s": round(elapsed, 2),

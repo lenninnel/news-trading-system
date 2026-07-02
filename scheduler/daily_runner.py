@@ -99,7 +99,6 @@ async def _process_ticker(
     db_lock: asyncio.Lock,
     worker_semaphore: asyncio.Semaphore,
     tracker: _ProgressTracker,
-    debate_semaphore: asyncio.Semaphore | None = None,
     session: str | None = None,
     session_type: str = "signal",
     scanner_candidates: set[str] | None = None,
@@ -114,7 +113,6 @@ async def _process_ticker(
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
-                debate_semaphore=debate_semaphore,
                 session=session,
                 session_type=session_type,
                 scanner_candidates=scanner_candidates,
@@ -149,16 +147,15 @@ async def run_batch(
         execute:         When True, execute trades via broker.
         session:         Trading session name (e.g. "US_OPEN").
         session_type:    "signal" | "execution" | "monitor".
-        macro_context:   Session-level macro block from MacroContextAgent,
-                         prepended to every bull/bear debate prompt. Empty
-                         string when the feature is off.
+        macro_context:   Session-level macro block from MacroContextAgent.
+                         Empty string when the feature is off. Recorded via
+                         the macro_context_used flag in signal_events.
 
     Returns:
         dict with keys: results, elapsed_s, success_count, fail_count.
     """
     api_semaphore = asyncio.Semaphore(5)
     data_semaphore = asyncio.Semaphore(10)
-    debate_semaphore = asyncio.Semaphore(4)  # cap concurrent debates (rate limit safety)
     db_lock = asyncio.Lock()
     worker_semaphore = asyncio.Semaphore(workers)
     tracker = _ProgressTracker(len(tickers))
@@ -184,7 +181,6 @@ async def run_batch(
                 api_semaphore=api_semaphore,
                 data_semaphore=data_semaphore,
                 db_lock=db_lock,
-                debate_semaphore=debate_semaphore,
                 worker_semaphore=worker_semaphore,
                 tracker=tracker,
                 session=session,
@@ -407,11 +403,9 @@ class DailyScheduler:
                 "ticker": r.get("ticker"),
                 "signal": r.get("combined_signal") or r.get("signal"),
                 "confidence": r.get("confidence"),
-                "debate_outcome": (
-                    (r.get("debate") or {}).get("summary")
-                    if isinstance(r.get("debate"), dict)
-                    else None
-                ),
+                # Q-014: debate removed — kept as a key for prompt-shape
+                # stability in the reviewer, always None now.
+                "debate_outcome": None,
                 "trade_executed": bool(execution.get("trade_id")),
             })
 
