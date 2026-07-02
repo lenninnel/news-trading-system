@@ -370,50 +370,37 @@ class TestBullishSetupConfidence:
 
 
 # ===========================================================================
-# Post-debate floor enforcement
+# Signal-type confidence floor enforcement (Q-014: always applied post-fusion)
 # ===========================================================================
 
-class TestDebateFloorEnforcement:
-    """After a bull/bear debate penalty, confidence must not drop below the
-    signal-type minimum floor.  This mirrors the inline enforcement in
-    Coordinator.run() that clamps ``conf`` after overwriting it with
-    ``debate_result.adjusted_confidence``."""
+class TestSignalFloorEnforcement:
+    """Confidence must not drop below the signal-type minimum floor.
 
-    # The floor map used in coordinator.py after the debate block.
-    # Phase B: HOLD is intentionally absent — strategies emit data-driven
-    # HOLD confidence (10-40%) and a 0.25 clamp would erase that variance.
-    _SIGNAL_FLOORS = {
-        "STRONG BUY": 0.60, "STRONG SELL": 0.60,
-        "WEAK BUY": 0.35, "WEAK SELL": 0.35,
-        "CONFLICTING": 0.10,
-    }
+    Q-014 removed the bull/bear debate; the floor clamp that used to live
+    inside the debate block is now applied UNCONDITIONALLY after signal
+    fusion via ``Coordinator._apply_signal_floor`` — these tests exercise
+    that real method, not a replica.
+    """
 
     @staticmethod
-    def _apply_floor(signal: str, debate_confidence: float) -> float:
-        """Replicate the coordinator's post-debate floor enforcement."""
-        floors = {
-            "STRONG BUY": 0.60, "STRONG SELL": 0.60,
-            "WEAK BUY": 0.35, "WEAK SELL": 0.35,
-            "CONFLICTING": 0.10,
-        }
-        floor = floors.get(signal, 0.0)
-        return max(debate_confidence, floor)
+    def _apply_floor(signal: str, conf: float) -> float:
+        return Coordinator._apply_signal_floor("TEST", signal, conf)
 
     def test_weak_buy_never_below_035(self):
-        """Even with a harsh debate penalty, WEAK BUY stays >= 0.35."""
+        """Even a very low fused confidence keeps WEAK BUY >= 0.35."""
         assert self._apply_floor("WEAK BUY", 0.15) == 0.35
         assert self._apply_floor("WEAK BUY", 0.0) == 0.35
         assert self._apply_floor("WEAK BUY", 0.34) == 0.35
 
     def test_weak_buy_above_floor_unchanged(self):
-        """If debate confidence is already above the floor, it stays."""
+        """If fused confidence is already above the floor, it stays."""
         assert self._apply_floor("WEAK BUY", 0.45) == 0.45
 
     def test_weak_sell_never_below_035(self):
         assert self._apply_floor("WEAK SELL", 0.10) == 0.35
 
     def test_strong_buy_never_below_060(self):
-        """STRONG BUY must stay >= 0.60 after debate."""
+        """STRONG BUY must stay >= 0.60."""
         assert self._apply_floor("STRONG BUY", 0.40) == 0.60
         assert self._apply_floor("STRONG BUY", 0.59) == 0.60
 
@@ -435,17 +422,72 @@ class TestDebateFloorEnforcement:
         assert self._apply_floor("CONFLICTING", 0.05) == 0.10
         assert self._apply_floor("CONFLICTING", 0.10) == 0.10
 
-    def test_weak_buy_confidence_never_below_030(self):
-        """WEAK BUY confidence is never below 0.30 (it's actually >= 0.35)."""
-        for debate_conf in [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.29]:
-            result = self._apply_floor("WEAK BUY", debate_conf)
-            assert result >= 0.30, f"WEAK BUY conf {result} < 0.30 when debate gave {debate_conf}"
+    def test_floor_applied_without_debate_weak_buy(self):
+        """Q-014 regression: the floor fires with NO debate in the pipeline —
+        a fused WEAK BUY below 0.35 is clamped up to exactly 0.35."""
+        assert Coordinator._apply_signal_floor("AAPL", "WEAK BUY", 0.20) == 0.35
 
-    def test_strong_buy_confidence_never_below_055(self):
-        """STRONG BUY confidence is never below 0.55 (it's actually >= 0.60)."""
-        for debate_conf in [0.0, 0.10, 0.30, 0.50, 0.54]:
-            result = self._apply_floor("STRONG BUY", debate_conf)
-            assert result >= 0.55, f"STRONG BUY conf {result} < 0.55 when debate gave {debate_conf}"
+    def test_floor_applied_without_debate_strong_signals(self):
+        """Q-014 regression: STRONG signals below 0.60 are clamped to 0.60."""
+        assert Coordinator._apply_signal_floor("AAPL", "STRONG BUY", 0.50) == 0.60
+        assert Coordinator._apply_signal_floor("AAPL", "STRONG SELL", 0.42) == 0.60
+
+    def test_floor_map_matches_module_constant(self):
+        """The helper reads the module-level _SIGNAL_FLOORS map."""
+        from orchestrator.coordinator import _SIGNAL_FLOORS
+        assert _SIGNAL_FLOORS == {
+            "STRONG BUY": 0.60, "STRONG SELL": 0.60,
+            "WEAK BUY": 0.35, "WEAK SELL": 0.35,
+            "CONFLICTING": 0.10,
+        }
+        for sig, floor in _SIGNAL_FLOORS.items():
+            assert self._apply_floor(sig, 0.0) == floor
+
+
+# ===========================================================================
+# Signal event logging without debate (Q-014)
+# ===========================================================================
+
+class TestSignalEventNoDebate:
+    """After Q-014, signal_events rows must carry bull_case=None,
+    bear_case=None, and a debate_outcome without debate-derived values."""
+
+    @staticmethod
+    def _make_result(**overrides):
+        result = {
+            "ticker": "AAPL",
+            "combined_signal": "WEAK BUY",
+            "confidence": 0.35,
+            "technical": {"indicators": {"price": 180.0, "rsi": 45.0}},
+            "sentiment": {"avg_score": 0.4, "source_breakdown": {}},
+            "execution": {},
+        }
+        result.update(overrides)
+        return result
+
+    def _logged_row(self, result):
+        from unittest.mock import MagicMock
+        coordinator = Coordinator.__new__(Coordinator)
+        coordinator.signal_logger = MagicMock()
+        coordinator._log_signal_event(result, session="US_OPEN")
+        coordinator.signal_logger.log.assert_called_once()
+        return coordinator.signal_logger.log.call_args[0][0]
+
+    def test_bull_and_bear_case_are_none(self):
+        row = self._logged_row(self._make_result())
+        assert row["bull_case"] is None
+        assert row["bear_case"] is None
+
+    def test_debate_outcome_skipped_for_regular_signal(self):
+        row = self._logged_row(self._make_result())
+        assert row["debate_outcome"] == "skipped"
+
+    def test_debate_outcome_scanner_tag_preserved(self):
+        """The scanner_no_debate tag (a different write) must survive."""
+        row = self._logged_row(self._make_result(is_scanner_candidate=True))
+        assert row["debate_outcome"] == "scanner_no_debate"
+        assert row["bull_case"] is None
+        assert row["bear_case"] is None
 
 
 # ===========================================================================
@@ -472,7 +514,6 @@ class TestSessionPropagation:
                 "indicators": {"price": 180.0, "rsi": 45.0, "sma_50": 175.0, "rvol": 1.5},
             },
             "sentiment": {"avg_score": 0.6, "source_breakdown": {}},
-            "debate": None,
             "execution": {},
         }
 
@@ -515,7 +556,6 @@ class TestSessionPropagation:
             "confidence": 0.25,
             "technical": {"indicators": {}},
             "sentiment": {"avg_score": 0.0, "source_breakdown": {}},
-            "debate": None,
             "execution": {},
         }
 
@@ -558,9 +598,6 @@ class TestCachedUSOpenPortfolioGate:
 
         c.signal_logger = MagicMock()
         c.signal_logger.get_pending_forward_signals.return_value = []
-
-        c.debate_agent = MagicMock()
-        c.debate_agent.is_enabled.return_value = False
 
         c.risk_agent = MagicMock()
         c.risk_agent.run.return_value = {
@@ -664,9 +701,6 @@ class TestEODBuyGuardrail:
 
         c.signal_logger = MagicMock()
         c.signal_logger.get_pending_forward_signals.return_value = []
-
-        c.debate_agent = MagicMock()
-        c.debate_agent.is_enabled.return_value = False
 
         c.risk_agent = MagicMock()
         c.risk_agent.run.return_value = {

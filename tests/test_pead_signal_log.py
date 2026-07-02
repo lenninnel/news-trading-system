@@ -692,11 +692,6 @@ def _build_pead_override_coordinator(
         "calc_id":           1,
     })
 
-    coord.debate_agent = MagicMock()
-    # is_pead == True in the production code skips debate already, but
-    # disable globally so the path is deterministic.
-    coord.debate_agent.is_enabled = MagicMock(return_value=False)
-
     coord.paper_trader = MagicMock()
     coord.paper_trader.track_trade = MagicMock(
         return_value={"trade_id": trade_id, "price": 150.0},
