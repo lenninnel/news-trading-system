@@ -466,3 +466,58 @@ class TestIBKRMarketHours:
         trader, mock_ib, _ = _make_trader()
         mock_ib.reqMarketDataType.side_effect = Exception("no data")
         assert trader.is_market_open() is False
+
+
+# ── Non-US symbol guard ──────────────────────────────────────────────────────
+
+class TestNonUSSymbolGuard:
+    """Non-US (exchange-suffixed) tickers must never reach the order path."""
+
+    def test_is_us_symbol_classification(self):
+        from execution.ibkr_trader import _is_us_symbol
+        assert _is_us_symbol("AAPL") is True
+        assert _is_us_symbol("BRK-B") is True  # class shares are dash-style
+        assert _is_us_symbol("VNA.DE") is False
+        assert _is_us_symbol("SAP.XETRA") is False
+        assert _is_us_symbol("COFA.PA") is False
+
+    def test_track_trade_skips_non_us(self, caplog):
+        trader, mock_ib, mock_db = _make_trader()
+        with caplog.at_level("WARNING", logger="execution.ibkr_trader"):
+            result = trader.track_trade("VNA.DE", "BUY", 10, 25.0)
+
+        assert result["status"] == "skipped_non_us"
+        assert result["skipped"] is True
+        assert result["trade_id"] is None
+        mock_ib.placeOrder.assert_not_called()
+        mock_db.log_trade_history.assert_not_called()
+        assert any("non-US symbol VNA.DE" in r.message for r in caplog.records)
+
+    def test_close_position_skips_non_us(self, caplog):
+        trader, mock_ib, _ = _make_trader()
+        with caplog.at_level("WARNING", logger="execution.ibkr_trader"):
+            assert trader.close_position("VNA.DE") is False
+        mock_ib.placeOrder.assert_not_called()
+        assert any("non-US symbol VNA.DE" in r.message for r in caplog.records)
+
+    def test_place_order_rejects_non_us(self, caplog):
+        trader, mock_ib, _ = _make_trader()
+        with caplog.at_level("WARNING", logger="execution.ibkr_trader"):
+            with pytest.raises(ValueError, match="non-US symbol"):
+                trader.place_order("VNA.DE", 10, "BUY")
+        mock_ib.placeOrder.assert_not_called()
+
+    def test_us_ticker_still_trades(self):
+        """AAPL order path is unchanged by the guard."""
+        trader, mock_ib, mock_db = _make_trader()
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Filled"
+        mock_trade.orderStatus.avgFillPrice = 150.0
+        mock_trade.fills = []
+        mock_ib.placeOrder.return_value = mock_trade
+        mock_ib.positions.return_value = []
+
+        result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+
+        assert result["trade_id"] == 42
+        mock_ib.placeOrder.assert_called_once()

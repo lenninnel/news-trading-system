@@ -157,14 +157,28 @@ class TelegramNotifier:
 
         try:
             resp = requests.post(self._url, json=payload, timeout=10)
-            if not resp.ok:
+            if resp.ok:
+                return True
+            log.warning(
+                "Telegram API error %d: %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+            # Markdown parse errors return 400 and would silently drop the
+            # message. Retry once as plain text: same payload minus parse_mode.
+            if "parse_mode" in payload:
+                retry_payload = {
+                    k: v for k, v in payload.items() if k != "parse_mode"
+                }
+                retry = requests.post(self._url, json=retry_payload, timeout=10)
+                if retry.ok:
+                    return True
                 log.warning(
-                    "Telegram API error %d: %s",
-                    resp.status_code,
-                    resp.text[:200],
+                    "Telegram plain-text retry failed %d: %s",
+                    retry.status_code,
+                    retry.text[:200],
                 )
-                return False
-            return True
+            return False
         except Exception as exc:
             log.warning("Could not send Telegram message: %s", exc)
             return False
