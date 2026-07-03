@@ -43,6 +43,17 @@ log = logging.getLogger(__name__)
 # Tickers that cannot be traded on IBKR via this integration.
 UNSUPPORTED_IBKR: set[str] = set()
 
+
+def _is_us_symbol(ticker: str) -> bool:
+    """True if *ticker* is a US-listed symbol tradable via SMART/USD.
+
+    Exchange-suffixed tickers contain a "." (VNA.DE, SAP.XETRA, COFA.PA).
+    US class shares are stored dash-style in this system (BRK-B, never
+    BRK.B — the Wikipedia scrape replaces "." with "-"), so a "." is a
+    reliable non-US indicator.
+    """
+    return "." not in ticker
+
 # Order outcome polling — wait this long for placeOrder to reach a terminal
 # orderStatus before we give up and cancel. Tuned to cover normal Gateway
 # round-trip plus a few seconds of slack for slow paper sessions.
@@ -477,6 +488,18 @@ class IBKRTrader:
         ticker = ticker.upper()
         action = action.upper()
 
+        if not _is_us_symbol(ticker):
+            log.warning("skipping non-US symbol %s — no US order path", ticker)
+            return {
+                "trade_id": None, "ticker": ticker, "action": action,
+                "shares": shares, "price": price,
+                "stop_loss": stop_loss, "take_profit": take_profit,
+                "pnl": 0.0, "total_value": 0.0,
+                "skipped": True,
+                "skip_reason": f"{ticker} is not a US symbol — no US order path",
+                "status": "skipped_non_us",
+            }
+
         if ticker in UNSUPPORTED_IBKR:
             log.info("Skipping execution for %s — not supported on IBKR", ticker)
             return {
@@ -698,6 +721,10 @@ class IBKRTrader:
         to confirm in volatile markets and auto-cancelling triggers a
         worse-priced retry (see ``STOP_EXTENDED_TIMEOUT``).
         """
+        if not _is_us_symbol(ticker.upper()):
+            log.warning("skipping non-US symbol %s — no US order path", ticker)
+            return False
+
         def _impl() -> bool:
             positions = self._ib.positions()
             for pos in positions:
@@ -749,6 +776,9 @@ class IBKRTrader:
             raise ValueError(f"side must be BUY or SELL, got '{side}'")
         if order_type != "market":
             raise ValueError(f"Unsupported order_type: {order_type}")
+        if not _is_us_symbol(ticker.upper()):
+            log.warning("skipping non-US symbol %s — no US order path", ticker)
+            raise ValueError(f"non-US symbol {ticker}: no US order path")
 
         def _impl() -> dict:
             contract = self._Stock(ticker.upper(), "SMART", "USD")

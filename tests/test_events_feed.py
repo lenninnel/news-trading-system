@@ -343,3 +343,38 @@ class TestCoordinatorEarningsDowngrade:
 
         assert sizing_signal == "STRONG BUY"
         assert event_risk_flag == "none"
+
+
+# ── EODHD removal (unentitled endpoint) ──────────────────────────────────────
+
+class TestNoEODHDInEventsFeed:
+    """events_feed must not touch EODHD — earnings gating runs via yfinance."""
+
+    def test_module_has_no_eodhd_import(self):
+        import data.events_feed as ef
+        assert not hasattr(ef, "EODHDFeed")
+        assert not hasattr(ef, "is_german_ticker")
+
+    @patch("data.events_feed.yf.Ticker")
+    def test_german_ticker_uses_yfinance_only(self, mock_ticker_cls):
+        from datetime import date as _date
+
+        clear_cache()
+        mock_ticker_cls.return_value.calendar = {
+            "Earnings Date": [_date(2026, 8, 6)]
+        }
+        result = get_earnings_date("VNA.DE")
+        assert result == _date(2026, 8, 6)
+        mock_ticker_cls.assert_called_once_with("VNA.DE")
+
+    @patch("data.events_feed.yf.Ticker")
+    def test_xetra_suffix_still_converted_for_yfinance(self, mock_ticker_cls):
+        from datetime import date as _date
+
+        clear_cache()
+        mock_ticker_cls.return_value.calendar = {
+            "Earnings Date": [_date(2026, 8, 6)]
+        }
+        result = get_earnings_date("SAP.XETRA")
+        assert result == _date(2026, 8, 6)
+        mock_ticker_cls.assert_called_once_with("SAP.DE")

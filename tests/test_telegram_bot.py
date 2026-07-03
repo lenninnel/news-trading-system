@@ -325,3 +325,51 @@ class TestMisconfigured:
         notifier = TelegramNotifier(bot_token="bad", chat_id="bad")
         with patch("notifications.telegram_bot.requests.post", side_effect=Exception("auth fail")):
             notifier.send_error("something broke")
+
+
+# ── Plain-text fallback retry ────────────────────────────────────────────────
+
+class TestPlainTextFallback:
+    """A Markdown 400 must trigger one retry without parse_mode."""
+
+    def _resp(self, ok, status=200, text="ok"):
+        resp = MagicMock()
+        resp.ok = ok
+        resp.status_code = status
+        resp.text = text
+        return resp
+
+    def test_retries_without_parse_mode_and_returns_true(self, notifier, caplog):
+        with patch("notifications.telegram_bot.requests.post") as m:
+            m.side_effect = [
+                self._resp(False, 400, "Bad Request: can't parse entities"),
+                self._resp(True),
+            ]
+            with caplog.at_level("WARNING", logger="notifications.telegram_bot"):
+                assert notifier._send("test _broken markdown") is True
+
+        assert m.call_count == 2
+        first_payload = m.call_args_list[0].kwargs["json"]
+        retry_payload = m.call_args_list[1].kwargs["json"]
+        assert first_payload["parse_mode"] == "Markdown"
+        assert "parse_mode" not in retry_payload
+        assert retry_payload["text"] == first_payload["text"]
+        assert any("Telegram API error 400" in r.message for r in caplog.records)
+
+    def test_logs_both_failures_when_retry_also_fails(self, notifier, caplog):
+        with patch("notifications.telegram_bot.requests.post") as m:
+            m.side_effect = [
+                self._resp(False, 400, "Bad Request"),
+                self._resp(False, 400, "still bad"),
+            ]
+            with caplog.at_level("WARNING", logger="notifications.telegram_bot"):
+                assert notifier._send("test") is False
+
+        assert m.call_count == 2
+        warnings = [r.message for r in caplog.records]
+        assert any("Telegram API error 400" in w for w in warnings)
+        assert any("plain-text retry failed" in w for w in warnings)
+
+    def test_no_retry_on_success(self, notifier, mock_post):
+        assert notifier._send("test") is True
+        assert mock_post.call_count == 1
