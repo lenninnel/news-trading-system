@@ -8,6 +8,7 @@ Run with:
     python3 -m pytest tests/ -v
 """
 
+import logging
 import sys
 import os
 
@@ -759,3 +760,194 @@ class TestEODBuyGuardrail:
         c.paper_trader.track_trade.assert_called_once()
         kwargs = c.paper_trader.track_trade.call_args.kwargs
         assert kwargs["action"] == "SELL"
+
+
+# ===========================================================================
+# F2 sanity gate — forward SL/TP override vs actual fill (2026-07-02 replay)
+# ===========================================================================
+
+class TestF2ForwardOverrideSanityGate:
+    """Per-leg sanity gate on the forward-signal SL/TP override in
+    _execute_forward_signals_async (long-only BUY path).
+
+    On 2026-07-02 stale US_PRE forward levels were adopted unchecked:
+    TRGP and VRT got a stop-loss ABOVE the fill, AAPL a take-profit
+    BELOW the fill. The gate adopts a forward level only when it sits
+    on the correct side of the actual fill price (SL < fill, TP > fill);
+    a wrong-side level keeps the fresh risk_agent value and logs a
+    WARNING. If the comparison itself fails (corrupt type), BOTH legs
+    fall back to the fresh calc (fail-to-fresh) — never a half-applied
+    state.
+    """
+
+    # Fresh risk_agent levels per case (correct-side, distinct from the
+    # forward levels so accept vs reject is unambiguous).
+    FRESH = {
+        "TRGP": (254.89, 270.55),
+        "VRT": (306.71, 325.50),
+        "AAPL": (301.87, 320.17),
+        "HLTH": (98.50, 103.00),
+    }
+
+    def _make_coordinator(self, *, fill, fwd_sl, fwd_tp, fresh_sl, fresh_tp):
+        from unittest.mock import MagicMock
+        from orchestrator.coordinator import Coordinator
+
+        c = Coordinator.__new__(Coordinator)
+        c.db = MagicMock()
+        c.db.get_cached_signal.return_value = {
+            "signal": "WEAK BUY",
+            "confidence": 0.42,
+            "price_at_signal": fill,  # zero drift → forward stays confirmed
+            "strategy": "momentum",
+            "sentiment_score": 0.2,
+        }
+        c.db.get_portfolio_position.return_value = None
+
+        c.market_data = MagicMock()
+        c.market_data.fetch.return_value = {"price": fill, "degraded": False}
+
+        c.signal_logger = MagicMock()
+        c.signal_logger.get_pending_forward_signals.return_value = [{
+            "id": 4711,
+            "signal": "WEAK BUY",
+            "price_at_signal": fill,
+            "stop_loss": fwd_sl,
+            "take_profit": fwd_tp,
+            "strategy_name": "momentum",
+        }]
+
+        c.risk_agent = MagicMock()
+        c.risk_agent.run.return_value = {
+            "skipped": False,
+            "direction": "BUY",
+            "shares": 10,
+            "stop_loss": fresh_sl,
+            "take_profit": fresh_tp,
+        }
+
+        c.paper_trader = MagicMock()
+        c.paper_trader.track_trade.return_value = {
+            "trade_id": 999, "price": fill,
+        }
+
+        c._portfolio_manager = MagicMock()
+        c._portfolio_manager.can_add_position.return_value = (True, "")
+        c._has_alpaca_position = lambda _t: False
+        return c
+
+    def _run(self, c, ticker):
+        import asyncio
+        return asyncio.run(c._execute_forward_signals_async(
+            ticker,
+            execute=True,
+            api_semaphore=asyncio.Semaphore(1),
+            data_semaphore=asyncio.Semaphore(1),
+            db_lock=asyncio.Lock(),
+        ))
+
+    @staticmethod
+    def _f2_warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.getMessage().startswith("F2-gate")
+        ]
+
+    @pytest.mark.parametrize(
+        "ticker,fill,fwd_sl,fwd_tp,sl_accepted,tp_accepted",
+        [
+            ("TRGP", 257.67, 262.7772, 289.8278, False, True),
+            ("VRT", 310.00, 328.1236, 399.2282, False, True),
+            ("AAPL", 304.92, 283.5728, 300.9344, True, False),
+        ],
+    )
+    def test_replay_2026_07_02(
+        self, caplog, ticker, fill, fwd_sl, fwd_tp, sl_accepted, tp_accepted,
+    ):
+        """Replay of the three 2026-07-02 fills with the real forward
+        levels: wrong-side legs are rejected (fresh kept + WARNING),
+        correct-side legs are adopted."""
+        fresh_sl, fresh_tp = self.FRESH[ticker]
+        c = self._make_coordinator(
+            fill=fill, fwd_sl=fwd_sl, fwd_tp=fwd_tp,
+            fresh_sl=fresh_sl, fresh_tp=fresh_tp,
+        )
+        with caplog.at_level(logging.WARNING, logger="orchestrator.coordinator"):
+            result = self._run(c, ticker)
+
+        risk = result["risk"]
+        assert risk["stop_loss"] == (fwd_sl if sl_accepted else fresh_sl)
+        assert risk["take_profit"] == (fwd_tp if tp_accepted else fresh_tp)
+
+        warnings = self._f2_warnings(caplog)
+        assert len(warnings) == (not sl_accepted) + (not tp_accepted)
+        if not sl_accepted:
+            assert any(
+                f"rejected wrong-side fwd SL {fwd_sl} vs fill {fill}, "
+                f"kept fresh {fresh_sl}" in w
+                for w in warnings
+            )
+        if not tp_accepted:
+            assert any(
+                f"rejected wrong-side fwd TP {fwd_tp} vs fill {fill}, "
+                f"kept fresh {fresh_tp}" in w
+                for w in warnings
+            )
+
+        # The trade executes with the gated levels.
+        kwargs = c.paper_trader.track_trade.call_args.kwargs
+        assert kwargs["stop_loss"] == risk["stop_loss"]
+        assert kwargs["take_profit"] == risk["take_profit"]
+
+    def test_healthy_forward_levels_pass_through_unchanged(self, caplog):
+        """Correct-side forward levels are adopted verbatim (level
+        continuity: the exact objects, no transformation) and no
+        F2-gate WARNING is emitted."""
+        fresh_sl, fresh_tp = self.FRESH["HLTH"]
+        c = self._make_coordinator(
+            fill=100.00, fwd_sl=97.00, fwd_tp=106.00,
+            fresh_sl=fresh_sl, fresh_tp=fresh_tp,
+        )
+        fwd_row = c.signal_logger.get_pending_forward_signals.return_value[0]
+
+        with caplog.at_level(logging.WARNING, logger="orchestrator.coordinator"):
+            result = self._run(c, "HLTH")
+
+        risk = result["risk"]
+        # Byte-identical pass-through: same objects as in the forward row.
+        assert risk["stop_loss"] is fwd_row["stop_loss"]
+        assert risk["take_profit"] is fwd_row["take_profit"]
+        assert risk["stop_loss"] == 97.00
+        assert risk["take_profit"] == 106.00
+        assert self._f2_warnings(caplog) == []
+
+        kwargs = c.paper_trader.track_trade.call_args.kwargs
+        assert kwargs["stop_loss"] == 97.00
+        assert kwargs["take_profit"] == 106.00
+
+    def test_fail_to_fresh_on_corrupt_forward_value(self, caplog):
+        """A non-comparable forward SL (string) must not raise, must
+        leave BOTH legs on the fresh risk_agent values — the valid
+        forward TP is deliberately NOT adopted (no half-applied state)
+        — and must log a WARNING."""
+        fresh_sl, fresh_tp = self.FRESH["HLTH"]
+        c = self._make_coordinator(
+            fill=100.00, fwd_sl="corrupt-not-a-price", fwd_tp=106.00,
+            fresh_sl=fresh_sl, fresh_tp=fresh_tp,
+        )
+        with caplog.at_level(logging.WARNING, logger="orchestrator.coordinator"):
+            result = self._run(c, "HLTH")  # must not raise
+
+        risk = result["risk"]
+        assert risk["stop_loss"] == fresh_sl
+        assert risk["take_profit"] == fresh_tp
+
+        warnings = self._f2_warnings(caplog)
+        assert len(warnings) == 1
+        assert "evaluation failed" in warnings[0]
+
+        # Pipeline continues: trade executes on the fresh levels.
+        kwargs = c.paper_trader.track_trade.call_args.kwargs
+        assert kwargs["stop_loss"] == fresh_sl
+        assert kwargs["take_profit"] == fresh_tp

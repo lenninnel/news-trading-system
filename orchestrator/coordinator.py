@@ -2303,12 +2303,49 @@ class Coordinator:
                 )
 
             if not risk["skipped"]:
-                # Use forward signal SL/TP if available
+                # Use forward signal SL/TP if available — F2 sanity gate:
+                # adopt a forward level only when it sits on the correct
+                # side of the actual fill price (long-only BUY path).
+                # 2026-07-02: stale US_PRE levels landed above the fill
+                # (TRGP/VRT SL) or below it (AAPL TP); wrong-side levels
+                # now fall back to the fresh risk_agent calc per leg.
                 for fwd in pending:
-                    if fwd.get("stop_loss"):
-                        risk["stop_loss"] = fwd["stop_loss"]
-                    if fwd.get("take_profit"):
-                        risk["take_profit"] = fwd["take_profit"]
+                    try:
+                        fwd_sl = fwd.get("stop_loss")
+                        fwd_tp = fwd.get("take_profit")
+                        # Evaluate both legs before assigning either so a
+                        # failed comparison can never leave half-applied
+                        # values (fail-to-fresh).
+                        sl_ok = bool(fwd_sl) and fwd_sl < current_price
+                        tp_ok = bool(fwd_tp) and fwd_tp > current_price
+                        if fwd_sl:
+                            if sl_ok:
+                                risk["stop_loss"] = fwd_sl
+                            else:
+                                log.warning(
+                                    "F2-gate: rejected wrong-side fwd SL %s "
+                                    "vs fill %s, kept fresh %s",
+                                    fwd_sl, current_price,
+                                    risk.get("stop_loss"),
+                                )
+                        if fwd_tp:
+                            if tp_ok:
+                                risk["take_profit"] = fwd_tp
+                            else:
+                                log.warning(
+                                    "F2-gate: rejected wrong-side fwd TP %s "
+                                    "vs fill %s, kept fresh %s",
+                                    fwd_tp, current_price,
+                                    risk.get("take_profit"),
+                                )
+                    except Exception:
+                        # fail-to-fresh: comparisons run before any
+                        # assignment, so risk[] still holds the fresh calc.
+                        log.warning(
+                            "F2-gate: evaluation failed for %s — keeping "
+                            "fresh risk levels",
+                            ticker, exc_info=True,
+                        )
                     break  # use first matching forward signal
 
                 if (risk.get("stop_loss") and risk["stop_loss"] > 0
