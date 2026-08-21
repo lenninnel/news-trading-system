@@ -887,13 +887,13 @@ class TestF2ForwardOverrideSanityGate:
         assert len(warnings) == (not sl_accepted) + (not tp_accepted)
         if not sl_accepted:
             assert any(
-                f"leg=sl reason=wrong_side candidate={fwd_sl} "
+                f"origin=forward leg=sl reason=wrong_side candidate={fwd_sl} "
                 f"fill={fill} kept fresh={fresh_sl}" in w
                 for w in warnings
             )
         if not tp_accepted:
             assert any(
-                f"leg=tp reason=wrong_side candidate={fwd_tp} "
+                f"origin=forward leg=tp reason=wrong_side candidate={fwd_tp} "
                 f"fill={fill} kept fresh={fresh_tp}" in w
                 for w in warnings
             )

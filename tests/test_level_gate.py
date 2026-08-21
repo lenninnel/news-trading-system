@@ -154,47 +154,95 @@ def test_invalid_fill_forces_no_fill_reason(caplog, leg, candidate):
     assert "reason=wrong_side" not in caplog.text
 
 
-# ── T3: logging contract ─────────────────────────────────────────────────
+# ── T3: logging contract (incl. amendments A2 + A3) ──────────────────────
 
 
-def _warnings(caplog):
+def _gate_records(caplog, levelno):
     return [
         r for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == "orchestrator.level_gate"
+        if r.levelno == levelno and r.name == "orchestrator.level_gate"
     ]
 
 
+def _warnings(caplog):
+    return _gate_records(caplog, logging.WARNING)
+
+
 @pytest.mark.parametrize(
-    "leg,candidate,fill_valid,reason",
+    "leg,candidate,fill_valid,reason,origin,level",
     [
-        ("sl", 105.0, True,  "wrong_side"),
-        ("sl", None,  True,  "null_level"),
-        ("sl", 92.0,  False, "no_fill"),
-        ("tp", 95.0,  True,  "wrong_side"),
-        ("tp", None,  True,  "null_level"),
-        ("tp", 112.0, False, "no_fill"),
+        # wrong_side / no_fill → WARNING regardless of origin
+        ("sl", 105.0, True,  "wrong_side", "strategy", logging.WARNING),
+        ("tp", 95.0,  True,  "wrong_side", "forward",  logging.WARNING),
+        ("sl", 92.0,  False, "no_fill",    "forward",  logging.WARNING),
+        ("tp", 112.0, False, "no_fill",    "strategy", logging.WARNING),
+        # A2 split: null_level is INFO for strategy, WARNING for forward
+        ("sl", None,  True,  "null_level", "strategy", logging.INFO),
+        ("tp", None,  True,  "null_level", "strategy", logging.INFO),
+        ("sl", None,  True,  "null_level", "forward",  logging.WARNING),
+        ("tp", None,  True,  "null_level", "forward",  logging.WARNING),
     ],
 )
-def test_non_adoption_emits_exactly_one_warning_with_all_fields(
-    caplog, leg, candidate, fill_valid, reason,
+def test_non_adoption_emits_exactly_one_line_with_all_fields(
+    caplog, leg, candidate, fill_valid, reason, origin, level,
 ):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     risk = _fresh_risk()
     kept = risk["stop_loss" if leg == "sl" else "take_profit"]
 
-    apply_level_override(risk, leg, candidate, FILL, _ctx(fill_valid))
+    apply_level_override(
+        risk, leg, candidate, FILL, _ctx(fill_valid, origin=origin),
+    )
 
-    warnings = _warnings(caplog)
-    assert len(warnings) == 1, "exactly one WARNING per non-adopted leg"
-    msg = warnings[0].getMessage()
+    records = _gate_records(caplog, level)
+    assert len(records) == 1, "exactly one line per non-adopted leg"
+    # Only the level differs — never both levels for one non-adoption
+    other = logging.INFO if level == logging.WARNING else logging.WARNING
+    assert _gate_records(caplog, other) == []
+
+    msg = records[0].getMessage()
     assert msg.startswith("F2-gate:"), "literal grep-continuity prefix"
     assert "ticker=NVDA" in msg
     assert "session=US_OPEN" in msg
+    assert f"origin={origin}" in msg, "A3: origin mandatory in every line"
     assert f"leg={leg}" in msg
     assert f"reason={reason}" in msg
     assert f"candidate={candidate}" in msg
     assert f"fill={FILL}" in msg
     assert f"kept fresh={kept}" in msg
+
+
+@pytest.mark.parametrize("leg", ["sl", "tp"])
+def test_null_level_strategy_is_info_not_warning(caplog, leg):
+    """A2: absent strategy levels are expected — INFO, never WARNING."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(
+        risk, leg, None, FILL, _ctx(origin="strategy"),
+    )
+    assert adopted is False
+    assert _warnings(caplog) == []
+    infos = _gate_records(caplog, logging.INFO)
+    assert len(infos) == 1
+    assert infos[0].getMessage().startswith("F2-gate:")
+    assert "reason=null_level" in infos[0].getMessage()
+    assert "origin=strategy" in infos[0].getMessage()
+
+
+@pytest.mark.parametrize("leg", ["sl", "tp"])
+def test_null_level_forward_stays_warning(caplog, leg):
+    """A2: a NULL level in a forward row is still anomalous → WARNING."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(
+        risk, leg, None, FILL, _ctx(origin="forward"),
+    )
+    assert adopted is False
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "reason=null_level" in warnings[0].getMessage()
+    assert "origin=forward" in warnings[0].getMessage()
+    assert _gate_records(caplog, logging.INFO) == []
 
 
 @pytest.mark.parametrize("leg,candidate", [("sl", 92.0), ("tp", 112.0)])
