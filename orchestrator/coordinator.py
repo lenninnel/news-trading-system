@@ -87,6 +87,7 @@ from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFe
 from execution.broker_factory import create_trader
 from execution.portfolio_manager import PortfolioManager
 from orchestrator.cluster_detector import ClusterDetector
+from orchestrator.level_gate import apply_level_override
 from storage.database import Database
 from strategies.base import StrategyResult
 from strategies.momentum import MomentumStrategy
@@ -1336,12 +1337,21 @@ class Coordinator:
             regime=_effective_regime,
         )
 
-        # Override SL/TP with strategy-specific values when available
+        # Override SL/TP with strategy-specific values when available —
+        # candidates route through the F2 chokepoint gate (level_gate.py).
         if strategy_result is not None and not risk["skipped"]:
-            if strategy_result.stop_loss:
-                risk["stop_loss"] = strategy_result.stop_loss
-            if strategy_result.take_profit:
-                risk["take_profit"] = strategy_result.take_profit
+            _gate_ctx = {
+                "ticker": ticker,
+                "session": session,
+                "origin": "strategy",
+                "fill_valid": bool(price_is_live and price and price > 0),
+            }
+            apply_level_override(
+                risk, "sl", strategy_result.stop_loss, price, _gate_ctx,
+            )
+            apply_level_override(
+                risk, "tp", strategy_result.take_profit, price, _gate_ctx,
+            )
 
         if verbose:
             if risk["skipped"]:
@@ -1765,12 +1775,21 @@ class Coordinator:
                 regime=regime_info.get("regime"),
             )
 
-        # Override SL/TP with strategy-specific values when available
+        # Override SL/TP with strategy-specific values when available —
+        # candidates route through the F2 chokepoint gate (level_gate.py).
         if strategy_result is not None and not risk["skipped"]:
-            if strategy_result.stop_loss:
-                risk["stop_loss"] = strategy_result.stop_loss
-            if strategy_result.take_profit:
-                risk["take_profit"] = strategy_result.take_profit
+            _gate_ctx = {
+                "ticker": ticker,
+                "session": session,
+                "origin": "strategy",
+                "fill_valid": bool(price_is_live and price and price > 0),
+            }
+            apply_level_override(
+                risk, "sl", strategy_result.stop_loss, price, _gate_ctx,
+            )
+            apply_level_override(
+                risk, "tp", strategy_result.take_profit, price, _gate_ctx,
+            )
 
         # --- Execution ---
         execution = None
@@ -2303,49 +2322,28 @@ class Coordinator:
                 )
 
             if not risk["skipped"]:
-                # Use forward signal SL/TP if available — F2 sanity gate:
+                # Use forward signal SL/TP if available — candidates
+                # route through the F2 chokepoint gate (level_gate.py):
                 # adopt a forward level only when it sits on the correct
-                # side of the actual fill price (long-only BUY path).
+                # side of the actual fill price (long-only BUY path);
+                # non-adoption keeps the fresh risk_agent calc per leg.
                 # 2026-07-02: stale US_PRE levels landed above the fill
-                # (TRGP/VRT SL) or below it (AAPL TP); wrong-side levels
-                # now fall back to the fresh risk_agent calc per leg.
+                # (TRGP/VRT SL) or below it (AAPL TP).
+                _gate_ctx = {
+                    "ticker": ticker,
+                    "session": session,
+                    "origin": "forward",
+                    "fill_valid": bool(current_price and current_price > 0),
+                }
                 for fwd in pending:
-                    try:
-                        fwd_sl = fwd.get("stop_loss")
-                        fwd_tp = fwd.get("take_profit")
-                        # Evaluate both legs before assigning either so a
-                        # failed comparison can never leave half-applied
-                        # values (fail-to-fresh).
-                        sl_ok = bool(fwd_sl) and fwd_sl < current_price
-                        tp_ok = bool(fwd_tp) and fwd_tp > current_price
-                        if fwd_sl:
-                            if sl_ok:
-                                risk["stop_loss"] = fwd_sl
-                            else:
-                                log.warning(
-                                    "F2-gate: rejected wrong-side fwd SL %s "
-                                    "vs fill %s, kept fresh %s",
-                                    fwd_sl, current_price,
-                                    risk.get("stop_loss"),
-                                )
-                        if fwd_tp:
-                            if tp_ok:
-                                risk["take_profit"] = fwd_tp
-                            else:
-                                log.warning(
-                                    "F2-gate: rejected wrong-side fwd TP %s "
-                                    "vs fill %s, kept fresh %s",
-                                    fwd_tp, current_price,
-                                    risk.get("take_profit"),
-                                )
-                    except Exception:
-                        # fail-to-fresh: comparisons run before any
-                        # assignment, so risk[] still holds the fresh calc.
-                        log.warning(
-                            "F2-gate: evaluation failed for %s — keeping "
-                            "fresh risk levels",
-                            ticker, exc_info=True,
-                        )
+                    apply_level_override(
+                        risk, "sl", fwd.get("stop_loss"),
+                        current_price, _gate_ctx,
+                    )
+                    apply_level_override(
+                        risk, "tp", fwd.get("take_profit"),
+                        current_price, _gate_ctx,
+                    )
                     break  # use first matching forward signal
 
                 if (risk.get("stop_loss") and risk["stop_loss"] > 0

@@ -775,9 +775,12 @@ class TestF2ForwardOverrideSanityGate:
     BELOW the fill. The gate adopts a forward level only when it sits
     on the correct side of the actual fill price (SL < fill, TP > fill);
     a wrong-side level keeps the fresh risk_agent value and logs a
-    WARNING. If the comparison itself fails (corrupt type), BOTH legs
-    fall back to the fresh calc (fail-to-fresh) — never a half-applied
-    state.
+    WARNING.
+
+    Since the F2 chokepoint migration (R-spec v1.1) the gate lives in
+    orchestrator/level_gate.apply_level_override; this site's former
+    inline comparisons, WARNINGs, and broad fail-to-fresh try/except
+    were replaced by two helper calls per pending signal (S6a).
     """
 
     # Fresh risk_agent levels per case (correct-side, distinct from the
@@ -873,7 +876,7 @@ class TestF2ForwardOverrideSanityGate:
             fill=fill, fwd_sl=fwd_sl, fwd_tp=fwd_tp,
             fresh_sl=fresh_sl, fresh_tp=fresh_tp,
         )
-        with caplog.at_level(logging.WARNING, logger="orchestrator.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="orchestrator.level_gate"):
             result = self._run(c, ticker)
 
         risk = result["risk"]
@@ -884,14 +887,14 @@ class TestF2ForwardOverrideSanityGate:
         assert len(warnings) == (not sl_accepted) + (not tp_accepted)
         if not sl_accepted:
             assert any(
-                f"rejected wrong-side fwd SL {fwd_sl} vs fill {fill}, "
-                f"kept fresh {fresh_sl}" in w
+                f"origin=forward leg=sl reason=wrong_side candidate={fwd_sl} "
+                f"fill={fill} kept fresh={fresh_sl}" in w
                 for w in warnings
             )
         if not tp_accepted:
             assert any(
-                f"rejected wrong-side fwd TP {fwd_tp} vs fill {fill}, "
-                f"kept fresh {fresh_tp}" in w
+                f"origin=forward leg=tp reason=wrong_side candidate={fwd_tp} "
+                f"fill={fill} kept fresh={fresh_tp}" in w
                 for w in warnings
             )
 
@@ -926,28 +929,23 @@ class TestF2ForwardOverrideSanityGate:
         assert kwargs["stop_loss"] == 97.00
         assert kwargs["take_profit"] == 106.00
 
-    def test_fail_to_fresh_on_corrupt_forward_value(self, caplog):
-        """A non-comparable forward SL (string) must not raise, must
-        leave BOTH legs on the fresh risk_agent values — the valid
-        forward TP is deliberately NOT adopted (no half-applied state)
-        — and must log a WARNING."""
+    def test_corrupt_forward_value_raises(self):
+        """MIGRATION NOTE (F2 chokepoint, R-spec v1.1 S6a): the former
+        site-local broad try/except gave fail-to-fresh on a corrupt
+        (non-numeric) forward level — both legs kept fresh, WARNING,
+        trade executed. S6a replaced that try/except with the bare
+        helper calls and the spec's adoption rule covers only
+        None/fill_valid/side, so a non-comparable candidate now raises
+        TypeError out of the pipeline and NO trade fires. This test
+        pins that literal-spec behavior; flagged for review in the
+        F2 build report (2026-08-20)."""
         fresh_sl, fresh_tp = self.FRESH["HLTH"]
         c = self._make_coordinator(
             fill=100.00, fwd_sl="corrupt-not-a-price", fwd_tp=106.00,
             fresh_sl=fresh_sl, fresh_tp=fresh_tp,
         )
-        with caplog.at_level(logging.WARNING, logger="orchestrator.coordinator"):
-            result = self._run(c, "HLTH")  # must not raise
+        with pytest.raises(TypeError):
+            self._run(c, "HLTH")
 
-        risk = result["risk"]
-        assert risk["stop_loss"] == fresh_sl
-        assert risk["take_profit"] == fresh_tp
-
-        warnings = self._f2_warnings(caplog)
-        assert len(warnings) == 1
-        assert "evaluation failed" in warnings[0]
-
-        # Pipeline continues: trade executes on the fresh levels.
-        kwargs = c.paper_trader.track_trade.call_args.kwargs
-        assert kwargs["stop_loss"] == fresh_sl
-        assert kwargs["take_profit"] == fresh_tp
+        # No half-applied trade: the exception aborts before execution.
+        c.paper_trader.track_trade.assert_not_called()
