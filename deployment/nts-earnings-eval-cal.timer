@@ -1,0 +1,14 @@
+# Timer for nts-earnings-eval-cal.service — daily 12:00 UTC forward-calendar
+# capture (today .. today+30d). Standalone: NOT part of the trading daemon /
+# scheduler session list. Install instructions in the .service file.
+
+[Unit]
+Description=NTS Q2 earnings source eval calendar capture timer (daily 12:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 UTC
+Persistent=true
+Unit=nts-earnings-eval-cal.service
+
+[Install]
+WantedBy=timers.target
