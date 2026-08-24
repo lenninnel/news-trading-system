@@ -19,6 +19,12 @@ Standalone, capture-only, NON-LIVE job — these tests pin its contract:
   and config.settings.PEAD_TICKERS (exactly 15) — nothing hard-coded.
 * Secrets — error strings are sanitized (no query params / API keys) and
   run_log stores endpoint paths only.
+* Alpha Vantage — CSV calendar normalization; per-ticker eps path with
+  the free-tier daily budget (shortfall WARNING + run_log.error_text);
+  HTTP-200 JSON-note rate limiting treated as retriable; eps_method
+  'unknown'; reportTime mapping; fail-soft vs the other two providers.
+* NEWS_SENTIMENT probe — stdout only, summary fields present, no DB
+  write, exit 1 on failure.
 
 No network: fetchers are injected, or ``requests.get`` is monkeypatched.
 """
@@ -98,6 +104,21 @@ def _fetcher(rows, status=200, headers=None):
     return lambda frm, to: (rows, status, headers or {})
 
 
+def _av_eps_fetcher(payloads, status=200, headers=None, calls=None):
+    """Per-ticker AV eps fetcher: payloads maps ticker → payload."""
+    def _fetch(ticker):
+        if calls is not None:
+            calls.append(ticker)
+        return payloads[ticker], status, headers or {}
+    return _fetch
+
+
+# Empty stand-ins so tests focused on one provider still satisfy the
+# three-provider loop.
+_AV_NONE_CAL = _fetcher([])
+_AV_NONE_EPS = lambda ticker: ({"symbol": ticker, "quarterlyEarnings": []}, 200, {})  # noqa: E731
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = sqlite3.connect(tmp_path / "earnings_source_eval.db")
@@ -131,7 +152,8 @@ def test_schema_creates_exact_rspec_tables(conn):
 
 def test_cal_capture_field_mapping_both_providers(conn):
     fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
-                "fmp": _fetcher(FMP_CAL_ROWS)}
+                "fmp": _fetcher(FMP_CAL_ROWS),
+                "alphavantage": _AV_NONE_CAL}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["finnhub"]["ok"]
@@ -173,13 +195,14 @@ def test_cal_run_log_rows_and_no_query_params(conn):
                                     headers={"X-RateLimit-Remaining": "29",
                                              "X-RateLimit-Limit": "30",
                                              "Content-Type": "application/json"}),
-                "fmp": _fetcher(FMP_CAL_ROWS)}
+                "fmp": _fetcher(FMP_CAL_ROWS),
+                "alphavantage": _AV_NONE_CAL}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     logs = conn.execute(
         "SELECT provider, endpoint, http_status, rows_returned,"
         " rate_limit_headers, error_text FROM run_log ORDER BY provider").fetchall()
-    assert len(logs) == 2
+    assert len(logs) == 3
     fh = [l for l in logs if l[0] == "finnhub"][0]
     assert "?" not in fh[1] and "apikey" not in fh[1] and "token" not in fh[1]
     assert fh[2] == 200
@@ -193,7 +216,8 @@ def test_cal_run_log_rows_and_no_query_params(conn):
 
 def test_eps_capture_field_mapping_both_providers(conn):
     fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS),
-                "fmp": _fetcher(FMP_EPS_ROWS)}
+                "fmp": _fetcher(FMP_EPS_ROWS),
+                "alphavantage": _AV_NONE_EPS}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     rows = conn.execute(
@@ -223,7 +247,8 @@ def test_eps_capture_field_mapping_both_providers(conn):
 
 
 def test_first_seen_ts_set_once_and_carried_forward(conn):
-    fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS), "fmp": _fetcher([])}
+    fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS), "fmp": _fetcher([]),
+                "alphavantage": _AV_NONE_EPS}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     # Second capture of the SAME (provider, ticker, report_date), next day.
@@ -248,7 +273,8 @@ def test_fail_soft_one_provider_raising_never_stops_the_other(conn):
     def _boom(frm, to):
         raise RuntimeError("finnhub down")
 
-    fetchers = {"finnhub": _boom, "fmp": _fetcher(FMP_CAL_ROWS)}
+    fetchers = {"finnhub": _boom, "fmp": _fetcher(FMP_CAL_ROWS),
+                "alphavantage": _AV_NONE_CAL}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["finnhub"]["ok"] is False
@@ -264,7 +290,7 @@ def test_fail_soft_one_provider_raising_never_stops_the_other(conn):
     # BOTH outcomes land in run_log.
     logs = {r[0]: r for r in conn.execute(
         "SELECT provider, error_text, rows_returned FROM run_log")}
-    assert len(logs) == 2
+    assert len(logs) == 3
     assert "finnhub down" in logs["finnhub"][1]
     assert logs["fmp"][1] is None and logs["fmp"][2] == 3
 
@@ -277,7 +303,8 @@ def test_retry_cap_initial_plus_two_retries_then_stop(conn):
         calls.append(1)
         raise RuntimeError("still down")
 
-    fetchers = {"finnhub": _always_fails, "fmp": _fetcher([])}
+    fetchers = {"finnhub": _always_fails, "fmp": _fetcher([]),
+                "alphavantage": _AV_NONE_CAL}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=sleeps.append)
     # Max 2 retries after the initial attempt → exactly 3 calls, 2 backoff
@@ -298,7 +325,8 @@ def test_retry_recovers_without_run_log_error(conn):
             raise RuntimeError("blip")
         return FMP_CAL_ROWS, 200, {}
 
-    fetchers = {"finnhub": _fetcher([]), "fmp": _flaky}
+    fetchers = {"finnhub": _fetcher([]), "fmp": _flaky,
+                "alphavantage": _AV_NONE_CAL}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert len(attempts) == 2
@@ -311,10 +339,11 @@ def test_retry_recovers_without_run_log_error(conn):
 # ── Live fetchers: payload shapes + key placement (requests mocked) ──
 
 class _FakeResp:
-    def __init__(self, payload, headers=None):
+    def __init__(self, payload, headers=None, text=None):
         self._payload = payload
         self.status_code = 200
         self.headers = headers or {}
+        self.text = text if text is not None else json.dumps(payload)
 
     def raise_for_status(self):
         pass
@@ -366,3 +395,288 @@ def test_universe_loader_finds_us_and_exactly_15_pead_names():
 
     universe = ev.load_universe()
     assert set(us) <= universe and set(pead) <= universe
+
+
+# ── Alpha Vantage fixtures ───────────────────────────────────────────
+
+# EARNINGS_CALENDAR CSV rows as csv.DictReader yields them (all strings).
+AV_CAL_ROWS = [
+    {"symbol": "CASY", "name": "Caseys General Stores Inc",
+     "reportDate": "2026-09-08", "fiscalDateEnding": "2026-07-31",
+     "estimate": "4.50", "currency": "USD"},
+    # No reportDate → date_status "absent".
+    {"symbol": "AAPL", "name": "Apple Inc", "reportDate": "",
+     "fiscalDateEnding": "2026-09-30", "estimate": "", "currency": "USD"},
+    # Out-of-universe row — must be filtered out.
+    {"symbol": "ZZZQ", "name": "Zzz Corp", "reportDate": "2026-09-05",
+     "fiscalDateEnding": "2026-08-31", "estimate": "1.00", "currency": "USD"},
+]
+
+AV_CAL_CSV = (
+    "symbol,name,reportDate,fiscalDateEnding,estimate,currency\r\n"
+    "CASY,Caseys General Stores Inc,2026-09-08,2026-07-31,4.50,USD\r\n"
+)
+
+# EARNINGS payload (per-ticker; whole history — only in-window rows count).
+AV_EPS_AAPL = {
+    "symbol": "AAPL",
+    "annualEarnings": [{"fiscalDateEnding": "2025-09-30",
+                        "reportedEPS": "7.4"}],
+    "quarterlyEarnings": [
+        {"fiscalDateEnding": "2026-06-30", "reportedDate": "2026-08-24",
+         "reportedEPS": "2.35", "estimatedEPS": "2.10", "surprise": "0.25",
+         "surprisePercentage": "11.9", "reportTime": "post-market"},
+        {"fiscalDateEnding": "2020-06-30", "reportedDate": "2020-07-30",
+         "reportedEPS": "0.65", "estimatedEPS": "0.51", "surprise": "0.14",
+         "surprisePercentage": "27.45", "reportTime": "pre-market"},
+    ],
+}
+
+AV_RATE_LIMIT_NOTE = {
+    "Information": "Thank you for using Alpha Vantage! Our standard API "
+                   "rate limit is 25 requests per day."
+}
+
+AV_NEWS_FIXTURE = {
+    "items": "2",
+    "sentiment_score_definition": "x <= -0.35: Bearish; ...",
+    "relevance_score_definition": "0 < x <= 1, higher means more relevant",
+    "feed": [
+        {"title": "Apple beats on Q3 earnings",
+         "url": "https://example.com/a",
+         "time_published": "20260824T101500", "authors": ["Reporter A"],
+         "summary": "Apple reported...", "source": "Benzinga",
+         "overall_sentiment_score": 0.25,
+         "overall_sentiment_label": "Somewhat-Bullish",
+         "ticker_sentiment": [
+             {"ticker": "AAPL", "relevance_score": "0.85",
+              "ticker_sentiment_score": "0.31",
+              "ticker_sentiment_label": "Somewhat-Bullish"}]},
+        {"title": "Tech roundup", "url": "https://example.com/b",
+         "time_published": "20260823T220000",
+         "overall_sentiment_label": "Neutral",
+         "ticker_sentiment": [
+             {"ticker": "AAPL", "relevance_score": "0.42",
+              "ticker_sentiment_label": "Neutral"},
+             {"ticker": "MSFT", "relevance_score": "0.10",
+              "ticker_sentiment_label": "Neutral"}]},
+    ],
+}
+
+
+# ── Alpha Vantage: cal normalization ─────────────────────────────────
+
+def test_av_cal_normalization_universe_filter_and_date_status(conn):
+    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
+                "alphavantage": _fetcher(AV_CAL_ROWS)}
+    summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
+                             universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
+    assert summary["providers"]["alphavantage"]["ok"]
+    assert summary["providers"]["alphavantage"]["rows_returned"] == 3
+
+    rows = conn.execute(
+        "SELECT ticker, report_date, time_of_day, date_status, days_ahead,"
+        " provider_status_raw FROM cal_capture"
+        " WHERE provider='alphavantage' ORDER BY ticker").fetchall()
+    assert len(rows) == 2                     # ZZZQ filtered out
+    aapl, casy = rows[0], rows[1]
+
+    assert casy[0] == "CASY"
+    assert casy[1] == "2026-09-08"
+    assert casy[2] == "unknown"               # AV CSV has no session field
+    assert casy[3] == "scheduled"             # reportDate present
+    assert casy[4] == 15                      # days_ahead from 2026-08-24
+    raw = json.loads(casy[5])                 # raw CSV row as-is
+    assert raw["estimate"] == "4.50" and raw["fiscalDateEnding"] == "2026-07-31"
+
+    assert aapl[1] == "" and aapl[3] == "absent" and aapl[4] is None
+
+
+def test_fetch_alphavantage_calendar_parses_csv_and_detects_note(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        captured.update(url=url, params=params)
+        return _FakeResp(None, text=AV_CAL_CSV)
+
+    monkeypatch.setattr(ev.requests, "get", fake_get)
+    rows, status, _ = ev.fetch_alphavantage_calendar("SECRET")
+    assert status == 200
+    assert rows == [{"symbol": "CASY", "name": "Caseys General Stores Inc",
+                     "reportDate": "2026-09-08",
+                     "fiscalDateEnding": "2026-07-31",
+                     "estimate": "4.50", "currency": "USD"}]
+    assert captured["params"]["function"] == "EARNINGS_CALENDAR"
+    assert captured["params"]["horizon"] == "3month"
+
+    # Rate limiting: HTTP 200 with a JSON note instead of CSV.
+    monkeypatch.setattr(
+        ev.requests, "get",
+        lambda *a, **kw: _FakeResp(None, text=json.dumps(AV_RATE_LIMIT_NOTE)))
+    with pytest.raises(ev.AlphaVantageRateLimitError):
+        ev.fetch_alphavantage_calendar("SECRET")
+
+
+# ── Alpha Vantage: eps normalization ─────────────────────────────────
+
+def test_normalize_av_report_time():
+    assert ev.normalize_av_report_time("pre-market") == "bmo"
+    assert ev.normalize_av_report_time("post-market") == "amc"
+    assert ev.normalize_av_report_time("") == "unknown"
+    assert ev.normalize_av_report_time(None) == "unknown"
+    assert ev.normalize_av_report_time("whatever") == "unknown"
+
+
+def test_av_eps_normalization_window_method_first_seen(conn):
+    calls = []
+    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
+                "alphavantage": _av_eps_fetcher({"AAPL": AV_EPS_AAPL},
+                                                calls=calls)}
+    ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
+                   universe={"AAPL"}, av_priority=["AAPL"],
+                   sleep_fn=_NO_SLEEP)
+    assert calls == ["AAPL"]
+
+    rows = conn.execute(
+        "SELECT report_date, estimate_eps, actual_eps, surprise_pct,"
+        " eps_method, available_same_day, first_seen_ts FROM eps_capture"
+        " WHERE provider='alphavantage'").fetchall()
+    # Only the in-window (today-1..today) quarter — the 2020 row dropped.
+    assert len(rows) == 1
+    r = rows[0]
+    assert r[0] == "2026-08-24"
+    assert r[1] == 2.10 and r[2] == 2.35      # AV strings → floats
+    assert r[3] == 11.9                       # AV's own surprisePercentage
+    assert r[4] == "unknown"                  # no gaap/adj distinction
+    assert r[5] == 1                          # reported on capture day
+    assert r[6] == _NOW_EPS.isoformat()
+
+    # reportTime mapping is computed (informational — eps_capture has no
+    # time_of_day column in the R-spec schema).
+    norms = ev.normalize_av_eps_rows(
+        AV_EPS_AAPL, "2026-08-23", "2026-08-24", _NOW_EPS.date())
+    assert norms[0]["time_of_day"] == "amc"   # post-market → amc
+
+    # Second capture next day: first_seen_ts carried forward.
+    later = datetime(2026, 8, 25, 23, 0, 0, tzinfo=timezone.utc)
+    ev.run_capture("eps", conn, now=later, fetchers=fetchers,
+                   universe={"AAPL"}, av_priority=["AAPL"],
+                   sleep_fn=_NO_SLEEP)
+    seen = conn.execute(
+        "SELECT first_seen_ts FROM eps_capture WHERE provider='alphavantage'"
+        " AND report_date='2026-08-24' ORDER BY rowid").fetchall()
+    assert [s[0] for s in seen] == [_NOW_EPS.isoformat()] * 2
+
+
+# ── Alpha Vantage: budget shortfall + note-style rate limiting ───────
+
+def test_av_budget_shortfall_warning_and_error_text(conn, caplog):
+    calls = []
+    fetchers = {
+        "finnhub": _fetcher([]), "fmp": _fetcher([]),
+        "alphavantage": _av_eps_fetcher(
+            {"CASY": {"symbol": "CASY", "quarterlyEarnings": []},
+             "TSLA": {"symbol": "TSLA", "quarterlyEarnings": []}},
+            calls=calls),
+    }
+    with caplog.at_level("WARNING", logger="earnings_source_eval"):
+        summary = ev.run_capture(
+            "eps", conn, now=_NOW_EPS, fetchers=fetchers,
+            universe=_UNIVERSE, av_priority=["CASY", "TSLA", "AAPL"],
+            av_daily_limit=3, sleep_fn=_NO_SLEEP)
+
+    # Budget = 3 daily - 1 reserved for cal = 2 < 3 tickers → AAPL skipped.
+    assert calls == ["CASY", "TSLA"]
+    assert summary["providers"]["alphavantage"]["skipped"] == 1
+
+    joined = " ".join(r.getMessage() for r in caplog.records
+                      if r.levelname == "WARNING")
+    assert "3 tickers > remaining daily budget 2" in joined
+    assert "AAPL" in joined
+
+    err = conn.execute(
+        "SELECT error_text FROM run_log WHERE provider='alphavantage'"
+    ).fetchone()[0]
+    assert "budget shortfall" in err
+    assert "universe 3 > remaining budget 2" in err
+    assert "AAPL" in err
+
+
+def test_av_note_rate_limit_is_retriable_and_recorded(conn):
+    calls = []
+
+    def _rate_limited(ticker):
+        calls.append(ticker)
+        return AV_RATE_LIMIT_NOTE, 200, {}
+
+    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
+                "alphavantage": _rate_limited}
+    summary = ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
+                             universe={"AAPL"}, av_priority=["AAPL"],
+                             sleep_fn=_NO_SLEEP)
+    # HTTP 200 + note is a retriable failure: initial + 2 retries.
+    assert calls == ["AAPL"] * 3
+    assert summary["providers"]["alphavantage"]["ok"] is False
+
+    log = conn.execute(
+        "SELECT rows_returned, rate_limit_headers, error_text FROM run_log"
+        " WHERE provider='alphavantage'").fetchone()
+    assert log[0] == 0
+    assert "25 requests per day" in json.loads(log[1])["av_note"]
+    assert "rate-limit note" in log[2]
+
+
+def test_av_fail_soft_other_providers_unaffected(conn):
+    def _boom(frm, to):
+        raise RuntimeError("av boom")
+
+    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
+                "fmp": _fetcher(FMP_CAL_ROWS), "alphavantage": _boom}
+    summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
+                             universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
+    assert summary["providers"]["alphavantage"]["ok"] is False
+    assert summary["providers"]["finnhub"]["ok"] is True
+    assert summary["providers"]["fmp"]["ok"] is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM cal_capture WHERE provider IN ('finnhub','fmp')"
+    ).fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0] == 3
+    assert "av boom" in conn.execute(
+        "SELECT error_text FROM run_log WHERE provider='alphavantage'"
+    ).fetchone()[0]
+
+
+# ── NEWS_SENTIMENT probe (stdout only, no DB) ────────────────────────
+
+def test_news_probe_summary_and_no_db_write(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "probe-should-not-exist.db"
+    monkeypatch.setenv("EARNINGS_EVAL_DB", str(db))
+
+    rc = ev.run_news_probe("AAPL",
+                           fetch_fn=lambda: (AV_NEWS_FIXTURE, 200, {}))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '"feed"' in out                    # raw JSON pretty-printed
+    assert "articles: 2" in out
+    assert "date_range: 20260823T220000 .. 20260824T101500" in out
+    assert "fields_present" in out
+    assert "title: 2/2" in out
+    assert "authors: 1/2" in out              # field presence per article
+    assert "ticker_relevance (AAPL): n=2" in out
+    assert "min=0.4200" in out and "max=0.8500" in out
+    assert '"Somewhat-Bullish": 1' in out and '"Neutral": 1' in out
+    assert not db.exists()                    # stdout ONLY — no DB write
+
+
+def test_news_probe_failure_exits_1(capsys):
+    def _auth_fail():
+        raise RuntimeError("401 unauthorized for url: https://x?apikey=SECRET")
+
+    assert ev.run_news_probe("AAPL", fetch_fn=_auth_fail) == 1
+    out = capsys.readouterr().out
+    assert "FAILED" in out and "SECRET" not in out
+
+    # Provider note (rate limit) also fails the probe.
+    assert ev.run_news_probe(
+        "AAPL", fetch_fn=lambda: (AV_RATE_LIMIT_NOTE, 200, {})) == 1
+    assert "provider note" in capsys.readouterr().out

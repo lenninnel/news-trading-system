@@ -2,9 +2,9 @@
 """Q2 earnings source evaluation — capture-only (R-spec 2026-08-24).
 
 Standalone, NON-LIVE evaluation stack that captures earnings-calendar and
-EPS-actuals data from two free providers (Finnhub + FMP) into its OWN
-SQLite database, so the two sources can later be compared for calendar
-accuracy and actuals latency.
+EPS-actuals data from three free providers (Finnhub + FMP + Alpha Vantage)
+into its OWN SQLite database, so the sources can later be compared for
+calendar accuracy and actuals latency.
 
 Isolation contract (non-negotiable)
 -----------------------------------
@@ -24,6 +24,14 @@ Modes
     per provider covering today .. today+30d, filtered to the universe.
 ``--mode eps``  (23:00 UTC timer) — actuals capture, one RANGE call per
     provider covering today-1 .. today, filtered to the universe.
+    Alpha Vantage has no range actuals endpoint — its EARNINGS call is
+    per-ticker, so eps mode walks the universe in priority order (PEAD
+    first, then US watchlist) under the free-tier daily call budget
+    (default 25/day, 1 reserved for the cal call); any shortfall is
+    WARNING-logged with exact numbers and recorded in run_log.error_text.
+``--mode news-probe --ticker T`` — one-shot Alpha Vantage NEWS_SENTIMENT
+    probe: pretty-prints the raw JSON + a field summary to stdout ONLY
+    (no DB write, no run_log row, no timer). Exit 1 on any failure.
 
 Universe (sourced at runtime, never hard-coded)
 -----------------------------------------------
@@ -33,11 +41,22 @@ Rows whose symbol is not an exact match against the union are dropped.
 
 Secrets discipline
 ------------------
-API keys are read from env (``FINNHUB_API_KEY`` / ``FMP_API_KEY``).  The
-Finnhub key travels in the ``X-Finnhub-Token`` header (never in the URL).
-FMP requires the key as a query param, so NO full URL is ever logged and
+API keys are read from env (``FINNHUB_API_KEY`` / ``FMP_API_KEY`` /
+``ALPHA_VANTAGE_API_KEY``).  The Finnhub key travels in the
+``X-Finnhub-Token`` header (never in the URL).  FMP and Alpha Vantage
+require the key as a query param, so NO full URL is ever logged and
 every error string is passed through ``_sanitize_error`` (strips query
 strings and masks ``apikey=``/``token=`` values) before logging or storage.
+
+Alpha Vantage quirks (handled explicitly)
+-----------------------------------------
+* EARNINGS_CALENDAR returns CSV (not JSON), covers ALL tickers in one
+  call (horizon=3month) — parsed with csv.DictReader, filtered to the
+  universe.
+* Rate limiting arrives as HTTP 200 with a JSON "Note"/"Information"
+  message, NOT a 429 — detected and treated as a retriable failure; any
+  such note is captured into run_log.rate_limit_headers.
+* EARNINGS gives no GAAP/adjusted distinction → eps_method="unknown".
 
 Retries
 -------
@@ -47,8 +66,16 @@ initial attempt (3 HTTP calls total), then the failure is logged to
 """
 from __future__ import annotations
 
+# Allow manual CLI invocation from anywhere without PYTHONPATH=. (the
+# systemd units set WorkingDirectory, an interactive shell doesn't).
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 import argparse
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
@@ -80,14 +107,41 @@ _BACKOFF_BASE_S = 2.0    # 2s, then 4s
 _HTTP_TIMEOUT_S = 20.0
 
 # Endpoint identifiers stored in run_log — path only, NEVER a full URL
-# with query params (the FMP key rides in the query string).
+# with query params (the FMP / Alpha Vantage keys ride in the query string).
 _FINNHUB_ENDPOINT = "finnhub.io/api/v1/calendar/earnings"
 _FMP_ENDPOINT = "financialmodelingprep.com/api/v3/earning_calendar"
+_AV_CAL_ENDPOINT = "alphavantage.co/query#EARNINGS_CALENDAR"
+_AV_EPS_ENDPOINT = "alphavantage.co/query#EARNINGS"
+_AV_NEWS_ENDPOINT = "alphavantage.co/query#NEWS_SENTIMENT"
 
 _FINNHUB_URL = "https://finnhub.io/api/v1/calendar/earnings"
 _FMP_URL = "https://financialmodelingprep.com/api/v3/earning_calendar"
+_AV_URL = "https://www.alphavantage.co/query"
 
-_PROVIDERS = ("finnhub", "fmp")
+_PROVIDERS = ("finnhub", "fmp", "alphavantage")
+
+# Alpha Vantage free-tier daily call budget.  The EARNINGS actuals
+# endpoint is per-ticker, so eps mode spends one call per universe name;
+# one call/day is reserved for the (same-day) EARNINGS_CALENDAR run.
+_AV_DAILY_LIMIT = int(os.environ.get("ALPHA_VANTAGE_DAILY_LIMIT", "25"))
+_AV_CAL_RESERVED_CALLS = 1
+
+
+class AlphaVantageRateLimitError(RuntimeError):
+    """AV signals rate limiting as HTTP 200 + a JSON note — retriable."""
+
+    def __init__(self, note: str):
+        super().__init__(f"alphavantage rate-limit note: {note}")
+        self.note = note
+
+
+def _av_note(payload) -> "str | None":
+    """Extract AV's rate-limit/notice message from a JSON payload, if any."""
+    if isinstance(payload, dict):
+        for key in ("Note", "Information", "Error Message"):
+            if payload.get(key):
+                return str(payload[key])
+    return None
 
 
 # ── Secrets hygiene ──────────────────────────────────────────────────
@@ -231,11 +285,70 @@ def fetch_fmp(api_key: str, frm: str, to: str) -> tuple[list, int, dict]:
     return rows, resp.status_code, dict(resp.headers)
 
 
-def _default_fetchers() -> dict:
+def fetch_alphavantage_calendar(api_key: str) -> tuple[list, int, dict]:
+    """One call to AV's EARNINGS_CALENDAR (horizon=3month, ALL tickers).
+
+    Returns CSV parsed into a list of dicts.  A rate-limit response is
+    HTTP 200 with a JSON note instead of CSV — detected and raised as
+    AlphaVantageRateLimitError (retriable).  The key rides in the query
+    string — callers must never log the URL (see _sanitize_error).
+    """
+    resp = requests.get(
+        _AV_URL,
+        params={"function": "EARNINGS_CALENDAR", "horizon": "3month",
+                "apikey": api_key},
+        timeout=_HTTP_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    text = resp.text.strip()
+    if text.startswith("{"):
+        note = _av_note(json.loads(text))
+        raise AlphaVantageRateLimitError(note or "unexpected JSON payload")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    return rows, resp.status_code, dict(resp.headers)
+
+
+def fetch_alphavantage_earnings(api_key: str, ticker: str) -> tuple[dict, int, dict]:
+    """Per-ticker call to AV's EARNINGS actuals endpoint."""
+    resp = requests.get(
+        _AV_URL,
+        params={"function": "EARNINGS", "symbol": ticker, "apikey": api_key},
+        timeout=_HTTP_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload, resp.status_code, dict(resp.headers)
+
+
+def fetch_alphavantage_news(api_key: str, ticker: str) -> tuple[dict, int, dict]:
+    """One call to AV's NEWS_SENTIMENT endpoint (probe mode only)."""
+    resp = requests.get(
+        _AV_URL,
+        params={"function": "NEWS_SENTIMENT", "tickers": ticker,
+                "apikey": api_key},
+        timeout=_HTTP_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload, resp.status_code, dict(resp.headers)
+
+
+def _av_api_key() -> str:
+    key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+    if not key:
+        raise RuntimeError("ALPHA_VANTAGE_API_KEY missing")
+    return key
+
+
+def _default_fetchers(mode: str) -> dict:
     """Build the live fetchers from env keys.
 
     A missing key raises inside the provider's callable so it lands in
-    run_log as that provider's failure without touching the other.
+    run_log as that provider's failure without touching the others.
+    Signatures per provider: finnhub/fmp take (frm, to); alphavantage
+    takes (frm, to) in cal mode (AV's horizon is fixed, the range is
+    ignored) but (ticker) in eps mode — its actuals endpoint is
+    per-ticker.
     """
     def _finnhub(frm: str, to: str):
         key = os.environ.get("FINNHUB_API_KEY", "")
@@ -249,7 +362,14 @@ def _default_fetchers() -> dict:
             raise RuntimeError("FMP_API_KEY missing")
         return fetch_fmp(key, frm, to)
 
-    return {"finnhub": _finnhub, "fmp": _fmp}
+    if mode == "cal":
+        def _av(frm: str, to: str):
+            return fetch_alphavantage_calendar(_av_api_key())
+    else:
+        def _av(ticker: str):
+            return fetch_alphavantage_earnings(_av_api_key(), ticker)
+
+    return {"finnhub": _finnhub, "fmp": _fmp, "alphavantage": _av}
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────
@@ -295,11 +415,37 @@ def normalize_cal_row(provider: str, row: dict, today: date) -> "dict | None":
     """Map one raw calendar row to cal_capture fields.
 
     date_status: 'scheduled' when the provider commits to a session
-    (bmo/amc/dmh), 'tentative' otherwise — neither free tier exposes an
-    explicit confirmed/estimated flag, so session presence is the best
-    available proxy.  provider_status_raw preserves the provider's raw
-    timing/status field verbatim for later audit.
+    (bmo/amc/dmh), 'tentative' otherwise — neither Finnhub's nor FMP's
+    free tier exposes an explicit confirmed/estimated flag, so session
+    presence is the best available proxy.  provider_status_raw preserves
+    the provider's raw timing/status field verbatim for later audit.
+
+    Alpha Vantage: no session field at all → time_of_day 'unknown';
+    date_status 'scheduled' if a reportDate exists, 'absent' otherwise
+    (report_date stored as '' then — the column is NOT NULL);
+    provider_status_raw carries the whole raw CSV row as JSON (the
+    estimate and fiscalDateEnding context also live in the hashed
+    payload).
     """
+    if provider == "alphavantage":
+        ticker, report_date = row.get("symbol"), row.get("reportDate")
+        if not ticker:
+            return None
+        try:
+            days_ahead = (
+                date.fromisoformat(report_date[:10]) - today
+            ).days if report_date else None
+        except ValueError:
+            days_ahead = None
+        return {
+            "ticker": ticker,
+            "report_date": report_date[:10] if report_date else "",
+            "time_of_day": "unknown",
+            "date_status": "scheduled" if report_date else "absent",
+            "days_ahead": days_ahead,
+            "raw_payload_hash": _payload_hash(row),
+            "provider_status_raw": json.dumps(row, sort_keys=True),
+        }
     if provider == "finnhub":
         ticker, report_date, status_raw = (
             row.get("symbol"), row.get("date"), row.get("hour"))
@@ -368,6 +514,71 @@ def normalize_eps_row(provider: str, row: dict, capture_day: date) -> "dict | No
     }
 
 
+def _av_float(value) -> "float | None":
+    """AV serializes numbers as strings and missing values as 'None'."""
+    if value in (None, "", "None"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_av_report_time(raw) -> str:
+    """AV reportTime → the stack's session vocabulary.
+
+    NOTE: eps_capture has no time_of_day column (R-spec schema), so this
+    mapping is informational — computed and unit-tested, not persisted.
+    """
+    rt = (raw or "").strip().lower()
+    return {"pre-market": "bmo", "post-market": "amc"}.get(rt, "unknown")
+
+
+def normalize_av_eps_rows(
+    payload: dict, frm: str, to: str, capture_day: date,
+) -> list[dict]:
+    """Map one ticker's EARNINGS payload to eps_capture rows.
+
+    Only quarterlyEarnings entries whose reportedDate falls inside the
+    run's [frm, to] window are captured (the endpoint returns the whole
+    history).  eps_method is 'unknown' — AV documents no GAAP/adjusted
+    distinction for reportedEPS.  surprise_pct prefers AV's own
+    surprisePercentage; falls back to computing from actual/estimate.
+    """
+    ticker = payload.get("symbol")
+    if not ticker:
+        return []
+    out = []
+    for q in payload.get("quarterlyEarnings") or []:
+        report_date = (q.get("reportedDate") or "")[:10]
+        if not report_date or not (frm <= report_date <= to):
+            continue
+        estimate = _av_float(q.get("estimatedEPS"))
+        actual = _av_float(q.get("reportedEPS"))
+        surprise_pct = _av_float(q.get("surprisePercentage"))
+        if surprise_pct is None and actual is not None \
+                and estimate not in (None, 0):
+            surprise_pct = (actual - estimate) / abs(estimate) * 100.0
+        available_same_day = None
+        if actual is not None:
+            try:
+                available_same_day = int(
+                    date.fromisoformat(report_date) == capture_day)
+            except ValueError:
+                available_same_day = None
+        out.append({
+            "ticker": ticker,
+            "report_date": report_date,
+            "estimate_eps": estimate,
+            "actual_eps": actual,
+            "surprise_pct": surprise_pct,
+            "eps_method": "unknown",
+            "available_same_day": available_same_day,
+            "time_of_day": normalize_av_report_time(q.get("reportTime")),
+        })
+    return out
+
+
 def _first_seen_ts(
     conn: sqlite3.Connection,
     provider: str,
@@ -389,6 +600,135 @@ def _first_seen_ts(
     return row[0] if row else capture_ts
 
 
+def _insert_eps_row(
+    conn: sqlite3.Connection, capture_ts: str, provider: str, norm: dict,
+) -> None:
+    first_seen = None
+    if norm["actual_eps"] is not None:
+        first_seen = _first_seen_ts(
+            conn, provider, norm["ticker"], norm["report_date"], capture_ts)
+    conn.execute(
+        "INSERT INTO eps_capture (capture_ts, provider, ticker,"
+        " report_date, estimate_eps, actual_eps, surprise_pct,"
+        " eps_method, available_same_day, first_seen_ts)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (capture_ts, provider, norm["ticker"], norm["report_date"],
+         norm["estimate_eps"], norm["actual_eps"], norm["surprise_pct"],
+         norm["eps_method"], norm["available_same_day"], first_seen),
+    )
+
+
+# ── Alpha Vantage eps path (per-ticker, budget-capped) ───────────────
+
+def _av_priority_order() -> list[str]:
+    """Universe walk order under the daily call budget: PEAD names first
+    (the strategy the eval serves), then the US watchlist."""
+    pead = load_pead_tickers()
+    seen = set(pead)
+    return pead + [t for t in load_us_watchlist() if t not in seen]
+
+
+def _capture_av_eps(
+    conn: sqlite3.Connection,
+    *,
+    capture_ts: str,
+    today: date,
+    frm: str,
+    to: str,
+    universe: set,
+    fetcher,
+    sleep_fn,
+    priority_order: "list[str] | None" = None,
+    daily_limit: "int | None" = None,
+) -> dict:
+    """AV actuals: one EARNINGS call per ticker under the free-tier
+    daily budget (default 25/day, 1 reserved for the same-day cal run).
+
+    A shortfall (universe > remaining budget) is the operational-ceiling
+    result the eval is after: WARNING with exact numbers, process as many
+    tickers as fit (PEAD first, then US watchlist), record the shortfall
+    in run_log.error_text.  Per-ticker failures never abort the loop.
+    """
+    daily_limit = _AV_DAILY_LIMIT if daily_limit is None else daily_limit
+    budget = max(0, daily_limit - _AV_CAL_RESERVED_CALLS)
+    ordered = [t for t in (priority_order or _av_priority_order())
+               if t in universe]
+    skipped: list[str] = []
+    if len(ordered) > budget:
+        skipped = ordered[budget:]
+        logger.warning(
+            "alphavantage eps: universe %d tickers > remaining daily "
+            "budget %d (daily limit %d - %d reserved for cal) — "
+            "processing first %d in priority order (PEAD first), "
+            "SKIPPING %d: %s",
+            len(ordered), budget, daily_limit, _AV_CAL_RESERVED_CALLS,
+            budget, len(skipped), ",".join(skipped),
+        )
+    process = ordered[:budget]
+
+    rows_total = 0
+    inserted = 0
+    errors: list[str] = []
+    note_seen: "str | None" = None
+    last_status: "int | None" = None
+    for ticker in process:
+        def _one(t=ticker):
+            payload, status, headers = fetcher(t)
+            note = _av_note(payload)
+            if note:
+                raise AlphaVantageRateLimitError(note)
+            return payload, status, headers
+
+        try:
+            payload, status, _headers = call_with_retries(
+                _one, sleep_fn=sleep_fn)
+        except Exception as exc:  # noqa: BLE001 — per-ticker fail-soft
+            if isinstance(exc, AlphaVantageRateLimitError):
+                note_seen = exc.note
+            err = _sanitize_error(f"{ticker}: {type(exc).__name__}: {exc}")
+            logger.error("alphavantage eps %s", err)
+            errors.append(err)
+            continue
+        last_status = status
+        rows_total += len(payload.get("quarterlyEarnings") or [])
+        for norm in normalize_av_eps_rows(payload, frm, to, today):
+            _insert_eps_row(conn, capture_ts, "alphavantage", norm)
+            inserted += 1
+
+    parts = []
+    if skipped:
+        parts.append(
+            f"budget shortfall: universe {len(ordered)} > remaining "
+            f"budget {budget} (daily limit {daily_limit}, "
+            f"{_AV_CAL_RESERVED_CALLS} reserved for cal) — skipped "
+            f"{len(skipped)}: {','.join(skipped)}")
+    parts.extend(errors)
+    error_text = " | ".join(parts) or None
+    rate_limit = json.dumps({"av_note": note_seen}) if note_seen else "{}"
+
+    conn.execute(
+        "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
+        " rows_returned, rate_limit_headers, error_text)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (capture_ts, "alphavantage", _AV_EPS_ENDPOINT, last_status,
+         rows_total, rate_limit, error_text),
+    )
+    conn.commit()
+    logger.info(
+        "alphavantage eps capture: %d/%d tickers processed, %d rows "
+        "returned, %d in-window inserted, %d skipped, %d errors",
+        len(process) - len(errors), len(ordered), rows_total, inserted,
+        len(skipped), len(errors),
+    )
+    return {
+        "ok": last_status is not None,
+        "rows_returned": rows_total,
+        "inserted": inserted,
+        "skipped": len(skipped),
+        "errors": len(errors),
+    }
+
+
 # ── Capture body ─────────────────────────────────────────────────────
 
 def run_capture(
@@ -399,13 +739,16 @@ def run_capture(
     fetchers: "dict | None" = None,
     universe: "set[str] | None" = None,
     sleep_fn=time.sleep,
+    av_priority: "list[str] | None" = None,
+    av_daily_limit: "int | None" = None,
 ) -> dict:
-    """Run one capture pass over both providers.
+    """Run one capture pass over all providers.
 
     Fail-soft: each provider is isolated in its own try/except; each
     outcome (success or final failure) gets a run_log row, and each
     provider's rows + run_log entry are committed independently so one
-    provider's crash never loses the other's data.
+    provider's crash never loses the others' data.  Alpha Vantage eps
+    runs through the budget-capped per-ticker path (_capture_av_eps).
     """
     if mode not in ("cal", "eps"):
         raise ValueError(f"unknown mode: {mode!r}")
@@ -420,27 +763,67 @@ def run_capture(
         frm, to = (
             today - timedelta(days=_EPS_LOOKBACK_DAYS)).isoformat(), today.isoformat()
 
-    fetchers = fetchers or _default_fetchers()
+    fetchers = fetchers or _default_fetchers(mode)
     universe = universe if universe is not None else load_universe()
-    endpoints = {"finnhub": _FINNHUB_ENDPOINT, "fmp": _FMP_ENDPOINT}
+    endpoints = {
+        "finnhub": _FINNHUB_ENDPOINT,
+        "fmp": _FMP_ENDPOINT,
+        "alphavantage": _AV_CAL_ENDPOINT if mode == "cal" else _AV_EPS_ENDPOINT,
+    }
 
     ensure_schema(conn)
     summary: dict = {"mode": mode, "capture_ts": capture_ts, "providers": {}}
 
     for provider in _PROVIDERS:
         endpoint = endpoints[provider]
+
+        if provider == "alphavantage" and mode == "eps":
+            # Per-ticker path with its own budget/fail-soft/run_log.
+            try:
+                summary["providers"][provider] = _capture_av_eps(
+                    conn, capture_ts=capture_ts, today=today, frm=frm,
+                    to=to, universe=universe,
+                    fetcher=fetchers[provider], sleep_fn=sleep_fn,
+                    priority_order=av_priority, daily_limit=av_daily_limit)
+            except Exception as exc:  # noqa: BLE001 — fail-soft boundary
+                err = _sanitize_error(f"{type(exc).__name__}: {exc}")
+                logger.error("alphavantage eps capture FAILED: %s", err)
+                conn.execute(
+                    "INSERT INTO run_log (run_ts, provider, endpoint,"
+                    " http_status, rows_returned, rate_limit_headers,"
+                    " error_text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (capture_ts, provider, endpoint, None, None, None, err),
+                )
+                conn.commit()
+                summary["providers"][provider] = {"ok": False, "error": err}
+            continue
+
+        def _fetch_once(provider=provider):
+            result = fetchers[provider](frm, to)
+            if provider == "alphavantage":
+                # AV rate limiting is HTTP 200 + a JSON note, not 429 —
+                # surface it as a retriable failure.
+                note = _av_note(result[0])
+                if note:
+                    raise AlphaVantageRateLimitError(note)
+            return result
+
         try:
             rows, status, headers = call_with_retries(
-                lambda: fetchers[provider](frm, to), sleep_fn=sleep_fn)
+                _fetch_once, sleep_fn=sleep_fn)
         except Exception as exc:  # noqa: BLE001 — fail-soft boundary
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            rate_limit = None
+            if isinstance(exc, AlphaVantageRateLimitError):
+                status = status or 200
+                rate_limit = json.dumps({"av_note": exc.note})
             err = _sanitize_error(f"{type(exc).__name__}: {exc}")
             logger.error("%s %s capture FAILED: %s", provider, mode, err)
             conn.execute(
                 "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
                 " rows_returned, rate_limit_headers, error_text)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (capture_ts, provider, endpoint, status, None, None, err),
+                (capture_ts, provider, endpoint, status, None, rate_limit, err),
             )
             conn.commit()
             summary["providers"][provider] = {"ok": False, "error": err}
@@ -466,21 +849,7 @@ def run_capture(
                 norm = normalize_eps_row(provider, raw, today)
                 if norm is None or norm["ticker"] not in universe:
                     continue
-                first_seen = None
-                if norm["actual_eps"] is not None:
-                    first_seen = _first_seen_ts(
-                        conn, provider, norm["ticker"], norm["report_date"],
-                        capture_ts)
-                conn.execute(
-                    "INSERT INTO eps_capture (capture_ts, provider, ticker,"
-                    " report_date, estimate_eps, actual_eps, surprise_pct,"
-                    " eps_method, available_same_day, first_seen_ts)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (capture_ts, provider, norm["ticker"], norm["report_date"],
-                     norm["estimate_eps"], norm["actual_eps"],
-                     norm["surprise_pct"], norm["eps_method"],
-                     norm["available_same_day"], first_seen),
-                )
+                _insert_eps_row(conn, capture_ts, provider, norm)
             inserted += 1
 
         conn.execute(
@@ -501,6 +870,80 @@ def run_capture(
     return summary
 
 
+# ── NEWS_SENTIMENT probe (one-shot, stdout only) ─────────────────────
+
+def run_news_probe(ticker: str, fetch_fn=None, out=print) -> int:
+    """One-shot Alpha Vantage NEWS_SENTIMENT probe.
+
+    Pretty-prints the raw JSON response, then a summary block: article
+    count, date range, fields present per article, ticker relevance
+    scores, sentiment labels.  stdout ONLY — no DB write, no run_log
+    row, no retries.  Returns 1 on any failure (rate limit, auth,
+    network), 0 otherwise.  Purpose: show what the endpoint gives, not
+    store it.
+    """
+    fetch = fetch_fn or (lambda: fetch_alphavantage_news(_av_api_key(), ticker))
+    try:
+        payload, status, _headers = fetch()
+    except Exception as exc:  # noqa: BLE001 — probe boundary
+        out(f"NEWS_SENTIMENT probe FAILED: "
+            f"{_sanitize_error(f'{type(exc).__name__}: {exc}')}")
+        return 1
+    note = _av_note(payload)
+    if note:
+        out(f"NEWS_SENTIMENT probe FAILED (provider note): {note}")
+        return 1
+
+    out("── raw response " + "─" * 40)
+    out(json.dumps(payload, indent=2, sort_keys=True))
+
+    feed = payload.get("feed") or []
+    out("── summary " + "─" * 45)
+    out(f"http_status: {status}")
+    out(f"articles: {len(feed)}")
+
+    times = sorted(a.get("time_published", "") for a in feed
+                   if a.get("time_published"))
+    out(f"date_range: {times[0]} .. {times[-1]}" if times
+        else "date_range: n/a")
+
+    field_counts: dict = {}
+    for a in feed:
+        for k in a:
+            field_counts[k] = field_counts.get(k, 0) + 1
+    out("fields_present (field: articles_with_field/articles):")
+    for k in sorted(field_counts):
+        out(f"  {k}: {field_counts[k]}/{len(feed)}")
+
+    relevances = []
+    overall_labels: dict = {}
+    ticker_labels: dict = {}
+    for a in feed:
+        lbl = a.get("overall_sentiment_label")
+        if lbl:
+            overall_labels[lbl] = overall_labels.get(lbl, 0) + 1
+        for ts in a.get("ticker_sentiment") or []:
+            if ts.get("ticker") == ticker:
+                try:
+                    relevances.append(float(ts.get("relevance_score")))
+                except (TypeError, ValueError):
+                    pass
+                tlbl = ts.get("ticker_sentiment_label")
+                if tlbl:
+                    ticker_labels[tlbl] = ticker_labels.get(tlbl, 0) + 1
+    if relevances:
+        out(f"ticker_relevance ({ticker}): n={len(relevances)} "
+            f"min={min(relevances):.4f} "
+            f"mean={sum(relevances) / len(relevances):.4f} "
+            f"max={max(relevances):.4f}")
+    else:
+        out(f"ticker_relevance ({ticker}): none found")
+    out(f"overall_sentiment_labels: {json.dumps(overall_labels, sort_keys=True)}")
+    out(f"ticker_sentiment_labels ({ticker}): "
+        f"{json.dumps(ticker_labels, sort_keys=True)}")
+    return 0
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -509,8 +952,16 @@ def main(argv: "list[str] | None" = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--mode", required=True, choices=("cal", "eps"))
+    parser.add_argument("--mode", required=True,
+                        choices=("cal", "eps", "news-probe"))
+    parser.add_argument("--ticker",
+                        help="single ticker (required for --mode news-probe)")
     args = parser.parse_args(argv)
+
+    if args.mode == "news-probe":
+        if not args.ticker:
+            parser.error("--ticker is required with --mode news-probe")
+        return run_news_probe(args.ticker)
 
     db_path = os.environ.get("EARNINGS_EVAL_DB", _DB_PATH_DEFAULT)
     try:
