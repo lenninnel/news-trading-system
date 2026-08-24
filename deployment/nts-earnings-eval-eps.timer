@@ -1,0 +1,14 @@
+# Timer for nts-earnings-eval-eps.service — daily 23:00 UTC actuals capture
+# (today-1 .. today, after US close). Standalone: NOT part of the trading
+# daemon / scheduler session list. Install instructions in the .service file.
+
+[Unit]
+Description=NTS Q2 earnings source eval EPS actuals capture timer (daily 23:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 23:00:00 UTC
+Persistent=true
+Unit=nts-earnings-eval-eps.service
+
+[Install]
+WantedBy=timers.target
