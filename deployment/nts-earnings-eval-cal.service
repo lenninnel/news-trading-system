@@ -1,0 +1,24 @@
+# NTS Q2 earnings source eval — forward CALENDAR capture (capture-only).
+#
+# Install (as the `trading` user — these are systemd --user units):
+#   cp deployment/nts-earnings-eval-cal.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now nts-earnings-eval-cal.timer
+# Verify:
+#   systemctl --user list-timers | grep earnings-eval
+#   journalctl --user -u nts-earnings-eval-cal.service -n 50
+
+[Unit]
+Description=NTS Q2 earnings source eval — forward calendar capture (capture-only, non-live)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trading/news-trading-system
+EnvironmentFile=%h/news-trading-system/.env
+ExecStart=/home/trading/news-trading-system/.venv/bin/python3 /home/trading/news-trading-system/scripts/earnings_source_eval.py --mode cal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
