@@ -67,15 +67,26 @@ _LEG_KEYS = {"sl": "stop_loss", "tp": "take_profit"}
 # the fill term cancels, so drift cannot produce a false reject
 # (the v1 formulation misfired on 19 of 47 era rows).
 #
-# Derivation of 0.05: control group (untouched ATR rows) = 0.000
-# exact, bit-identical; lowest override deviation = 0.0616 (PFE 270);
-# any value in (0, 0.0616) separates perfectly; 0.05 chosen because
-# the error payoff is asymmetric — a false reject costs a fresh
-# RiskAgent stop (the intended fallback), a false accept costs
-# VRT-class damage.
+# Derivation of 0.05 (R, after the forward-path retro):
+# In the era, ZERO of 181 candidates (44 override stops + 134 forward
+# levels + 3 ATR-kept) originated from the risk model on the override
+# path; all non-ATR candidates reconstruct as (2dp price) x 0.98,
+# frozen and carried up to 34 days. The invariant therefore rejects
+# ~95% on the forward path and 44/44 on the override path - this is
+# the intended outcome, not collateral damage. The "perfect
+# separation at 0.0616" from the first retro was a 3-row sampling
+# artifact; 6 override rows fall below it, down to 0.0191. 0.05 is
+# chosen at the tight end on error asymmetry (false reject = fresh
+# RiskAgent level, the intended fallback; false accept = VRT class),
+# NOT because a separation point was measured. Its discriminating
+# power is untested and only becomes testable once the override is
+# removed and genuine ATR levels appear on the forward path.
 #
-# Retro result: rejects 44/44 overrides, 0/3 ATR rows; -$13,226 of era
-# stop P&L would have gone to fresh levels instead.
+# PRE-REGISTERED POST-DEPLOY WATCH (R, 2026-08-26): monitor the
+# model_mismatch rejection rate per origin. Expectation ~95% forward,
+# ~100% strategy override. A material drop in forward rejection means
+# genuine ATR candidates have started appearing - that is the trigger
+# to re-derive the tolerance on a real control group.
 #
 # The invariant is a CONSISTENCY check against the risk model, NOT
 # budget protection: the 10% portfolio cap bound 100% of era
