@@ -784,11 +784,15 @@ class TestF2ForwardOverrideSanityGate:
     """
 
     # Fresh risk_agent levels per case (correct-side, distinct from the
-    # forward levels so accept vs reject is unambiguous).
+    # forward levels so accept vs reject is unambiguous). Since the
+    # level-integrity invariant v2 (model_mismatch, tolerance 0.05) the
+    # synthetic fresh SL of an accepted leg must sit within tolerance of
+    # the forward SL — AAPL's fresh SL is chosen accordingly; TRGP/VRT
+    # reject at wrong_side before the invariant runs.
     FRESH = {
         "TRGP": (254.89, 270.55),
         "VRT": (306.71, 325.50),
-        "AAPL": (301.87, 320.17),
+        "AAPL": (283.60, 320.17),
         "HLTH": (98.50, 103.00),
     }
 
@@ -907,9 +911,11 @@ class TestF2ForwardOverrideSanityGate:
         """Correct-side forward levels are adopted verbatim (level
         continuity: the exact objects, no transformation) and no
         F2-gate WARNING is emitted."""
+        # fwd_sl within invariant tolerance of the fresh 98.50:
+        # |98.50 − 98.45| / (100 − 98.50) = 0.0333 ≤ 0.05
         fresh_sl, fresh_tp = self.FRESH["HLTH"]
         c = self._make_coordinator(
-            fill=100.00, fwd_sl=97.00, fwd_tp=106.00,
+            fill=100.00, fwd_sl=98.45, fwd_tp=106.00,
             fresh_sl=fresh_sl, fresh_tp=fresh_tp,
         )
         fwd_row = c.signal_logger.get_pending_forward_signals.return_value[0]
@@ -921,12 +927,12 @@ class TestF2ForwardOverrideSanityGate:
         # Byte-identical pass-through: same objects as in the forward row.
         assert risk["stop_loss"] is fwd_row["stop_loss"]
         assert risk["take_profit"] is fwd_row["take_profit"]
-        assert risk["stop_loss"] == 97.00
+        assert risk["stop_loss"] == 98.45
         assert risk["take_profit"] == 106.00
         assert self._f2_warnings(caplog) == []
 
         kwargs = c.paper_trader.track_trade.call_args.kwargs
-        assert kwargs["stop_loss"] == 97.00
+        assert kwargs["stop_loss"] == 98.45
         assert kwargs["take_profit"] == 106.00
 
     def test_corrupt_forward_value_raises(self):

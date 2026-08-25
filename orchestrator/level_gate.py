@@ -9,26 +9,47 @@ orchestrator/coordinator.py (enforced by an AST test).
 Adoption rule (long-only, against the executed fill):
 
     leg "sl": adopt iff candidate is not None AND fill_valid AND candidate < fill
+              AND the level-integrity invariant v2 holds (see below)
     leg "tp": adopt iff candidate is not None AND fill_valid AND candidate > fill
+
+Check order on the sl leg (R spec 2026-08-26):
+
+    null_level → no_fill → wrong_side → model_mismatch → adopt
+
+``model_mismatch`` (sl leg ONLY — TP is out of scope this window)
+rejects a candidate whose deviation from the fresh RiskAgent level
+exceeds ``_MODEL_TOLERANCE`` under the v2 drift-free formula. When no
+usable reference exists (fresh level None or <= 0) the check is
+skipped and the candidate falls through to adopt, preserving
+pre-change behaviour; the downstream execution guard
+(coordinator.py:1788-1789) still blocks execution on a missing/<=0
+level. A degenerate denominator (fresh level at or above the fill)
+rejects — adopting against an unusable reference is the unsafe
+direction.
 
 Non-adoption keeps the fresh risk-agent calc for that leg and logs
 exactly one line with the literal prefix "F2-gate:" (grep continuity
 with pre-gate monitoring). Level split (amendment A2, R 2026-08-20):
 ``null_level`` with ctx origin "strategy" logs at INFO (expected —
 strategies routinely emit no levels; R tracks the weekly INFO count as
-a research signal); every other non-adoption (wrong_side, no_fill, and
-null_level with origin "forward") logs at WARNING. The message format
-is byte-identical across both levels; ``origin`` is a mandatory field
-in every non-adoption line (amendment A3).
+a research signal); every other non-adoption (wrong_side, no_fill,
+null_level with origin "forward", and model_mismatch — never a
+by-design absence) logs at WARNING. ``origin`` is a mandatory field
+in every non-adoption line (amendment A3); model_mismatch lines
+additionally carry reference, deviation, and tolerance.
 
-Deliberate design notes (R-spec v1.1):
+Deliberate design notes (R-spec v1.1, amended by the v2 invariant):
 
 * ``is not None`` checks only — 0.0 is a PRESENT value.  A 0.0 SL with a
-  positive fill passes ``0.0 < fill`` and IS adopted here; the
-  independent downstream execution guard (coordinator.py:1788-1789)
-  then blocks the trade.  That layering is intentional (R §7) — no >0
-  floor belongs in this helper.
-* No epsilon/tolerance anywhere.
+  positive fill passes ``0.0 < fill``; since the v2 invariant it is
+  then rejected as ``model_mismatch`` whenever a usable fresh
+  reference exists (its deviation is far beyond tolerance). Only when
+  the reference itself is missing/<=0 does the literal adoption
+  survive, and the independent downstream execution guard
+  (coordinator.py:1788-1789) then blocks the trade.  That layering is
+  intentional (R §7) — no >0 floor belongs in this helper.
+* No epsilon/tolerance on the side comparisons; the single tolerance
+  in this module is ``_MODEL_TOLERANCE`` for the v2 invariant.
 """
 
 from __future__ import annotations
@@ -39,6 +60,28 @@ log = logging.getLogger(__name__)
 
 # leg → risk dict key holding the fresh calc that non-adoption preserves
 _LEG_KEYS = {"sl": "stop_loss", "tp": "take_profit"}
+
+# ── Level-integrity invariant v2 (R, tolerance locked 2026-08-26) ────────
+#
+# v2 formula: |rc.stop_loss - candidate| / (fill - rc.stop_loss);
+# the fill term cancels, so drift cannot produce a false reject
+# (the v1 formulation misfired on 19 of 47 era rows).
+#
+# Derivation of 0.05: control group (untouched ATR rows) = 0.000
+# exact, bit-identical; lowest override deviation = 0.0616 (PFE 270);
+# any value in (0, 0.0616) separates perfectly; 0.05 chosen because
+# the error payoff is asymmetric — a false reject costs a fresh
+# RiskAgent stop (the intended fallback), a false accept costs
+# VRT-class damage.
+#
+# Retro result: rejects 44/44 overrides, 0/3 ATR rows; -$13,226 of era
+# stop P&L would have gone to fresh levels instead.
+#
+# The invariant is a CONSISTENCY check against the risk model, NOT
+# budget protection: the 10% portfolio cap bound 100% of era
+# positions, so stop_pct never drove sizing. Hence model_mismatch,
+# not budget_mismatch.
+_MODEL_TOLERANCE = 0.05
 
 
 def apply_level_override(risk, leg, candidate, fill, ctx) -> bool:
@@ -65,6 +108,46 @@ def apply_level_override(risk, leg, candidate, fill, ctx) -> bool:
     elif not ctx.get("fill_valid"):
         reason = "no_fill"
     elif (candidate < fill) if leg == "sl" else (candidate > fill):
+        if leg == "sl":
+            reference = risk.get(key)
+            if reference is None or reference <= 0:
+                # No usable reference — deviation undefined; fall through
+                # to adopt (pre-invariant behaviour; downstream guard
+                # blocks execution on a missing/<=0 resulting level).
+                log.debug(
+                    "F2-gate: model_mismatch check skipped ticker=%s "
+                    "session=%s origin=%s leg=%s reference=%s "
+                    "(no usable reference)",
+                    ctx.get("ticker"), ctx.get("session"),
+                    ctx.get("origin"), leg, reference,
+                )
+            else:
+                denominator = fill - reference
+                if denominator <= 0:
+                    # Fresh level at/above the fill — broken reference;
+                    # adopting against it is the unsafe direction.
+                    log.warning(
+                        "F2-gate: rejected ticker=%s session=%s origin=%s "
+                        "leg=%s reason=model_mismatch candidate=%s "
+                        "reference=%s fill=%s deviation=undefined "
+                        "denominator=%s tolerance=%s kept fresh=%s",
+                        ctx.get("ticker"), ctx.get("session"),
+                        ctx.get("origin"), leg, candidate, reference, fill,
+                        denominator, _MODEL_TOLERANCE, risk.get(key),
+                    )
+                    return False
+                deviation = abs(reference - candidate) / denominator
+                if deviation > _MODEL_TOLERANCE:
+                    log.warning(
+                        "F2-gate: rejected ticker=%s session=%s origin=%s "
+                        "leg=%s reason=model_mismatch candidate=%s "
+                        "reference=%s fill=%s deviation=%.6f tolerance=%s "
+                        "kept fresh=%s",
+                        ctx.get("ticker"), ctx.get("session"),
+                        ctx.get("origin"), leg, candidate, reference, fill,
+                        deviation, _MODEL_TOLERANCE, risk.get(key),
+                    )
+                    return False
         risk[key] = candidate
         log.debug(
             "F2-gate: adopted %s ticker=%s session=%s origin=%s "
