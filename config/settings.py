@@ -217,7 +217,10 @@ ENABLE_PROMPT_CACHING: bool = os.environ.get("ENABLE_PROMPT_CACHING", "true").lo
 # PEAD (Post-Earnings Announcement Drift) strategy
 PEAD_ENABLED: bool = os.environ.get("PEAD_ENABLED", "true").lower() in ("true", "1", "yes")
 PEAD_TICKERS: list[str] = [
-    # US mid-caps (validated: DSR=1.00 in walk-forward backtest)
+    # ticker selection: no artifact. Aggregate DSR 1.00 in
+    # combined_pead_ibkr_final.json (5ac2488) covers the 30-ticker
+    # US leg, not this 9-name subset; the production-config rerun
+    # 74a1154 (2026-03-31) reported DSR 0.0000. See KB-1 P7 audit.
     "CASY", "TXRH", "DECK", "TRGP", "CACI", "MEDP", "UFPI", "TOL", "PBR",
     # EU mid-caps (top Sharpe from IBKR cache run)
     "VNA.DE", "HOT.DE", "COFA.PA", "VIE.PA", "FNTN.DE", "LEG.DE",

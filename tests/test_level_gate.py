@@ -21,6 +21,18 @@ Covers (R-spec v1.1):
         run_combined.
     T6. Static chokepoint check: coordinator.py contains ZERO direct
         assignments to risk["stop_loss"] / risk["take_profit"].
+    T7. Level-integrity invariant v2 (model_mismatch, R spec
+        2026-08-26): tolerance boundary both sides, PFE-270 replay,
+        ATR-kept zero deviation, missing/<=0 reference skip path,
+        degenerate denominator, wrong_side precedence, and sl-only
+        scope (TP leg never runs the check).
+
+v2 note: the T1 sl valid-adopt candidate and the T2 zero/negative SL
+cases were originally written with candidates far from the fresh
+reference; under the invariant those now reject as model_mismatch, so
+the adopt fixtures use in-tolerance candidates and the literal-spec
+0.0/negative adoptions are exercised via the no-usable-reference skip
+path (which is where that layering still applies).
 
 All external collaborators are MagicMocks — no network, no real DB
 (mocking conventions follow tests/test_post_session_reviewer.py).
@@ -72,9 +84,10 @@ def _ctx(fill_valid: bool = True, origin: str = "strategy") -> dict:
     "leg,candidate,fill_valid,expect_adopt,expect_reason",
     [
         # sl: wrong_side / None / valid-adopt / no_fill
+        # (adopt candidate 94.8: deviation |95-94.8|/(100-95) = 0.04 ≤ 0.05)
         ("sl", 105.0, True,  False, "wrong_side"),
         ("sl", None,  True,  False, "null_level"),
-        ("sl", 92.0,  True,  True,  None),
+        ("sl", 94.8,  True,  True,  None),
         ("sl", 92.0,  False, False, "no_fill"),
         # tp: wrong_side / None / valid-adopt / no_fill
         ("tp", 95.0,  True,  False, "wrong_side"),
@@ -104,19 +117,36 @@ def test_core_cases(caplog, leg, candidate, fill_valid, expect_adopt, expect_rea
     assert risk[other_key] == _fresh_risk()[other_key]
 
 
-# ── T2: literal-spec edge documentation ──────────────────────────────────
+# ── T2: literal-spec edge documentation (amended by invariant v2) ────────
 #
 # The gate implements S2 LITERALLY: `is not None` presence checks, no >0
-# floor, no epsilon. 0.0 and negative candidates are PRESENT values and
-# pass the side comparison for the SL leg. The independent downstream
-# execution guard (coordinator.py, "missing/zero SL-TP" branch) is the
-# layer that blocks such trades — that layering is R §7's design.
+# floor, no epsilon on the side comparisons. 0.0 and negative candidates
+# are PRESENT values and pass the side comparison for the SL leg. Since
+# the v2 invariant they then reject as model_mismatch whenever a usable
+# fresh reference exists (deviation far beyond tolerance); the literal
+# adoption survives only on the no-usable-reference skip path, where the
+# independent downstream execution guard (coordinator.py, "missing/zero
+# SL-TP" branch) remains the layer that blocks such trades — R §7's
+# layering, now scoped to that path.
 
 
-def test_zero_sl_is_adopted_literal_spec(caplog):
-    """0.0 SL with a positive fill passes `0.0 < fill` → adopted."""
+def test_zero_sl_rejected_as_model_mismatch_with_reference(caplog):
+    """v2: 0.0 SL passes `0.0 < fill` but deviates 19.0 from the fresh
+    reference → model_mismatch, fresh calc kept."""
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", 0.0, FILL, _ctx())
+    assert adopted is False
+    assert risk["stop_loss"] == FRESH_SL
+    assert "reason=model_mismatch" in caplog.text
+
+
+def test_zero_sl_adopted_when_no_usable_reference(caplog):
+    """Literal-spec adoption of 0.0 survives on the skip path (fresh SL
+    None): `0.0 < fill` adopts, downstream guard blocks execution."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    risk["stop_loss"] = None
     adopted = apply_level_override(risk, "sl", 0.0, FILL, _ctx())
     assert adopted is True
     assert risk["stop_loss"] == 0.0
@@ -133,9 +163,19 @@ def test_zero_tp_is_wrong_side(caplog):
     assert "reason=wrong_side" in caplog.text
 
 
-def test_negative_sl_is_adopted_literal_spec():
-    """A negative SL still satisfies `candidate < fill` → adopted."""
+def test_negative_sl_rejected_as_model_mismatch_with_reference():
+    """v2: a negative SL satisfies `candidate < fill` but deviates far
+    beyond tolerance from the fresh reference → model_mismatch."""
     risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", -5.0, FILL, _ctx())
+    assert adopted is False
+    assert risk["stop_loss"] == FRESH_SL
+
+
+def test_negative_sl_adopted_when_no_usable_reference():
+    """Literal-spec adoption of a negative SL survives on the skip path."""
+    risk = _fresh_risk()
+    risk["stop_loss"] = None
     adopted = apply_level_override(risk, "sl", -5.0, FILL, _ctx())
     assert adopted is True
     assert risk["stop_loss"] == -5.0
@@ -245,7 +285,7 @@ def test_null_level_forward_stays_warning(caplog, leg):
     assert _gate_records(caplog, logging.INFO) == []
 
 
-@pytest.mark.parametrize("leg,candidate", [("sl", 92.0), ("tp", 112.0)])
+@pytest.mark.parametrize("leg,candidate", [("sl", 94.8), ("tp", 112.0)])
 def test_adoption_emits_no_warning(caplog, leg, candidate):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     risk = _fresh_risk()
@@ -256,6 +296,135 @@ def test_adoption_emits_no_warning(caplog, leg, candidate):
     for r in caplog.records:
         if r.name == "orchestrator.level_gate":
             assert r.levelno <= logging.DEBUG
+
+
+# ── T7: level-integrity invariant v2 (model_mismatch) ────────────────────
+#
+# deviation = |reference − candidate| / (fill − reference), sl leg only,
+# _MODEL_TOLERANCE = 0.05. Fixtures: fresh SL 95.0, fill 100.0 →
+# denominator 5.0, so candidate 95.0 ± 5.0·d gives deviation d exactly.
+
+
+def test_model_mismatch_just_below_tolerance_adopted(caplog):
+    """deviation 0.049 (candidate 94.755) → adopted, no WARNING."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", 94.755, FILL, _ctx())
+    assert adopted is True
+    assert risk["stop_loss"] == 94.755
+    assert _warnings(caplog) == []
+
+
+def test_model_mismatch_just_above_tolerance_rejected(caplog):
+    """deviation 0.051 (candidate 94.745) → rejected, exactly one
+    WARNING carrying candidate/reference/fill/deviation/tolerance/kept
+    fresh and the A3 origin field."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", 94.745, FILL, _ctx())
+    assert adopted is False
+    assert risk["stop_loss"] == FRESH_SL
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1, "exactly one WARNING per model_mismatch"
+    msg = warnings[0].getMessage()
+    assert msg.startswith("F2-gate:")
+    assert "leg=sl" in msg
+    assert "reason=model_mismatch" in msg
+    assert "origin=strategy" in msg, "A3: origin mandatory"
+    assert "candidate=94.745" in msg
+    assert "reference=95.0" in msg
+    assert f"fill={FILL}" in msg
+    assert "deviation=0.051000" in msg
+    assert "tolerance=0.05" in msg
+    assert f"kept fresh={FRESH_SL}" in msg
+
+
+def test_model_mismatch_pfe270_replay_rejected(caplog):
+    """PFE sell 270, the lowest era override deviation (0.0616): the
+    tolerance 0.05 must catch the tightest real override."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    risk["stop_loss"] = 24.3015          # fresh RiskAgent proposal
+    adopted = apply_level_override(risk, "sl", 24.3236, 24.66, _ctx())
+    assert adopted is False
+    assert risk["stop_loss"] == 24.3015
+    assert len(_warnings(caplog)) == 1
+    assert "reason=model_mismatch" in caplog.text
+
+
+def test_model_mismatch_atr_kept_zero_deviation_adopted(caplog):
+    """candidate == reference → deviation exactly 0.0 → adopted (the
+    retro control group: an untouched stop can never fail v2)."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", FRESH_SL, FILL, _ctx())
+    assert adopted is True
+    assert risk["stop_loss"] == FRESH_SL
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize("reference", [None, 0.0, -3.0])
+def test_model_mismatch_skipped_without_usable_reference(caplog, reference):
+    """reference None/<=0 → check skipped (DEBUG), candidate adopted,
+    no WARNING."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    risk["stop_loss"] = reference
+    adopted = apply_level_override(risk, "sl", 92.0, FILL, _ctx())
+    assert adopted is True
+    assert risk["stop_loss"] == 92.0
+    assert _warnings(caplog) == []
+    debugs = [
+        r.getMessage() for r in _gate_records(caplog, logging.DEBUG)
+        if "model_mismatch check skipped" in r.getMessage()
+    ]
+    assert len(debugs) == 1
+    assert debugs[0].startswith("F2-gate:")
+
+
+@pytest.mark.parametrize("reference", [100.0, 105.0])
+def test_model_mismatch_degenerate_denominator_rejected(caplog, reference):
+    """reference >= fill → denominator <= 0, deviation undefined:
+    rejected as model_mismatch with WARNING naming the denominator."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    risk["stop_loss"] = reference
+    adopted = apply_level_override(risk, "sl", 92.0, FILL, _ctx())
+    assert adopted is False
+    assert risk["stop_loss"] == reference
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "reason=model_mismatch" in msg
+    assert "deviation=undefined" in msg
+    assert f"denominator={FILL - reference}" in msg
+
+
+def test_wrong_side_wins_over_model_mismatch(caplog):
+    """candidate > fill AND wildly deviating → wrong_side, not
+    model_mismatch (order: wrong_side precedes the invariant)."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    adopted = apply_level_override(risk, "sl", 140.0, FILL, _ctx())
+    assert adopted is False
+    assert "reason=wrong_side" in caplog.text
+    assert "reason=model_mismatch" not in caplog.text
+
+
+def test_tp_leg_never_runs_model_mismatch(caplog):
+    """sl-only scope: a TP deviating 18.4× tolerance from the fresh TP
+    is still adopted — the check must not run on the tp leg."""
+    caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
+    risk = _fresh_risk()
+    # |108 - 200| / (100 - 108) is not even well-formed for tp; the
+    # point is that no model arithmetic runs at all on this leg.
+    adopted = apply_level_override(risk, "tp", 200.0, FILL, _ctx())
+    assert adopted is True
+    assert risk["take_profit"] == 200.0
+    assert _warnings(caplog) == []
+    assert "model_mismatch" not in caplog.text
 
 
 # ── T4/T5 shared fixtures: a Coordinator with mocked collaborators ──────
