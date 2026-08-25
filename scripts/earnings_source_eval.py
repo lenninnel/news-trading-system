@@ -200,7 +200,8 @@ def load_universe() -> set[str]:
 # ── Schema ───────────────────────────────────────────────────────────
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the three eval tables if absent (exact R-spec columns)."""
+    """Create the three eval tables if absent (exact R-spec columns),
+    then apply additive migrations (R Amendment A4: eps_capture.time_of_day)."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS cal_capture (
@@ -232,6 +233,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # R Amendment A4 (2026-08-25): persist AV's reportTime session.  SQLite
+    # has no ADD COLUMN IF NOT EXISTS, so the migration is try/except on
+    # the "duplicate column" error for DBs that already carry it.
+    try:
+        conn.execute("ALTER TABLE eps_capture ADD COLUMN time_of_day TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS run_log (
@@ -478,6 +487,8 @@ def normalize_eps_row(provider: str, row: dict, capture_day: date) -> "dict | No
     available_same_day: 1 if the actual was already non-null when captured
     ON the report date itself, 0 if it only showed up on a later capture
     day, NULL while the actual is still missing.
+    time_of_day is always None here — neither Finnhub's nor FMP's eps
+    payload provides a session; only Alpha Vantage does (reportTime).
     """
     if provider == "finnhub":
         ticker, report_date = row.get("symbol"), row.get("date")
@@ -511,6 +522,7 @@ def normalize_eps_row(provider: str, row: dict, capture_day: date) -> "dict | No
         "surprise_pct": surprise_pct,
         "eps_method": method,
         "available_same_day": available_same_day,
+        "time_of_day": None,
     }
 
 
@@ -527,8 +539,8 @@ def _av_float(value) -> "float | None":
 def normalize_av_report_time(raw) -> str:
     """AV reportTime → the stack's session vocabulary.
 
-    NOTE: eps_capture has no time_of_day column (R-spec schema), so this
-    mapping is informational — computed and unit-tested, not persisted.
+    Persisted to eps_capture.time_of_day since R Amendment A4
+    (2026-08-25); "pre-market"→"bmo", "post-market"→"amc", else "unknown".
     """
     rt = (raw or "").strip().lower()
     return {"pre-market": "bmo", "post-market": "amc"}.get(rt, "unknown")
@@ -610,11 +622,12 @@ def _insert_eps_row(
     conn.execute(
         "INSERT INTO eps_capture (capture_ts, provider, ticker,"
         " report_date, estimate_eps, actual_eps, surprise_pct,"
-        " eps_method, available_same_day, first_seen_ts)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " eps_method, available_same_day, first_seen_ts, time_of_day)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (capture_ts, provider, norm["ticker"], norm["report_date"],
          norm["estimate_eps"], norm["actual_eps"], norm["surprise_pct"],
-         norm["eps_method"], norm["available_same_day"], first_seen),
+         norm["eps_method"], norm["available_same_day"], first_seen,
+         norm["time_of_day"]),
     )
 
 
