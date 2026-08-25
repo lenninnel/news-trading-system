@@ -22,7 +22,8 @@ Standalone, capture-only, NON-LIVE job — these tests pin its contract:
 * Alpha Vantage — CSV calendar normalization; per-ticker eps path with
   the free-tier daily budget (shortfall WARNING + run_log.error_text);
   HTTP-200 JSON-note rate limiting treated as retriable; eps_method
-  'unknown'; reportTime mapping; fail-soft vs the other two providers.
+  'unknown'; reportTime → eps_capture.time_of_day persisted (Amendment
+  A4, Finnhub/FMP rows carry NULL); fail-soft vs the other two providers.
 * NEWS_SENTIMENT probe — stdout only, summary fields present, no DB
   write, exit 1 on failure.
 
@@ -139,10 +140,11 @@ def test_schema_creates_exact_rspec_tables(conn):
         "capture_ts", "provider", "ticker", "report_date", "time_of_day",
         "date_status", "days_ahead", "raw_payload_hash",
         "provider_status_raw"]
+    # time_of_day sits last — added by the A4 ALTER TABLE migration.
     assert _columns(conn, "eps_capture") == [
         "capture_ts", "provider", "ticker", "report_date", "estimate_eps",
         "actual_eps", "surprise_pct", "eps_method", "available_same_day",
-        "first_seen_ts"]
+        "first_seen_ts", "time_of_day"]
     assert _columns(conn, "run_log") == [
         "run_ts", "provider", "endpoint", "http_status", "rows_returned",
         "rate_limit_headers", "error_text"]
@@ -222,7 +224,8 @@ def test_eps_capture_field_mapping_both_providers(conn):
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     rows = conn.execute(
         "SELECT provider, ticker, report_date, estimate_eps, actual_eps,"
-        " surprise_pct, eps_method, available_same_day, first_seen_ts"
+        " surprise_pct, eps_method, available_same_day, first_seen_ts,"
+        " time_of_day"
         " FROM eps_capture ORDER BY provider, ticker").fetchall()
     assert len(rows) == 4
     by_key = {(r[0], r[1]): r for r in rows}
@@ -244,6 +247,10 @@ def test_eps_capture_field_mapping_both_providers(conn):
     fmp_aapl = by_key[("fmp", "AAPL")]
     assert fmp_aapl[3] == 2.08 and fmp_aapl[4] == 2.34
     assert fmp_aapl[6] == "fmp_calendar:eps/epsEstimated"
+
+    # Neither Finnhub nor FMP provides a session in the eps payload —
+    # time_of_day is NULL on every one of their rows (A4).
+    assert all(r[9] is None for r in rows)
 
 
 def test_first_seen_ts_set_once_and_carried_forward(conn):
@@ -539,7 +546,8 @@ def test_av_eps_normalization_window_method_first_seen(conn):
 
     rows = conn.execute(
         "SELECT report_date, estimate_eps, actual_eps, surprise_pct,"
-        " eps_method, available_same_day, first_seen_ts FROM eps_capture"
+        " eps_method, available_same_day, first_seen_ts, time_of_day"
+        " FROM eps_capture"
         " WHERE provider='alphavantage'").fetchall()
     # Only the in-window (today-1..today) quarter — the 2020 row dropped.
     assert len(rows) == 1
@@ -550,9 +558,9 @@ def test_av_eps_normalization_window_method_first_seen(conn):
     assert r[4] == "unknown"                  # no gaap/adj distinction
     assert r[5] == 1                          # reported on capture day
     assert r[6] == _NOW_EPS.isoformat()
+    assert r[7] == "amc"                      # reportTime persisted (A4)
 
-    # reportTime mapping is computed (informational — eps_capture has no
-    # time_of_day column in the R-spec schema).
+    # reportTime mapping: post-market → amc, per normalize_av_report_time.
     norms = ev.normalize_av_eps_rows(
         AV_EPS_AAPL, "2026-08-23", "2026-08-24", _NOW_EPS.date())
     assert norms[0]["time_of_day"] == "amc"   # post-market → amc
@@ -592,14 +600,47 @@ def test_av_budget_shortfall_warning_and_error_text(conn, caplog):
     joined = " ".join(r.getMessage() for r in caplog.records
                       if r.levelname == "WARNING")
     assert "3 tickers > remaining daily budget 2" in joined
-    assert "AAPL" in joined
+    # The WARNING must NAME the skipped tickers, not just count them.
+    assert "SKIPPING 1: AAPL" in joined
 
     err = conn.execute(
         "SELECT error_text FROM run_log WHERE provider='alphavantage'"
     ).fetchone()[0]
     assert "budget shortfall" in err
     assert "universe 3 > remaining budget 2" in err
-    assert "AAPL" in err
+    # run_log.error_text carries the same named list for R's audit.
+    assert "skipped 1: AAPL" in err
+
+
+def test_av_budget_shortfall_names_all_skipped_tickers(conn, caplog):
+    """Multiple skipped names appear as a comma-joined, priority-ordered
+    list in BOTH the WARNING and run_log.error_text — so R can check
+    whether the same tickers are systematically excluded."""
+    calls = []
+    fetchers = {
+        "finnhub": _fetcher([]), "fmp": _fetcher([]),
+        "alphavantage": _av_eps_fetcher(
+            {"CASY": {"symbol": "CASY", "quarterlyEarnings": []}},
+            calls=calls),
+    }
+    with caplog.at_level("WARNING", logger="earnings_source_eval"):
+        summary = ev.run_capture(
+            "eps", conn, now=_NOW_EPS, fetchers=fetchers,
+            universe=_UNIVERSE, av_priority=["CASY", "TSLA", "AAPL"],
+            av_daily_limit=2, sleep_fn=_NO_SLEEP)
+
+    # Budget = 2 daily - 1 reserved = 1 → only CASY processed.
+    assert calls == ["CASY"]
+    assert summary["providers"]["alphavantage"]["skipped"] == 2
+
+    joined = " ".join(r.getMessage() for r in caplog.records
+                      if r.levelname == "WARNING")
+    assert "SKIPPING 2: TSLA,AAPL" in joined
+
+    err = conn.execute(
+        "SELECT error_text FROM run_log WHERE provider='alphavantage'"
+    ).fetchone()[0]
+    assert "skipped 2: TSLA,AAPL" in err
 
 
 def test_av_note_rate_limit_is_retriable_and_recorded(conn):
