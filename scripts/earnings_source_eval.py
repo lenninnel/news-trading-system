@@ -2,9 +2,9 @@
 """Q2 earnings source evaluation — capture-only (R-spec 2026-08-24).
 
 Standalone, NON-LIVE evaluation stack that captures earnings-calendar and
-EPS-actuals data from three free providers (Finnhub + FMP + Alpha Vantage)
-into its OWN SQLite database, so the sources can later be compared for
-calendar accuracy and actuals latency.
+EPS-actuals data from four free providers (Finnhub + FMP + Alpha Vantage
++ yfinance) into its OWN SQLite database, so the sources can later be
+compared for calendar accuracy and actuals latency.
 
 Isolation contract (non-negotiable)
 -----------------------------------
@@ -20,10 +20,10 @@ Isolation contract (non-negotiable)
 
 Modes
 -----
-``--mode cal``  (12:00 UTC timer) — forward calendar capture, one RANGE call
-    per provider covering today .. today+30d, filtered to the universe.
+``--mode cal``  (12:00 UTC timer) — calendar capture, one RANGE call per
+    provider covering today-2 .. today+30d, filtered to the universe.
 ``--mode eps``  (23:00 UTC timer) — actuals capture, one RANGE call per
-    provider covering today-1 .. today, filtered to the universe.
+    provider covering today-2 .. today, filtered to the universe.
     Alpha Vantage has no range actuals endpoint — its EARNINGS call is
     per-ticker, so eps mode walks the universe in priority order (PEAD
     first, then US watchlist) under the free-tier daily call budget
@@ -58,11 +58,47 @@ Alpha Vantage quirks (handled explicitly)
   such note is captured into run_log.rate_limit_headers.
 * EARNINGS gives no GAAP/adjusted distinction → eps_method="unknown".
 
+Window coverage per provider (R spec 2026-08-26, [T-2, T+30])
+-------------------------------------------------------------
+* finnhub: from/to range params → full [T-2, T+30] cal, [T-2, T] eps.
+* alphavantage: EARNINGS_CALENDAR is horizon-based and FORWARD-ONLY —
+  it cannot return past dates; the limitation is recorded as a note in
+  run_log.error_text on every cal run (T-2 coverage comes from the
+  per-ticker EARNINGS endpoint in eps mode, filtered to [T-2, T]).
+* fmp: 403 on the free tier, unchanged.
+* yfinance: ``Ticker.calendar`` is forward-only (next report only) —
+  same run_log note as AV; eps history filtered to [T-2, T].
+days_ahead is stored as computed — negative values (report in the past)
+are legal and never clamped.
+
+yfinance (fourth provider, R spec 2026-08-26)
+---------------------------------------------
+The prod venv carries yfinance 0.2.58 whose earnings_dates endpoint is
+broken, so yfinance data comes from an ISOLATED SUBPROCESS: the main
+script executes ``scripts/_yf_eval_fetch.py`` with the interpreter at
+``$YF_EVAL_PYTHON`` (default /home/trading/yfeval-venv/bin/python3,
+created out of band) and parses ONE json object from its stdout.
+yfinance is never imported here.  A missing interpreter, timeout
+(120s), non-zero exit or malformed stdout is that provider's failure —
+run_log row, other providers unaffected.  Single attempt, no retries
+(a 120s-timeout retry would triple the run; the daily cadence is the
+retry).  eps_method is "unknown" (no GAAP/adjusted distinction, same
+as AV); time_of_day derives from the row timestamp's clock time when
+present, else NULL.
+
+run_log.client_version (R spec 2026-08-26)
+------------------------------------------
+Which client produced each run_log row: the three HTTP providers store
+"requests <version>" (they all go through the requests library);
+yfinance stores "yfinance <version>" as reported by the isolated
+helper (NULL when the helper never got far enough to report one).
+
 Retries
 -------
-Each provider call gets max 2 retries with exponential backoff after the
-initial attempt (3 HTTP calls total), then the failure is logged to
-``run_log`` and the run continues with the other provider.
+Each HTTP provider call gets max 2 retries with exponential backoff
+after the initial attempt (3 HTTP calls total), then the failure is
+logged to ``run_log`` and the run continues with the other providers.
+The yfinance subprocess is single-attempt (see above).
 """
 from __future__ import annotations
 
@@ -81,6 +117,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -99,8 +136,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Own DB — NOT news_trading.db.  Env override for tests / local runs.
 _DB_PATH_DEFAULT = "/home/trading/trading-data/earnings_source_eval.db"
 
-_CAL_FORWARD_DAYS = 30   # cal mode: today .. today+30d
-_EPS_LOOKBACK_DAYS = 1   # eps mode: today-1 .. today
+# Capture windows (R spec 2026-08-26: widened to [T-2, T+30]).
+_CAL_LOOKBACK_DAYS = 2   # cal mode: today-2 .. today+30d
+_CAL_FORWARD_DAYS = 30
+_EPS_LOOKBACK_DAYS = 2   # eps mode: today-2 .. today
 
 _MAX_RETRIES = 2         # retries after the initial attempt (3 calls total)
 _BACKOFF_BASE_S = 2.0    # 2s, then 4s
@@ -113,12 +152,37 @@ _FMP_ENDPOINT = "financialmodelingprep.com/api/v3/earning_calendar"
 _AV_CAL_ENDPOINT = "alphavantage.co/query#EARNINGS_CALENDAR"
 _AV_EPS_ENDPOINT = "alphavantage.co/query#EARNINGS"
 _AV_NEWS_ENDPOINT = "alphavantage.co/query#NEWS_SENTIMENT"
+_YF_CAL_ENDPOINT = "yfinance#Ticker.calendar"
+_YF_EPS_ENDPOINT = "yfinance#Ticker.get_earnings_dates"
 
 _FINNHUB_URL = "https://finnhub.io/api/v1/calendar/earnings"
 _FMP_URL = "https://financialmodelingprep.com/api/v3/earning_calendar"
 _AV_URL = "https://www.alphavantage.co/query"
 
-_PROVIDERS = ("finnhub", "fmp", "alphavantage")
+_PROVIDERS = ("finnhub", "fmp", "alphavantage", "yfinance")
+
+# run_log.client_version for the HTTP providers — they all speak
+# through the requests library.  yfinance rows carry the version the
+# isolated helper reports instead.
+_HTTP_CLIENT_VERSION = f"requests {requests.__version__}"
+
+# yfinance runs in an ISOLATED venv (prod's 0.2.58 earnings_dates is
+# broken) — the helper is executed by this interpreter, never imported.
+_YF_EVAL_PYTHON_DEFAULT = "/home/trading/yfeval-venv/bin/python3"
+_YF_HELPER = _REPO_ROOT / "scripts" / "_yf_eval_fetch.py"
+_YF_SUBPROCESS_TIMEOUT_S = 120.0
+
+# Endpoint limitations vs the [T-2, T+30] target window — recorded in
+# run_log.error_text on every successful cal run rather than silently
+# narrowing (R spec 2026-08-26 item 3).
+_WINDOW_NOTES = {
+    ("alphavantage", "cal"):
+        "cal endpoint forward-only; T-2 coverage comes from the "
+        "per-ticker EARNINGS endpoint",
+    ("yfinance", "cal"):
+        "calendar endpoint forward-only (next report + estimate only); "
+        "T-2 coverage comes from get_earnings_dates in eps mode",
+}
 
 # Alpha Vantage free-tier daily call budget.  The EARNINGS actuals
 # endpoint is per-ticker, so eps mode spends one call per universe name;
@@ -201,7 +265,8 @@ def load_universe() -> set[str]:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the three eval tables if absent (exact R-spec columns),
-    then apply additive migrations (R Amendment A4: eps_capture.time_of_day)."""
+    then apply additive migrations (R Amendment A4: eps_capture.time_of_day;
+    R spec 2026-08-26: run_log.client_version)."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS cal_capture (
@@ -253,6 +318,33 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             error_text         TEXT
         )
         """
+    )
+    # R spec 2026-08-26: which client produced the row (same idempotent
+    # try/except pattern as the A4 migration above).
+    try:
+        conn.execute("ALTER TABLE run_log ADD COLUMN client_version TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
+def _insert_run_log(
+    conn: sqlite3.Connection,
+    run_ts: str,
+    provider: str,
+    endpoint: str,
+    http_status: "int | None",
+    rows_returned: "int | None",
+    rate_limit_headers: "str | None",
+    error_text: "str | None",
+    client_version: "str | None",
+) -> None:
+    conn.execute(
+        "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
+        " rows_returned, rate_limit_headers, error_text, client_version)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_ts, provider, endpoint, http_status, rows_returned,
+         rate_limit_headers, error_text, client_version),
     )
 
 
@@ -349,6 +441,42 @@ def _av_api_key() -> str:
     return key
 
 
+def fetch_yfinance(mode: str, tickers: "list[str]") -> dict:
+    """Run scripts/_yf_eval_fetch.py in the ISOLATED yfinance venv.
+
+    Executes the helper with the interpreter at $YF_EVAL_PYTHON (default
+    /home/trading/yfeval-venv/bin/python3, created out of band) and
+    parses one json object {version, rows, errors} from its stdout.
+    Raises on a missing interpreter, timeout (120s), non-zero exit or
+    malformed stdout — the caller's fail-soft boundary turns that into
+    a run_log row without touching the other providers.
+    """
+    interpreter = os.environ.get("YF_EVAL_PYTHON", _YF_EVAL_PYTHON_DEFAULT)
+    if not Path(interpreter).exists():
+        raise RuntimeError(
+            f"yfinance eval interpreter missing: {interpreter} "
+            "(yfeval-venv not provisioned?)")
+    proc = subprocess.run(
+        [interpreter, str(_YF_HELPER),
+         "--mode", mode, "--tickers", ",".join(tickers)],
+        capture_output=True, text=True, timeout=_YF_SUBPROCESS_TIMEOUT_S,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"yfinance helper exit {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:500]}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"yfinance helper emitted malformed JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"yfinance helper payload is {type(payload).__name__}, "
+            "expected object")
+    return payload
+
+
 def _default_fetchers(mode: str) -> dict:
     """Build the live fetchers from env keys.
 
@@ -357,7 +485,9 @@ def _default_fetchers(mode: str) -> dict:
     Signatures per provider: finnhub/fmp take (frm, to); alphavantage
     takes (frm, to) in cal mode (AV's horizon is fixed, the range is
     ignored) but (ticker) in eps mode — its actuals endpoint is
-    per-ticker.
+    per-ticker.  yfinance takes (tickers) — one subprocess covers the
+    whole universe in both modes — and returns the helper's payload
+    dict {version, rows, errors}.
     """
     def _finnhub(frm: str, to: str):
         key = os.environ.get("FINNHUB_API_KEY", "")
@@ -378,7 +508,11 @@ def _default_fetchers(mode: str) -> dict:
         def _av(ticker: str):
             return fetch_alphavantage_earnings(_av_api_key(), ticker)
 
-    return {"finnhub": _finnhub, "fmp": _fmp, "alphavantage": _av}
+    def _yf(tickers: "list[str]"):
+        return fetch_yfinance(mode, tickers)
+
+    return {"finnhub": _finnhub, "fmp": _fmp, "alphavantage": _av,
+            "yfinance": _yf}
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────
@@ -591,6 +725,102 @@ def normalize_av_eps_rows(
     return out
 
 
+def normalize_yf_cal_row(row: dict, today: date) -> "dict | None":
+    """Map one helper cal row to cal_capture fields.
+
+    yfinance's calendar exposes no session and no confirmed/estimated
+    flag → time_of_day 'unknown'; date_status 'scheduled' if a report
+    date exists, 'absent' otherwise (report_date stored as '' then —
+    the column is NOT NULL, mirroring the AV handling).
+    provider_status_raw carries the helper's whole raw calendar dict.
+    """
+    ticker = row.get("ticker")
+    if not ticker:
+        return None
+    report_date = (row.get("report_date") or "")[:10]
+    try:
+        days_ahead = (
+            date.fromisoformat(report_date) - today
+        ).days if report_date else None
+    except ValueError:
+        days_ahead = None
+    return {
+        "ticker": ticker,
+        "report_date": report_date,
+        "time_of_day": "unknown",
+        "date_status": "scheduled" if report_date else "absent",
+        "days_ahead": days_ahead,
+        "raw_payload_hash": _payload_hash(row),
+        "provider_status_raw": json.dumps(
+            row.get("raw") or {}, sort_keys=True, default=str),
+    }
+
+
+def normalize_yf_report_time(raw) -> "str | None":
+    """Helper 'HH:MM' (exchange-local row timestamp) → session, else NULL.
+
+    Yahoo's earnings_dates timestamps carry a real clock time when the
+    session is known; the mapping is positional vs US cash hours:
+    before 09:30 → bmo, 16:00 or later → amc, in between → dmh.
+    Missing/midnight-only/unparseable → None (NULL — R spec item 1d,
+    unlike AV's 'unknown' which asserts the field existed).
+    """
+    if not raw:
+        return None
+    try:
+        hour, minute = str(raw).split(":", 1)
+        minutes = int(hour) * 60 + int(minute)
+    except ValueError:
+        return None
+    if minutes < 9 * 60 + 30:
+        return "bmo"
+    if minutes >= 16 * 60:
+        return "amc"
+    return "dmh"
+
+
+def normalize_yf_eps_row(
+    row: dict, frm: str, to: str, capture_day: date,
+) -> "dict | None":
+    """Map one helper eps row to eps_capture fields.
+
+    get_earnings_dates returns history (and future placeholders) — only
+    rows inside the run's [frm, to] window are captured.  eps_method is
+    'unknown' (Yahoo documents no GAAP/adjusted distinction, same as
+    AV).  surprise_pct prefers Yahoo's own Surprise(%); falls back to
+    computing from actual/estimate.
+    """
+    ticker = row.get("ticker")
+    report_date = (row.get("report_date") or "")[:10]
+    if not ticker or not report_date:
+        return None
+    if not (frm <= report_date <= to):
+        return None
+    estimate = _av_float(row.get("estimate_eps"))
+    actual = _av_float(row.get("actual_eps"))
+    surprise_pct = _av_float(row.get("surprise_pct"))
+    if surprise_pct is None and actual is not None \
+            and estimate not in (None, 0):
+        surprise_pct = (actual - estimate) / abs(estimate) * 100.0
+    available_same_day = None
+    if actual is not None:
+        try:
+            available_same_day = int(
+                date.fromisoformat(report_date) == capture_day)
+        except ValueError:
+            available_same_day = None
+    return {
+        "ticker": ticker,
+        "report_date": report_date,
+        "estimate_eps": estimate,
+        "actual_eps": actual,
+        "surprise_pct": surprise_pct,
+        "eps_method": "unknown",
+        "available_same_day": available_same_day,
+        "time_of_day": normalize_yf_report_time(row.get("report_time")),
+    }
+
+
 def _first_seen_ts(
     conn: sqlite3.Connection,
     provider: str,
@@ -719,13 +949,9 @@ def _capture_av_eps(
     error_text = " | ".join(parts) or None
     rate_limit = json.dumps({"av_note": note_seen}) if note_seen else "{}"
 
-    conn.execute(
-        "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
-        " rows_returned, rate_limit_headers, error_text)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (capture_ts, "alphavantage", _AV_EPS_ENDPOINT, last_status,
-         rows_total, rate_limit, error_text),
-    )
+    _insert_run_log(
+        conn, capture_ts, "alphavantage", _AV_EPS_ENDPOINT, last_status,
+        rows_total, rate_limit, error_text, _HTTP_CLIENT_VERSION)
     conn.commit()
     logger.info(
         "alphavantage eps capture: %d/%d tickers processed, %d rows "
@@ -739,6 +965,83 @@ def _capture_av_eps(
         "inserted": inserted,
         "skipped": len(skipped),
         "errors": len(errors),
+    }
+
+
+# ── yfinance path (isolated subprocess, both modes) ──────────────────
+
+def _capture_yfinance(
+    conn: sqlite3.Connection,
+    *,
+    mode: str,
+    capture_ts: str,
+    today: date,
+    frm: str,
+    to: str,
+    universe: set,
+    fetcher,
+) -> dict:
+    """yfinance capture: ONE subprocess call covers the whole universe.
+
+    The fetcher returns the helper's payload {version, rows, errors} —
+    per-ticker failures arrive in errors[] (recorded in
+    run_log.error_text, sanitized) without failing the provider.  In
+    cal mode the forward-only endpoint limitation note is prepended to
+    error_text on every run (R spec item 3).  http_status is NULL — no
+    HTTP happens in this process.
+    """
+    payload = fetcher(sorted(universe))
+    version = payload.get("version")
+    rows = payload.get("rows") or []
+    helper_errors = payload.get("errors") or []
+    endpoint = _YF_CAL_ENDPOINT if mode == "cal" else _YF_EPS_ENDPOINT
+
+    inserted = 0
+    for raw in rows:
+        if mode == "cal":
+            norm = normalize_yf_cal_row(raw, today)
+            if norm is None or norm["ticker"] not in universe:
+                continue
+            conn.execute(
+                "INSERT INTO cal_capture (capture_ts, provider, ticker,"
+                " report_date, time_of_day, date_status, days_ahead,"
+                " raw_payload_hash, provider_status_raw)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (capture_ts, "yfinance", norm["ticker"],
+                 norm["report_date"], norm["time_of_day"],
+                 norm["date_status"], norm["days_ahead"],
+                 norm["raw_payload_hash"], norm["provider_status_raw"]),
+            )
+        else:
+            norm = normalize_yf_eps_row(raw, frm, to, today)
+            if norm is None or norm["ticker"] not in universe:
+                continue
+            _insert_eps_row(conn, capture_ts, "yfinance", norm)
+        inserted += 1
+
+    parts = []
+    note = _WINDOW_NOTES.get(("yfinance", mode))
+    if note:
+        parts.append(note)
+    parts.extend(
+        _sanitize_error(f"{e.get('ticker')}: {e.get('error')}")
+        for e in helper_errors)
+    error_text = " | ".join(parts) or None
+
+    _insert_run_log(
+        conn, capture_ts, "yfinance", endpoint, None, len(rows), None,
+        error_text, f"yfinance {version}" if version else None)
+    conn.commit()
+    logger.info(
+        "yfinance %s capture OK: %d rows returned, %d in-universe "
+        "inserted, %d helper errors (yfinance %s)",
+        mode, len(rows), inserted, len(helper_errors), version,
+    )
+    return {
+        "ok": True,
+        "rows_returned": len(rows),
+        "inserted": inserted,
+        "helper_errors": len(helper_errors),
     }
 
 
@@ -761,7 +1064,9 @@ def run_capture(
     outcome (success or final failure) gets a run_log row, and each
     provider's rows + run_log entry are committed independently so one
     provider's crash never loses the others' data.  Alpha Vantage eps
-    runs through the budget-capped per-ticker path (_capture_av_eps).
+    runs through the budget-capped per-ticker path (_capture_av_eps);
+    yfinance runs through the isolated-subprocess path
+    (_capture_yfinance) in both modes.
     """
     if mode not in ("cal", "eps"):
         raise ValueError(f"unknown mode: {mode!r}")
@@ -769,8 +1074,11 @@ def run_capture(
     today = now.date()
     capture_ts = now.isoformat()
 
+    # [T-2, T+30] target window (R spec 2026-08-26) — days_ahead may go
+    # negative for the lookback days and is stored unclamped.
     if mode == "cal":
-        frm, to = today.isoformat(), (
+        frm, to = (
+            today - timedelta(days=_CAL_LOOKBACK_DAYS)).isoformat(), (
             today + timedelta(days=_CAL_FORWARD_DAYS)).isoformat()
     else:
         frm, to = (
@@ -782,6 +1090,7 @@ def run_capture(
         "finnhub": _FINNHUB_ENDPOINT,
         "fmp": _FMP_ENDPOINT,
         "alphavantage": _AV_CAL_ENDPOINT if mode == "cal" else _AV_EPS_ENDPOINT,
+        "yfinance": _YF_CAL_ENDPOINT if mode == "cal" else _YF_EPS_ENDPOINT,
     }
 
     ensure_schema(conn)
@@ -789,6 +1098,22 @@ def run_capture(
 
     for provider in _PROVIDERS:
         endpoint = endpoints[provider]
+
+        if provider == "yfinance":
+            # Isolated-subprocess path, single attempt (no retries).
+            try:
+                summary["providers"][provider] = _capture_yfinance(
+                    conn, mode=mode, capture_ts=capture_ts, today=today,
+                    frm=frm, to=to, universe=universe,
+                    fetcher=fetchers[provider])
+            except Exception as exc:  # noqa: BLE001 — fail-soft boundary
+                err = _sanitize_error(f"{type(exc).__name__}: {exc}")
+                logger.error("yfinance %s capture FAILED: %s", mode, err)
+                _insert_run_log(conn, capture_ts, provider, endpoint,
+                                None, None, None, err, None)
+                conn.commit()
+                summary["providers"][provider] = {"ok": False, "error": err}
+            continue
 
         if provider == "alphavantage" and mode == "eps":
             # Per-ticker path with its own budget/fail-soft/run_log.
@@ -801,12 +1126,9 @@ def run_capture(
             except Exception as exc:  # noqa: BLE001 — fail-soft boundary
                 err = _sanitize_error(f"{type(exc).__name__}: {exc}")
                 logger.error("alphavantage eps capture FAILED: %s", err)
-                conn.execute(
-                    "INSERT INTO run_log (run_ts, provider, endpoint,"
-                    " http_status, rows_returned, rate_limit_headers,"
-                    " error_text) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (capture_ts, provider, endpoint, None, None, None, err),
-                )
+                _insert_run_log(conn, capture_ts, provider, endpoint,
+                                None, None, None, err,
+                                _HTTP_CLIENT_VERSION)
                 conn.commit()
                 summary["providers"][provider] = {"ok": False, "error": err}
             continue
@@ -832,12 +1154,8 @@ def run_capture(
                 rate_limit = json.dumps({"av_note": exc.note})
             err = _sanitize_error(f"{type(exc).__name__}: {exc}")
             logger.error("%s %s capture FAILED: %s", provider, mode, err)
-            conn.execute(
-                "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
-                " rows_returned, rate_limit_headers, error_text)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (capture_ts, provider, endpoint, status, None, rate_limit, err),
-            )
+            _insert_run_log(conn, capture_ts, provider, endpoint, status,
+                            None, rate_limit, err, _HTTP_CLIENT_VERSION)
             conn.commit()
             summary["providers"][provider] = {"ok": False, "error": err}
             continue
@@ -865,13 +1183,12 @@ def run_capture(
                 _insert_eps_row(conn, capture_ts, provider, norm)
             inserted += 1
 
-        conn.execute(
-            "INSERT INTO run_log (run_ts, provider, endpoint, http_status,"
-            " rows_returned, rate_limit_headers, error_text)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (capture_ts, provider, endpoint, status, len(rows),
-             _rate_limit_headers_json(headers), None),
-        )
+        # A window-coverage limitation (AV's forward-only calendar) is
+        # recorded even on success — error_text doubles as a note field.
+        _insert_run_log(conn, capture_ts, provider, endpoint, status,
+                        len(rows), _rate_limit_headers_json(headers),
+                        _WINDOW_NOTES.get((provider, mode)),
+                        _HTTP_CLIENT_VERSION)
         conn.commit()
         logger.info(
             "%s %s capture OK: %d rows returned, %d in-universe inserted",
