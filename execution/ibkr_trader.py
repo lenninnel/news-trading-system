@@ -27,6 +27,7 @@ from typing import Any, Callable
 import nest_asyncio
 import pandas as pd
 
+from emergency_stop import KillSwitch
 from storage.database import Database
 
 # ib_insync's sync API (IB.connect, IB.placeOrder, ib.sleep) internally calls
@@ -488,6 +489,11 @@ class IBKRTrader:
         ticker = ticker.upper()
         action = action.upper()
 
+        # Soft kill switch (emergency_stop.py --stop-trading): same
+        # position in the flow as PaperTrader.track_trade — before any
+        # symbol guard or broker I/O.
+        KillSwitch.assert_trading_allowed()
+
         if not _is_us_symbol(ticker):
             log.warning("skipping non-US symbol %s — no US order path", ticker)
             return {
@@ -721,6 +727,10 @@ class IBKRTrader:
         to confirm in volatile markets and auto-cancelling triggers a
         worse-priced retry (see ``STOP_EXTENDED_TIMEOUT``).
         """
+        # Kill-switch guard — every order-submitting entry point checks,
+        # not just track_trade. See track_trade for context.
+        KillSwitch.assert_trading_allowed()
+
         if not _is_us_symbol(ticker.upper()):
             log.warning("skipping non-US symbol %s — no US order path", ticker)
             return False
@@ -771,6 +781,10 @@ class IBKRTrader:
         to the local DB or compute PnL.  Use ``track_trade`` for the
         full pipeline.
         """
+        # Kill-switch guard — every order-submitting entry point checks,
+        # not just track_trade. See track_trade for context.
+        KillSwitch.assert_trading_allowed()
+
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got '{side}'")

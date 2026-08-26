@@ -541,3 +541,130 @@ class TestNoPositions:
         results = pm._check_all_positions()
         assert results == []
         trader.track_trade.assert_not_called()
+
+
+# ── test: stale-price guard ──────────────────────────────────────────
+
+class TestStalePriceGuard:
+    """Evaluability + alarm split for _fetch_current_price (R spec 2026-08-26)."""
+
+    @staticmethod
+    def _et():
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
+
+    def _rth_now(self):
+        return datetime(2026, 8, 25, 10, 0, tzinfo=self._et())    # Tue 10:00 ET
+
+    def _after_hours_now(self):
+        return datetime(2026, 8, 25, 20, 0, tzinfo=self._et())    # Tue 20:00 ET
+
+    @staticmethod
+    def _make_pm(notifier=None):
+        db = MagicMock()
+        db.get_trailing_stops.return_value = {}
+        return PositionManager(trader=MagicMock(), notifier=notifier, db=db)
+
+    @staticmethod
+    def _price_df(bar_time, close=205.0):
+        import pandas as pd
+        return pd.DataFrame({"Close": [close]},
+                            index=pd.DatetimeIndex([bar_time]))
+
+    @staticmethod
+    def _fetch(pm, df, now):
+        """Run _fetch_current_price with a frozen clock and a canned DataFrame."""
+        with patch("monitoring.position_manager.datetime") as mock_dt, \
+             patch("yfinance.Ticker") as mock_ticker:
+            mock_dt.now.return_value = now
+            mock_ticker.return_value.history.return_value = df
+            return pm._fetch_current_price("AAPL")
+
+    def test_fresh_bar_returns_price(self):
+        from datetime import timedelta
+        now = self._rth_now()
+        df = self._price_df(now - timedelta(minutes=1))
+        pm = self._make_pm()
+        assert self._fetch(pm, df, now) == 205.0
+        assert pm._stale_streaks == {}
+
+    def test_stale_bar_returns_none_and_warns(self, caplog):
+        from datetime import timedelta
+        now = self._rth_now()
+        df = self._price_df(now - timedelta(minutes=6))
+        pm = self._make_pm()
+        with caplog.at_level("WARNING", logger="monitoring.position_manager"):
+            assert self._fetch(pm, df, now) is None
+        assert "stale price bar" in caplog.text
+        assert pm._stale_streaks["AAPL"] == 1
+
+    def test_tz_naive_index_fails_closed(self, caplog):
+        # naive timestamp — provider fault, never guess a timezone
+        naive_bar = datetime(2026, 8, 25, 9, 59)
+        df = self._price_df(naive_bar)
+        pm = self._make_pm()
+        with caplog.at_level("WARNING", logger="monitoring.position_manager"):
+            assert self._fetch(pm, df, self._rth_now()) is None
+        assert "tz-naive" in caplog.text
+        assert pm._stale_streaks == {}  # a fault, not a stale streak
+
+    def test_streak_increments_and_resets(self):
+        from datetime import timedelta
+        now = self._rth_now()
+        stale_df = self._price_df(now - timedelta(minutes=10))
+        fresh_df = self._price_df(now - timedelta(minutes=1))
+        pm = self._make_pm()
+
+        for expected in (1, 2, 3):
+            assert self._fetch(pm, stale_df, now) is None
+            assert pm._stale_streaks["AAPL"] == expected
+
+        assert self._fetch(pm, fresh_df, now) == 205.0
+        assert "AAPL" not in pm._stale_streaks
+
+        assert self._fetch(pm, stale_df, now) is None
+        assert pm._stale_streaks["AAPL"] == 1  # restarted, not continued
+
+    def test_rth_stale_escalates_with_streak(self):
+        from datetime import timedelta
+        now = self._rth_now()
+        df = self._price_df(now - timedelta(minutes=6))
+        notifier = MagicMock()
+        pm = self._make_pm(notifier=notifier)
+
+        self._fetch(pm, df, now)
+        self._fetch(pm, df, now)
+
+        assert notifier.send_price_alert.call_count == 2
+        last_msg = notifier.send_price_alert.call_args[0][0]
+        assert "STALE FEED" in last_msg
+        assert "AAPL" in last_msg
+        assert "2 consecutive" in last_msg
+
+    def test_outside_rth_no_escalation(self, caplog):
+        from datetime import timedelta
+        now = self._after_hours_now()
+        df = self._price_df(now - timedelta(minutes=60))
+        notifier = MagicMock()
+        pm = self._make_pm(notifier=notifier)
+
+        with caplog.at_level("WARNING", logger="monitoring.position_manager"):
+            assert self._fetch(pm, df, now) is None
+
+        notifier.send_price_alert.assert_not_called()
+        assert "stale price bar" in caplog.text  # journal WARNING still written
+        assert pm._stale_streaks["AAPL"] == 1
+
+    def test_caller_skips_cleanly_on_none(self, caplog):
+        """The :236-239 path: None price → WARNING + continue, no orders."""
+        portfolio, history = _make_position()
+        trader = _make_trader(portfolio=portfolio, trade_history=history)
+        pm = PositionManager(trader=trader)
+
+        with patch.object(pm, "_fetch_current_price", return_value=None), \
+             caplog.at_level("WARNING", logger="monitoring.position_manager"):
+            results = pm._check_all_positions()
+
+        assert results == []
+        trader.track_trade.assert_not_called()
+        assert "No price for AAPL" in caplog.text

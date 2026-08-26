@@ -521,3 +521,86 @@ class TestNonUSSymbolGuard:
 
         assert result["trade_id"] == 42
         mock_ib.placeOrder.assert_called_once()
+
+
+# ── Kill switch ──────────────────────────────────────────────────────────────
+
+from emergency_stop import TradingBlocked
+
+
+def _kill_switch(active: bool):
+    """Patch the kill-switch flag check to a fixed state."""
+    return patch(
+        "execution.ibkr_trader.KillSwitch.is_trading_blocked",
+        return_value=active,
+    )
+
+
+def _filled_trade(fill_price=155.0):
+    trade = MagicMock()
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.avgFillPrice = fill_price
+    trade.fills = []
+    return trade
+
+
+class TestKillSwitch:
+    """Soft kill switch (emergency_stop.py --stop-trading) on the IBKR path.
+
+    Every order-submitting entry point must block before any broker call:
+    track_trade, close_position, place_order.
+    """
+
+    def test_track_trade_blocked(self):
+        trader, mock_ib, mock_db = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.track_trade("AAPL", "BUY", 10, 150.0)
+        # Broker never touched, nothing logged
+        mock_ib.qualifyContracts.assert_not_called()
+        mock_ib.placeOrder.assert_not_called()
+        mock_db.log_trade_history.assert_not_called()
+
+    def test_track_trade_allowed(self):
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.placeOrder.return_value = _filled_trade(152.5)
+        with _kill_switch(False):
+            result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+        assert result["trade_id"] == 42
+        mock_ib.placeOrder.assert_called_once()
+
+    def test_close_position_blocked(self):
+        trader, mock_ib, _ = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.close_position("AAPL")
+        mock_ib.positions.assert_not_called()
+        mock_ib.placeOrder.assert_not_called()
+
+    def test_close_position_allowed(self):
+        trader, mock_ib, _ = _make_trader()
+        mock_pos = MagicMock()
+        mock_pos.contract.symbol = "AAPL"
+        mock_pos.position = 10
+        mock_ib.positions.return_value = [mock_pos]
+        mock_ib.placeOrder.return_value = _filled_trade()
+        with _kill_switch(False):
+            assert trader.close_position("AAPL") is True
+        mock_ib.placeOrder.assert_called_once()
+
+    def test_place_order_blocked(self):
+        trader, mock_ib, _ = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.place_order("AAPL", 10, "BUY")
+        mock_ib.qualifyContracts.assert_not_called()
+        mock_ib.placeOrder.assert_not_called()
+
+    def test_place_order_allowed(self):
+        trader, mock_ib, _ = _make_trader()
+        trade = _filled_trade()
+        trade.order.orderId = 7
+        mock_ib.placeOrder.return_value = trade
+        with _kill_switch(False):
+            result = trader.place_order("AAPL", 10, "BUY")
+        assert result == {"order_id": 7, "status": "Filled"}
