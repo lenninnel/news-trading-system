@@ -489,10 +489,15 @@ class IBKRTrader:
         ticker = ticker.upper()
         action = action.upper()
 
-        # Soft kill switch (emergency_stop.py --stop-trading): same
-        # position in the flow as PaperTrader.track_trade — before any
-        # symbol guard or broker I/O.
-        KillSwitch.assert_trading_allowed()
+        # --stop-trading blocks new ENTRIES only (emergency_stop.py:9).
+        # Exits always pass: blocking them turns bounded risk into
+        # unbounded risk exactly when the switch is pulled — a position
+        # reaches its stop and cannot be sold. --stop-all + SIGTERM is
+        # the halt-everything path. Guard sits after action.upper() so a
+        # lowercase "buy" cannot slip past it, and before the
+        # _is_us_symbol check — same flow position as PaperTrader.
+        if action == "BUY":
+            KillSwitch.assert_trading_allowed()
 
         if not _is_us_symbol(ticker):
             log.warning("skipping non-US symbol %s — no US order path", ticker)
@@ -726,11 +731,11 @@ class IBKRTrader:
         uses the extended wait semantics — a stop/exit can take up to 60s
         to confirm in volatile markets and auto-cancelling triggers a
         worse-priced retry (see ``STOP_EXTENDED_TIMEOUT``).
-        """
-        # Kill-switch guard — every order-submitting entry point checks,
-        # not just track_trade. See track_trade for context.
-        KillSwitch.assert_trading_allowed()
 
+        No kill-switch guard: closing a position is by definition an
+        exit, and --stop-trading blocks new entries only — exits must
+        always pass (see track_trade).
+        """
         if not _is_us_symbol(ticker.upper()):
             log.warning("skipping non-US symbol %s — no US order path", ticker)
             return False
@@ -781,13 +786,17 @@ class IBKRTrader:
         to the local DB or compute PnL.  Use ``track_trade`` for the
         full pipeline.
         """
-        # Kill-switch guard — every order-submitting entry point checks,
-        # not just track_trade. See track_trade for context.
-        KillSwitch.assert_trading_allowed()
-
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got '{side}'")
+        # --stop-trading blocks new ENTRIES only (emergency_stop.py:9).
+        # Exits always pass: blocking them turns bounded risk into
+        # unbounded risk exactly when the switch is pulled — a position
+        # reaches its stop and cannot be sold. --stop-all + SIGTERM is
+        # the halt-everything path. side is validated to exactly
+        # BUY/SELL above, so "== BUY" is a complete entry test here.
+        if side == "BUY":
+            KillSwitch.assert_trading_allowed()
         if order_type != "market":
             raise ValueError(f"Unsupported order_type: {order_type}")
         if not _is_us_symbol(ticker.upper()):

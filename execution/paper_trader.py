@@ -111,11 +111,18 @@ class PaperTrader:
         Raises:
             ValueError: If action is not "BUY" or "SELL", or shares < 1.
         """
-        KillSwitch.assert_trading_allowed()
         ticker = ticker.upper()
         action = action.upper()
         if action not in ("BUY", "SELL"):
             raise ValueError(f"action must be BUY or SELL, got '{action}'")
+        # --stop-trading blocks new ENTRIES only (emergency_stop.py:9).
+        # Exits always pass: blocking them turns bounded risk into
+        # unbounded risk exactly when the switch is pulled — a position
+        # reaches its stop and cannot be sold. --stop-all + SIGTERM is
+        # the halt-everything path. Guard sits AFTER .upper() + action
+        # validation so a lowercase "buy" cannot slip past it.
+        if action == "BUY":
+            KillSwitch.assert_trading_allowed()
         if shares < 1:
             raise ValueError(f"shares must be ≥ 1, got {shares}")
         if not price or price <= 0:
