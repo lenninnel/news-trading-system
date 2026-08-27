@@ -521,3 +521,111 @@ class TestNonUSSymbolGuard:
 
         assert result["trade_id"] == 42
         mock_ib.placeOrder.assert_called_once()
+
+
+# ── Kill switch ──────────────────────────────────────────────────────────────
+
+from emergency_stop import TradingBlocked
+
+
+def _kill_switch(active: bool):
+    """Patch the kill-switch flag check to a fixed state."""
+    return patch(
+        "execution.ibkr_trader.KillSwitch.is_trading_blocked",
+        return_value=active,
+    )
+
+
+def _filled_trade(fill_price=155.0):
+    trade = MagicMock()
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.avgFillPrice = fill_price
+    trade.fills = []
+    return trade
+
+
+class TestKillSwitch:
+    """BUY-only kill switch (R amendment 2026-08-26) on the IBKR path.
+
+    --stop-trading blocks new ENTRIES only. Exits (SELLs, close_position)
+    must always pass: blocking them turns bounded risk into unbounded
+    risk exactly when the switch is pulled.
+    """
+
+    # -- entries blocked --------------------------------------------------
+
+    def test_track_trade_buy_blocked(self):
+        trader, mock_ib, mock_db = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.track_trade("AAPL", "BUY", 10, 150.0)
+        # Broker never touched, nothing logged
+        mock_ib.qualifyContracts.assert_not_called()
+        mock_ib.placeOrder.assert_not_called()
+        mock_db.log_trade_history.assert_not_called()
+
+    def test_track_trade_lowercase_buy_blocked(self):
+        """Ordering trap: guard sits after .upper(), so 'buy' is caught."""
+        trader, mock_ib, _ = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.track_trade("AAPL", "buy", 10, 150.0)
+        mock_ib.placeOrder.assert_not_called()
+
+    def test_place_order_buy_blocked(self):
+        trader, mock_ib, _ = _make_trader()
+        with _kill_switch(True):
+            with pytest.raises(TradingBlocked):
+                trader.place_order("AAPL", 10, "BUY")
+        mock_ib.qualifyContracts.assert_not_called()
+        mock_ib.placeOrder.assert_not_called()
+
+    # -- exits pass with the flag ACTIVE ----------------------------------
+
+    def test_track_trade_sell_passes_when_blocked(self):
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.placeOrder.return_value = _filled_trade(155.5)
+        with _kill_switch(True):
+            result = trader.track_trade("AAPL", "SELL", 10, 155.5)
+        assert result["trade_id"] == 42
+        mock_ib.placeOrder.assert_called_once()
+
+    def test_close_position_passes_when_blocked(self):
+        """close_position is by definition an exit — never guarded."""
+        trader, mock_ib, _ = _make_trader()
+        mock_pos = MagicMock()
+        mock_pos.contract.symbol = "AAPL"
+        mock_pos.position = 10
+        mock_ib.positions.return_value = [mock_pos]
+        mock_ib.placeOrder.return_value = _filled_trade()
+        with _kill_switch(True):
+            assert trader.close_position("AAPL") is True
+        mock_ib.placeOrder.assert_called_once()
+
+    def test_place_order_sell_passes_when_blocked(self):
+        trader, mock_ib, _ = _make_trader()
+        trade = _filled_trade()
+        trade.order.orderId = 7
+        mock_ib.placeOrder.return_value = trade
+        with _kill_switch(True):
+            result = trader.place_order("AAPL", 10, "SELL")
+        assert result == {"order_id": 7, "status": "Filled"}
+
+    # -- switch inactive: normal path -------------------------------------
+
+    def test_track_trade_buy_allowed(self):
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.placeOrder.return_value = _filled_trade(152.5)
+        with _kill_switch(False):
+            result = trader.track_trade("AAPL", "BUY", 10, 150.0)
+        assert result["trade_id"] == 42
+        mock_ib.placeOrder.assert_called_once()
+
+    def test_place_order_buy_allowed(self):
+        trader, mock_ib, _ = _make_trader()
+        trade = _filled_trade()
+        trade.order.orderId = 7
+        mock_ib.placeOrder.return_value = trade
+        with _kill_switch(False):
+            result = trader.place_order("AAPL", 10, "BUY")
+        assert result == {"order_id": 7, "status": "Filled"}

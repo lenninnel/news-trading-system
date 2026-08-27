@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -42,6 +42,13 @@ _MARKET_CLOSE_LOCAL = (16, 0)   # 4:00 PM ET
 # Trailing-stop parameters
 _TRAILING_ACTIVATION_PCT = 2.0   # position must be up >2% to activate
 _TRAILING_LOCK_PCT = 1.0         # trail locks in at least 1% gain
+
+# Evaluability guard: newest 1-minute bar must be at most this old for
+# the price to be usable in exit evaluation. A frozen yfinance feed keeps
+# returning the same last bar forever, which would silently disable every
+# stop/TP/trailing exit — better to skip the ticker (fail closed) than to
+# evaluate exits against a stale price.
+_MAX_BAR_AGE_MINUTES = 5
 
 # Stuck-order cooldown: after a stop/TP SELL hits IBKR's STOP_MAX_WAIT and
 # is left in flight, we don't want to evaluate the same position again on
@@ -86,6 +93,12 @@ class PositionManager:
         # skip evaluation so we don't submit a duplicate SELL on top of
         # the in-flight one (which IBKR did not cancel for us).
         self._stuck_orders: dict[str, float] = {}
+
+        # Stale-feed streaks: ticker → consecutive stale price polls.
+        # Reset to 0 on any fresh bar. One stale poll is noise, ten in a
+        # row is a dead feed — the streak is carried in both the journal
+        # line and the Telegram escalation so severity is readable.
+        self._stale_streaks: dict[str, int] = {}
 
         # Signal logger for audit trail
         from analytics.signal_logger import SignalLogger
@@ -625,14 +638,69 @@ class PositionManager:
     # Price fetching
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _fetch_current_price(ticker: str) -> float | None:
-        """Fetch latest 1-minute price via yfinance."""
+    def _fetch_current_price(self, ticker: str) -> float | None:
+        """Fetch latest 1-minute price via yfinance, stale-guarded.
+
+        Two separate concerns (R spec 2026-08-26):
+
+        EVALUABILITY (always on, regardless of clock): if the newest bar
+        is older than _MAX_BAR_AGE_MINUTES, return None — the caller in
+        _check_all_positions already skips the ticker on None. Never
+        evaluate exits against a stale price.
+
+        ALARM (RTH only): escalate to Telegram only while the market is
+        open. Outside RTH a stale last bar is expected (the feed idles
+        overnight) and only a journal WARNING is written.
+
+        NOTE: "RTH" here is _is_market_hours(), which is weekday + time
+        window ONLY, because the scheduler has no market-holiday calendar
+        (B1 finding, 2026-08-25). On a US market holiday this check will
+        treat the day as RTH and escalate on stale bars. The holiday
+        calendar is its own ticket. Do not pretend otherwise.
+        """
         try:
             import yfinance as yf
             data = yf.Ticker(ticker).history(period="1d", interval="1m")
             if data.empty:
                 return None
+
+            bar_time = data.index[-1]
+            # yfinance returns a tz-aware DatetimeIndex (US/Eastern). A
+            # naive index means the provider changed behaviour under us:
+            # fail closed rather than guess a timezone for the age check.
+            if getattr(bar_time, "tzinfo", None) is None:
+                log.warning(
+                    "[%s] yfinance bar index is tz-naive (last bar %s) — "
+                    "cannot assess staleness, treating price as "
+                    "unevaluable",
+                    ticker, bar_time,
+                )
+                return None
+
+            # Compare in the bar's own timezone — never naive vs aware.
+            now = datetime.now(bar_time.tzinfo)
+            age = now - bar_time
+            if age > timedelta(minutes=_MAX_BAR_AGE_MINUTES):
+                streak = self._stale_streaks.get(ticker, 0) + 1
+                self._stale_streaks[ticker] = streak
+                age_min = age.total_seconds() / 60.0
+                log.warning(
+                    "[%s] stale price bar: last bar %s is %.1f min old "
+                    "(max %d) — %d consecutive stale poll(s); skipping "
+                    "exit evaluation",
+                    ticker, bar_time, age_min, _MAX_BAR_AGE_MINUTES,
+                    streak,
+                )
+                if self._is_market_hours():
+                    self._send_alert(
+                        f"⚠️ STALE FEED: {ticker} last bar "
+                        f"{age_min:.1f}min old during market hours — "
+                        f"{streak} consecutive stale poll(s). Exits "
+                        f"cannot be evaluated."
+                    )
+                return None
+
+            self._stale_streaks.pop(ticker, None)
             return float(data["Close"].iloc[-1])
         except Exception as exc:
             log.warning("yfinance fetch failed for %s: %s", ticker, exc)
