@@ -36,6 +36,12 @@ class ClusterResult:
     agreeing_strategies: list[str] = field(default_factory=list)
     disagreeing_strategies: list[str] = field(default_factory=list)
     cluster_strength: int = 0
+    # B3 attribution carry-along (never feeds back into any decision):
+    # which agreeing strategy won the max()-by-rank pick, and how much
+    # boost was actually applied on top of its base confidence.  None on
+    # the HOLD / CONFLICTING exits — there is no strongest supplier there.
+    strongest_supplier: str | None = None
+    boost_applied: float | None = None
 
 
 class ClusterDetector:
@@ -133,4 +139,6 @@ class ClusterDetector:
             agreeing_strategies=agreeing,
             disagreeing_strategies=disagreeing,
             cluster_strength=len(winners),
+            strongest_supplier=strongest.strategy_name,
+            boost_applied=round(boosted_conf - base_conf, 2),
         )

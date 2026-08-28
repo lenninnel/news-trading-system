@@ -20,7 +20,9 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from storage.database import Database
@@ -37,7 +39,15 @@ CREATE TABLE IF NOT EXISTS forward_signals (
     signal              TEXT    NOT NULL,
     confidence          REAL,
     price_at_signal     REAL,
-    strategy_name       TEXT,
+    strategy_name       TEXT,   -- DEPRECATED for attribution (B3, R spec
+                                -- item 3): misattributes the vote supplier
+                                -- in 19/24 era rows (it records the router
+                                -- primary / caller label, NOT which strategy
+                                -- voted).  Kept only for the portfolio-cap
+                                -- strategy resolution in the cached US_OPEN
+                                -- executor.  For attribution, read
+                                -- vote_vector_json / strongest_supplier or
+                                -- the signal_attribution table instead.
     stop_loss           REAL,
     take_profit         REAL,
     status              TEXT    NOT NULL DEFAULT 'pending',
@@ -45,6 +55,19 @@ CREATE TABLE IF NOT EXISTS forward_signals (
     invalidated_reason  TEXT
 )
 """
+
+# B3 (A1): vote-vector columns added to forward_signals via idempotent
+# ALTER TABLE so the executing session can read the vector back instead
+# of re-inferring it.  All confidences on the 0-1 scale.
+_FORWARD_VOTE_COLUMNS: list[tuple[str, str]] = [
+    ("vote_vector_json", "TEXT"),      # per-strategy signals/confs
+    ("directional_count", "INTEGER"),
+    ("strongest_supplier", "TEXT"),
+    ("boost_applied", "REAL"),
+    ("conf_pre_floor", "REAL"),
+    ("conf_post_floor", "REAL"),
+    ("evaluated_at", "TEXT"),
+]
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_events (
@@ -119,6 +142,18 @@ class SignalLogger:
                     )
                 except Exception:
                     pass  # column already exists
+                # B3 (A1): forward_signals vote-vector columns.  Same
+                # idempotent-ALTER pattern as earnings_source_eval
+                # (time_of_day): swallow only "duplicate column".
+                for col, typedef in _FORWARD_VOTE_COLUMNS:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE forward_signals "
+                            f"ADD COLUMN {col} {typedef}"
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -204,7 +239,14 @@ class SignalLogger:
     # ------------------------------------------------------------------
 
     def store_forward_signal(self, data: dict) -> int | None:
-        """Store an EOD signal for next-day execution. Never raises."""
+        """Store an EOD signal for next-day execution. Never raises.
+
+        B3 (A1): optional vote-vector fields (``vote_vector_json``,
+        ``directional_count``, ``strongest_supplier``, ``boost_applied``,
+        ``conf_pre_floor``, ``conf_post_floor``, ``evaluated_at``) are
+        written in a SECOND statement so a vote-vector write failure can
+        never lose the forward row itself.
+        """
         try:
             now = datetime.now(timezone.utc).isoformat()
             with self._db._connect() as conn:
@@ -229,7 +271,38 @@ class SignalLogger:
                         data.get("take_profit"),
                     ),
                 )
-                return cur.lastrowid
+                row_id = cur.lastrowid
+                try:
+                    vector = data.get("vote_vector_json")
+                    if vector is not None and not isinstance(vector, str):
+                        vector = json.dumps(vector)
+                    conn.execute(
+                        """
+                        UPDATE forward_signals
+                        SET vote_vector_json = ?, directional_count = ?,
+                            strongest_supplier = ?, boost_applied = ?,
+                            conf_pre_floor = ?, conf_post_floor = ?,
+                            evaluated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            vector,
+                            data.get("directional_count"),
+                            data.get("strongest_supplier"),
+                            data.get("boost_applied"),
+                            data.get("conf_pre_floor"),
+                            data.get("conf_post_floor"),
+                            data.get("evaluated_at"),
+                            row_id,
+                        ),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "store_forward_signal() vote-vector write failed "
+                        "(forward row %s kept, non-fatal): %s",
+                        row_id, exc,
+                    )
+                return row_id
         except Exception as exc:
             log.warning("store_forward_signal() failed (non-fatal): %s", exc)
             return None
