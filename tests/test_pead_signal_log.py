@@ -904,7 +904,7 @@ class TestAnalyseTickerAsyncNoStampForNonPEADTrades:
         # Sidesteps the cluster detector / vote counting — we just want a
         # BUY decision with strat_name != "PEAD".
         coord._fuse_signals = MagicMock(
-            return_value=("WEAK BUY", 0.55, "CLUSTER_PARTIAL"),
+            return_value=("WEAK BUY", 0.55, "CLUSTER_PARTIAL", None),
         )
 
         # And pin strategy_label so strat_name is deterministic and
