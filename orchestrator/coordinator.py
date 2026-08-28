@@ -60,6 +60,7 @@ import asyncio
 import json
 import logging
 import time as _time
+from datetime import datetime, timezone
 
 
 log = logging.getLogger(__name__)
@@ -635,6 +636,27 @@ class Coordinator:
                                     strategy="PEAD",
                                     intended_price=price,
                                 )
+                                # B3 (A3/A6): PEAD same-run attribution —
+                                # pead vote only, no cluster ran.  This
+                                # path is dormant while PEAD is disabled;
+                                # wired anyway per spec.
+                                try:
+                                    self._record_signal_attribution(
+                                        execution=execution,
+                                        direction=risk["direction"],
+                                        ticker=ticker,
+                                        session=session or "PEAD_OPEN",
+                                        vote_ctx=self._pead_vote_ctx(conf),
+                                        combined_conf=conf,
+                                        # _apply_signal_floor never runs on
+                                        # this path — floor fields stay NULL.
+                                    )
+                                except Exception as exc:
+                                    log.error(
+                                        "[%s] attribution write failed "
+                                        "(non-fatal): %s",
+                                        ticker, exc,
+                                    )
                                 if execution and execution.get("trade_id"):
                                     try:
                                         if risk["direction"] == "BUY":
@@ -681,6 +703,7 @@ class Coordinator:
         # Store forward signal for execution session
         if combined_signal not in ("HOLD", "CONFLICTING"):
             try:
+                # B3 (A1a): pead-only vote vector on the forward row.
                 self.signal_logger.store_forward_signal({
                     "source_session": session or "PEAD_OPEN",
                     "target_session": "US_OPEN",
@@ -691,6 +714,10 @@ class Coordinator:
                     "strategy_name": "PEAD",
                     "stop_loss": risk.get("stop_loss") if not risk.get("skipped") else None,
                     "take_profit": risk.get("take_profit") if not risk.get("skipped") else None,
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                    "vote_vector_json": json.dumps(
+                        self._pead_vote_ctx(conf)["strategy_votes"],
+                    ),
                 })
             except Exception as exc:
                 log.warning("[%s] PEAD forward signal storage failed: %s", ticker, exc)
@@ -821,12 +848,12 @@ class Coordinator:
         sentiment_confidence: float,
         fallback_technical_signal: str,
         fallback_technical_confidence: float | None,
-    ) -> tuple[str, float, str]:
+    ) -> tuple[str, float, str, dict | None]:
         """Combine strategy votes via ClusterDetector, falling back to
         combine_signals() on exception.
 
-        Returns (combined_label, combined_confidence, signal_path) where
-        signal_path is one of:
+        Returns (combined_label, combined_confidence, signal_path,
+        vote_ctx) where signal_path is one of:
           * ``CLUSTER``          — all three strategies voted and
                                    ClusterDetector produced the verdict.
           * ``CLUSTER_PARTIAL``  — fewer than three strategies voted
@@ -836,6 +863,15 @@ class Coordinator:
           * ``FUSION_FALLBACK``  — no strategies voted or ClusterDetector
                                    raised; ``combine_signals()`` produced
                                    the verdict.
+
+        vote_ctx (B3 attribution carry-along — never feeds back into any
+        decision) is a dict with keys ``strategy_votes`` (list of
+        {strategy_name, signal, confidence} with confidence on the 0-1
+        scale), ``directional_count``, ``strongest_supplier`` and
+        ``boost_applied`` — or None on the two non-cluster exits:
+        CONFLICTING (no directional consensus — a strongest supplier
+        would be fabricated) and FUSION_FALLBACK (no vote vector exists
+        at all).  Downstream both must persist NULL vote fields (A4).
         """
         if strategy_votes:
             try:
@@ -852,10 +888,27 @@ class Coordinator:
                         ticker, len(strategy_votes),
                         self._EXPECTED_VOTE_COUNT, voters,
                     )
+                if cluster.cluster_signal == "CONFLICTING":
+                    vote_ctx = None
+                else:
+                    vote_ctx = {
+                        "strategy_votes": [
+                            {
+                                "strategy_name": r.strategy_name,
+                                "signal": r.signal,
+                                "confidence": round(r.confidence / 100.0, 4),
+                            }
+                            for r in strategy_votes
+                        ],
+                        "directional_count": cluster.cluster_strength,
+                        "strongest_supplier": cluster.strongest_supplier,
+                        "boost_applied": cluster.boost_applied,
+                    }
                 return (
                     cluster.cluster_signal,
                     round(max(0.0, min(1.0, cluster.confidence)), 2),
                     path,
+                    vote_ctx,
                 )
             except Exception as exc:
                 log.warning(
@@ -869,7 +922,7 @@ class Coordinator:
             sentiment_confidence=sentiment_confidence,
             technical_confidence=fallback_technical_confidence,
         )
-        return label, conf, "FUSION_FALLBACK"
+        return label, conf, "FUSION_FALLBACK", None
 
     @staticmethod
     def _apply_signal_floor(ticker: str, signal: str, conf: float) -> float:
@@ -889,6 +942,208 @@ class Coordinator:
             )
             return floor
         return conf
+
+    # ------------------------------------------------------------------
+    # B3 signal attribution (R spec 2026-08-27) — pure observation layer.
+    # Nothing in here may alter a trading decision.
+    # ------------------------------------------------------------------
+
+    # StrategyResult.strategy_name → signal_attribution column pair.
+    _ATTRIBUTION_VOTE_COLUMNS = {
+        "Momentum": ("momentum_signal", "momentum_conf"),
+        "Pullback": ("pullback_signal", "pullback_conf"),
+        "NewsCatalyst": ("newscatalyst_signal", "newscatalyst_conf"),
+        "PEAD": ("pead_signal", "pead_conf"),
+    }
+
+    @staticmethod
+    def _pead_vote_ctx(pead_conf: float) -> dict:
+        """Vote context for a PEAD-driven signal that bypassed the cluster.
+
+        PEAD genuinely voted BUY (that is what fired the path), so
+        pead_signal/pead_conf are facts; there was no cluster, so
+        directional_count / strongest_supplier / boost stay None —
+        recording them would fabricate a cluster that never ran (A4).
+        """
+        return {
+            "strategy_votes": [{
+                "strategy_name": "PEAD",
+                "signal": "BUY",
+                "confidence": round(float(pead_conf), 4),
+            }],
+            "directional_count": None,
+            "strongest_supplier": None,
+            "boost_applied": None,
+        }
+
+    def _record_signal_attribution(
+        self,
+        *,
+        execution: dict | None,
+        direction: str | None,
+        ticker: str,
+        session: str | None,
+        vote_ctx: dict | None,
+        combined_conf: float | None,
+        conf_pre_floor: float | None = None,
+        conf_post_floor: float | None = None,
+        same_run: bool = True,
+        evaluated_at: str | None = None,
+        no_vector_reason: str | None = None,
+    ) -> None:
+        """Write one signal_attribution row for an executed BUY.
+
+        Called IMMEDIATELY AFTER track_trade returns (A6).  Never raises
+        and never blocks the trade — any failure is logged at ERROR with
+        ticker and trade_id and swallowed.  No-op for SELLs, skipped
+        trades, and executions without a delivered trade_id.
+
+        same_run=True stamps evaluated_at == executed_at and staleness
+        0.0 (A3).  same_run=False (forward path, A1/A2) uses the passed
+        ``evaluated_at`` from the consumed forward row and computes
+        staleness_minutes from it; with no evaluated_at both stay NULL.
+        """
+        trade_id = (execution or {}).get("trade_id")
+        if not trade_id or direction != "BUY":
+            return
+        try:
+            executed_at = datetime.now(timezone.utc).isoformat()
+            if same_run:
+                eval_at: str | None = executed_at
+                staleness: float | None = 0.0
+            else:
+                eval_at = evaluated_at
+                staleness = None
+                if eval_at:
+                    try:
+                        delta = (
+                            datetime.fromisoformat(executed_at)
+                            - datetime.fromisoformat(eval_at)
+                        )
+                        staleness = round(delta.total_seconds() / 60.0, 2)
+                    except (ValueError, TypeError):
+                        staleness = None
+
+            row: dict = {
+                "trade_id": trade_id,
+                "ticker": ticker,
+                "session": session or "UNKNOWN",
+                "evaluated_at": eval_at,
+                "executed_at": executed_at,
+                "staleness_minutes": staleness,
+                "combined_conf": combined_conf,
+                "conf_pre_floor": conf_pre_floor,
+                "conf_post_floor": conf_post_floor,
+                "floors_applied": (
+                    None
+                    if conf_pre_floor is None or conf_post_floor is None
+                    else int(conf_post_floor != conf_pre_floor)
+                ),
+            }
+            if vote_ctx:
+                for vote in vote_ctx.get("strategy_votes") or []:
+                    cols = self._ATTRIBUTION_VOTE_COLUMNS.get(
+                        vote.get("strategy_name"),
+                    )
+                    if cols:
+                        row[cols[0]] = vote.get("signal")
+                        row[cols[1]] = vote.get("confidence")
+                row["directional_count"] = vote_ctx.get("directional_count")
+                row["strongest_supplier"] = vote_ctx.get("strongest_supplier")
+                row["boost_applied"] = vote_ctx.get("boost_applied")
+                row["attribution_status"] = "complete"
+            else:
+                # A4 — no silent skip: missing attribution is written AS
+                # missing (NULL vote fields), never fabricated.
+                row["attribution_status"] = "no_vote_vector"
+                row["attribution_reason"] = (
+                    no_vector_reason or "no vote vector available"
+                )
+            self.db.insert_signal_attribution(row)
+        except Exception as exc:
+            log.error(
+                "[%s] signal_attribution write failed for trade %s "
+                "(trade unaffected): %s",
+                ticker, trade_id, exc,
+            )
+
+    def _record_forward_attribution(
+        self,
+        *,
+        execution: dict | None,
+        direction: str | None,
+        ticker: str,
+        session: str | None,
+        forward_row: dict | None,
+        combined_conf: float | None,
+    ) -> None:
+        """Attribution for the cached US_OPEN executor (A1b).
+
+        Reads the vote vector back from the consumed forward_signals row.
+        A missing row or missing/unparseable vector still produces a row
+        with NULL vote fields and status 'no_vote_vector' (A4 — no silent
+        skip).  Never raises.
+        """
+        try:
+            vote_ctx: dict | None = None
+            reason: str | None = None
+            evaluated_at: str | None = None
+            conf_pre = conf_post = None
+
+            if forward_row is None:
+                reason = (
+                    "no pending forward row — trade executed from cached "
+                    "signal_events entry only"
+                )
+            else:
+                evaluated_at = forward_row.get("evaluated_at")
+                conf_pre = forward_row.get("conf_pre_floor")
+                conf_post = forward_row.get("conf_post_floor")
+                raw = forward_row.get("vote_vector_json")
+                if not raw:
+                    reason = (
+                        f"forward row {forward_row.get('id')} has no vote "
+                        "vector (pre-deploy row, sentiment-only PRE "
+                        "refresh, or failed vector write)"
+                    )
+                else:
+                    try:
+                        vote_ctx = {
+                            "strategy_votes": json.loads(raw),
+                            "directional_count": forward_row.get(
+                                "directional_count",
+                            ),
+                            "strongest_supplier": forward_row.get(
+                                "strongest_supplier",
+                            ),
+                            "boost_applied": forward_row.get("boost_applied"),
+                        }
+                    except (ValueError, TypeError) as exc:
+                        vote_ctx = None
+                        reason = (
+                            f"forward row {forward_row.get('id')} vote "
+                            f"vector unparseable: {exc}"
+                        )
+
+            self._record_signal_attribution(
+                execution=execution,
+                direction=direction,
+                ticker=ticker,
+                session=session,
+                vote_ctx=vote_ctx,
+                combined_conf=combined_conf,
+                conf_pre_floor=conf_pre,
+                conf_post_floor=conf_post,
+                same_run=False,
+                evaluated_at=evaluated_at,
+                no_vector_reason=reason,
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] forward attribution failed for trade %s "
+                "(trade unaffected): %s",
+                ticker, (execution or {}).get("trade_id"), exc,
+            )
 
     # ------------------------------------------------------------------
     # Signal fusion (static — easily unit-testable)
@@ -1269,7 +1524,7 @@ class Coordinator:
         )
 
         # --- Fuse via cluster detector (falls back to combine_signals) ---
-        combined_signal, conf, signal_path = self._fuse_signals(
+        combined_signal, conf, signal_path, vote_ctx = self._fuse_signals(
             ticker,
             strategy_votes,
             sentiment_signal=sentiment["signal"],
@@ -1279,6 +1534,7 @@ class Coordinator:
         )
 
         # --- Signal-type confidence floors (always applied post-fusion) ---
+        conf_pre_floor = conf
         conf = self._apply_signal_floor(ticker, combined_signal, conf)
 
         # --- Persist combined ---
@@ -1439,6 +1695,29 @@ class Coordinator:
                         strategy=trade_strategy,
                         intended_price=price,
                     )
+                    # B3 (A6): attribution row immediately after
+                    # track_trade — same run, so evaluated == executed.
+                    try:
+                        self._record_signal_attribution(
+                            execution=execution,
+                            direction=risk["direction"],
+                            ticker=ticker,
+                            session=session,
+                            vote_ctx=vote_ctx,
+                            combined_conf=conf,
+                            conf_pre_floor=conf_pre_floor,
+                            conf_post_floor=conf,
+                            no_vector_reason=(
+                                f"signal_path={signal_path}: no cluster "
+                                "vote vector (CONFLICTING or fallback "
+                                "fusion)"
+                            ),
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "[%s] attribution write failed (non-fatal): %s",
+                            ticker, exc,
+                        )
                     if execution and execution.get("trade_id"):
                         try:
                             if risk["direction"] == "BUY":
@@ -1690,10 +1969,13 @@ class Coordinator:
             )
             signal_path = "FUSION_FALLBACK"
             strat_name = "PEAD"
+            # B3: PEAD's BUY vote is the fact that fired this path; the
+            # cluster never ran, so the cluster-derived fields stay None.
+            vote_ctx = self._pead_vote_ctx(pead_result["confidence"])
             log.info("[%s] PEAD overriding strategy: %s (%.0f%%)",
                      ticker, combined_signal, conf * 100)
         else:
-            combined_signal, conf, signal_path = self._fuse_signals(
+            combined_signal, conf, signal_path, vote_ctx = self._fuse_signals(
                 ticker,
                 strategy_votes,
                 sentiment_signal=sentiment_signal,
@@ -1706,6 +1988,7 @@ class Coordinator:
         # Mirrors the sync run_combined() clamp — without this the async
         # production path lets WEAK BUY drop below the 0.35 execution gate
         # (observed bug: TSLA WEAK BUY 0.41 → 0.26).
+        conf_pre_floor = conf
         conf = self._apply_signal_floor(ticker, combined_signal, conf)
         is_scanner_candidate = ticker.upper() in (scanner_candidates or set())
 
@@ -1858,6 +2141,30 @@ class Coordinator:
                                 strategy=trade_strategy,
                                 intended_price=price,
                             )
+                            # B3 (A6): attribution row immediately after
+                            # track_trade — same run, evaluated == executed.
+                            try:
+                                self._record_signal_attribution(
+                                    execution=execution,
+                                    direction=risk["direction"],
+                                    ticker=ticker,
+                                    session=session,
+                                    vote_ctx=vote_ctx,
+                                    combined_conf=conf,
+                                    conf_pre_floor=conf_pre_floor,
+                                    conf_post_floor=conf,
+                                    no_vector_reason=(
+                                        f"signal_path={signal_path}: no "
+                                        "cluster vote vector (CONFLICTING "
+                                        "or fallback fusion)"
+                                    ),
+                                )
+                            except Exception as exc:
+                                log.error(
+                                    "[%s] attribution write failed "
+                                    "(non-fatal): %s",
+                                    ticker, exc,
+                                )
                             # Register / clear position metadata so the
                             # per-strategy and per-sector caps actually
                             # see meaningful tags on the next gate check.
@@ -1948,7 +2255,12 @@ class Coordinator:
         # so the next execution session can validate and trade them.
         if session_type == "signal" and combined_signal not in ("HOLD", "CONFLICTING"):
             try:
-                self.signal_logger.store_forward_signal({
+                # B3 (A1a): persist the vote vector alongside the forward
+                # row so the executing session reads it back instead of
+                # re-inferring attribution.  vote_ctx is None on the
+                # FUSION_FALLBACK exit — the columns then stay NULL and
+                # execution writes a 'no_vote_vector' attribution row (A4).
+                fwd_payload = {
                     "source_session": session or "EOD",
                     "target_session": "US_OPEN",
                     "ticker": ticker,
@@ -1958,7 +2270,20 @@ class Coordinator:
                     "strategy_name": strat_name,
                     "stop_loss": risk.get("stop_loss") if not risk.get("skipped") else None,
                     "take_profit": risk.get("take_profit") if not risk.get("skipped") else None,
-                })
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                    "conf_pre_floor": conf_pre_floor,
+                    "conf_post_floor": conf,
+                }
+                if vote_ctx:
+                    fwd_payload.update({
+                        "vote_vector_json": json.dumps(
+                            vote_ctx["strategy_votes"],
+                        ),
+                        "directional_count": vote_ctx.get("directional_count"),
+                        "strongest_supplier": vote_ctx.get("strongest_supplier"),
+                        "boost_applied": vote_ctx.get("boost_applied"),
+                    })
+                self.signal_logger.store_forward_signal(fwd_payload)
             except Exception as exc:
                 log.warning("[%s] Forward signal storage failed (non-fatal): %s", ticker, exc)
 
@@ -2132,6 +2457,10 @@ class Coordinator:
                             "[%s] PRE conviction changed %.0f%% → %.0f%% (delta %.0f%%) — updating forward signal",
                             ticker, old_conf * 100, conf * 100, delta * 100,
                         )
+                        # B3 (A1a): sentiment-only refresh — no strategy
+                        # votes exist, so no vote vector is written (the
+                        # executing session records 'no_vote_vector', A4).
+                        # evaluated_at still lands for staleness.
                         self.signal_logger.store_forward_signal({
                             "source_session": session or "PRE",
                             "target_session": target_session,
@@ -2139,6 +2468,7 @@ class Coordinator:
                             "signal": combined_signal,
                             "confidence": conf,
                             "price_at_signal": None,
+                            "evaluated_at": datetime.now(timezone.utc).isoformat(),
                         })
                         updated_forward = True
                     else:
@@ -2152,6 +2482,7 @@ class Coordinator:
                         "[%s] PRE new forward signal: %s (%.0f%%)",
                         ticker, combined_signal, conf * 100,
                     )
+                    # B3 (A1a): sentiment-only — no vote vector (see above).
                     self.signal_logger.store_forward_signal({
                         "source_session": session or "PRE",
                         "target_session": "XETRA_OPEN" if session and "XETRA" in session else "US_OPEN",
@@ -2159,6 +2490,7 @@ class Coordinator:
                         "signal": combined_signal,
                         "confidence": conf,
                         "price_at_signal": None,
+                        "evaluated_at": datetime.now(timezone.utc).isoformat(),
                     })
                     updated_forward = True
             except Exception as exc:
@@ -2407,6 +2739,31 @@ class Coordinator:
                                     strategy=strat_name if strat_name != "unknown" else None,
                                     intended_price=current_price,
                                 )
+                                # B3 (A1b/A6): read the vote vector back
+                                # from the consumed forward row (pending[0]
+                                # — the same row the level adoption used)
+                                # and write attribution immediately after
+                                # track_trade.  Pre-deploy rows / failed
+                                # vector writes land as 'no_vote_vector'
+                                # — visible AS missing, never fabricated
+                                # (A4).
+                                try:
+                                    self._record_forward_attribution(
+                                        execution=execution,
+                                        direction=risk["direction"],
+                                        ticker=ticker,
+                                        session=session,
+                                        forward_row=(
+                                            pending[0] if pending else None
+                                        ),
+                                        combined_conf=conf,
+                                    )
+                                except Exception as exc:
+                                    log.error(
+                                        "[%s] attribution write failed "
+                                        "(non-fatal): %s",
+                                        ticker, exc,
+                                    )
                                 log.info(
                                     "[%s] Cached signal executed: %s %d shares @ %.2f",
                                     ticker, risk["direction"], risk["shares"], current_price,

@@ -552,6 +552,38 @@ class Database:
                     raw_json              TEXT    NOT NULL,   -- full untouched record
                     UNIQUE(ticker, scheduled_report_date, capture_timestamp_utc)
                 );
+
+                -- B3 signal attribution (R spec 2026-08-27): one row per
+                -- EXECUTED BUY, carrying the per-strategy vote vector that
+                -- produced the fill.  All confidences on the 0-1 scale.
+                -- Never backfilled for pre-deploy trades (R spec item 4).
+                CREATE TABLE IF NOT EXISTS signal_attribution (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id            INTEGER NOT NULL,
+                    ticker              TEXT    NOT NULL,
+                    session             TEXT    NOT NULL,  -- execution path (A3)
+                    evaluated_at        TEXT,
+                    executed_at         TEXT    NOT NULL,
+                    staleness_minutes   REAL,              -- executed - evaluated (A2)
+                    momentum_signal     TEXT,
+                    momentum_conf       REAL,
+                    pullback_signal     TEXT,
+                    pullback_conf       REAL,
+                    newscatalyst_signal TEXT,
+                    newscatalyst_conf   REAL,
+                    pead_signal         TEXT,
+                    pead_conf           REAL,
+                    directional_count   INTEGER,           -- cluster_strength
+                    strongest_supplier  TEXT,              -- max()-ranked voter
+                    combined_conf       REAL,
+                    boost_applied       REAL,              -- 0.00 / 0.10 / 0.20
+                    floors_applied      INTEGER,           -- 1 if floor clamped
+                    conf_pre_floor      REAL,
+                    conf_post_floor     REAL,
+                    attribution_status  TEXT    NOT NULL,  -- 'complete' | 'no_vote_vector'
+                    attribution_reason  TEXT,              -- why, when not complete (A4)
+                    created_at          TEXT    NOT NULL
+                );
                 """
             )
 
@@ -2081,6 +2113,76 @@ class Database:
                 payload,
             )
         return len(payload)
+
+    # ------------------------------------------------------------------
+    # signal_attribution (B3 — one row per executed BUY)
+    # ------------------------------------------------------------------
+
+    @_retry_on_locked
+    def insert_signal_attribution(self, row: dict) -> int | None:
+        """Insert one signal_attribution row for an executed BUY.
+
+        Same locking discipline as upsert_daily_ohlc (file + write locks).
+        Required keys: trade_id, ticker, session, executed_at,
+        attribution_status.  All vote-vector keys are optional and stored
+        as NULL when absent — a missing vector must be visible AS missing
+        (A4), never fabricated.
+
+        Returns the new row id.  Raises on write failure — callers on the
+        trade path wrap this (A6: log ERROR and continue, never unwind
+        the trade).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        trade_id = row["trade_id"]
+        try:
+            trade_id = int(trade_id)
+        except (TypeError, ValueError):
+            pass  # store raw — losing the row would hide the attribution
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO signal_attribution
+                    (trade_id, ticker, session, evaluated_at, executed_at,
+                     staleness_minutes,
+                     momentum_signal, momentum_conf,
+                     pullback_signal, pullback_conf,
+                     newscatalyst_signal, newscatalyst_conf,
+                     pead_signal, pead_conf,
+                     directional_count, strongest_supplier,
+                     combined_conf, boost_applied,
+                     floors_applied, conf_pre_floor, conf_post_floor,
+                     attribution_status, attribution_reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id,
+                    row["ticker"].upper(),
+                    row["session"],
+                    row.get("evaluated_at"),
+                    row["executed_at"],
+                    row.get("staleness_minutes"),
+                    row.get("momentum_signal"),
+                    row.get("momentum_conf"),
+                    row.get("pullback_signal"),
+                    row.get("pullback_conf"),
+                    row.get("newscatalyst_signal"),
+                    row.get("newscatalyst_conf"),
+                    row.get("pead_signal"),
+                    row.get("pead_conf"),
+                    row.get("directional_count"),
+                    row.get("strongest_supplier"),
+                    row.get("combined_conf"),
+                    row.get("boost_applied"),
+                    row.get("floors_applied"),
+                    row.get("conf_pre_floor"),
+                    row.get("conf_post_floor"),
+                    row["attribution_status"],
+                    row.get("attribution_reason"),
+                    now,
+                ),
+            )
+            return cur.lastrowid
 
     def get_daily_ohlc(
         self, ticker: str, start: str, end: str,

@@ -496,7 +496,7 @@ def _make_coordinator(monkeypatch):
 
     # Instance-level overrides of pipeline internals
     coord._gather_strategy_votes = MagicMock(return_value=[STRATEGY_VOTE])
-    coord._fuse_signals = MagicMock(return_value=("STRONG BUY", 0.8, "CLUSTER"))
+    coord._fuse_signals = MagicMock(return_value=("STRONG BUY", 0.8, "CLUSTER", None))
     coord._run_pead = MagicMock(return_value=None)
     coord._has_alpaca_position = MagicMock(return_value=False)
     coord._last_combined_signal = MagicMock(return_value="HOLD")
