@@ -13,12 +13,13 @@ Covers (R-spec v1.1):
     T3. Logging contract: exactly one WARNING per non-adopted leg,
         literal prefix "F2-gate:", fields ticker/session/leg/reason/
         candidate/fill/kept-fresh present; adoption never WARNs.
-    T4. Integration regression, strategy-override site in
-        analyse_ticker_async: the strategy SL candidate never reaches
-        the gate (SL override removed 2026-09-01 — the RiskAgent is the
-        only stop source), valid TP is adopted; track_trade AND the
-        stored forward signal both receive the gated values.
-    T5. Same regression shape for the strategy-override site in
+    T4. Integration regression, former strategy-override site in
+        analyse_ticker_async: neither the strategy SL nor TP candidate
+        reaches the gate (strategy override fully removed 2026-09-01 —
+        the RiskAgent is the only level source on the analysis paths);
+        track_trade AND the stored forward signal both receive the
+        fresh RiskAgent values.
+    T5. Same regression shape for the former strategy-override site in
         run_combined.
     T6. Static chokepoint check: coordinator.py contains ZERO direct
         assignments to risk["stop_loss"] / risk["take_profit"].
@@ -435,8 +436,8 @@ STRATEGY_VOTE = SimpleNamespace(
     strategy_name="Momentum",
     signal="BUY",
     confidence=80.0,
-    stop_loss=105.0,    # must never reach the gate — SL override removed 2026-09-01
-    take_profit=112.0,  # valid → must be adopted
+    stop_loss=105.0,    # must never reach the gate — strategy override removed 2026-09-01
+    take_profit=112.0,  # must never reach the gate either
 )
 
 
@@ -507,22 +508,22 @@ def _make_coordinator(monkeypatch):
 
 
 def _assert_gated_trade(coord, caplog):
-    """Common assertions: fresh SL untouched (the strategy SL override was
-    removed 2026-09-01 — the candidate never reaches the gate, so no sl-leg
-    F2 line at all), TP still adopted through the gate."""
+    """Common assertions: fresh SL and TP untouched (the strategy override
+    was fully removed 2026-09-01 — neither candidate reaches the gate, so
+    no F2 line at all on the analysis paths)."""
     coord.paper_trader.track_trade.assert_called_once()
     kwargs = coord.paper_trader.track_trade.call_args.kwargs
     assert kwargs["stop_loss"] == FRESH_SL, "RiskAgent SL is the only stop source"
-    assert kwargs["take_profit"] == 112.0, "valid TP adopted"
+    assert kwargs["take_profit"] == FRESH_TP, "RiskAgent TP is the only TP source"
 
-    assert _warnings(caplog) == [], "no sl candidate offered → no F2 WARNING"
-    assert "leg=sl" not in caplog.text, "strategy SL must never reach the gate"
+    assert _warnings(caplog) == [], "no candidates offered → no F2 WARNING"
+    assert "F2-gate" not in caplog.text, "strategy levels must never reach the gate"
 
 
 # ── T5: run_combined strategy-override site ──────────────────────────────
 
 
-def test_run_combined_strategy_sl_removed_tp_gated(monkeypatch, caplog):
+def test_run_combined_strategy_override_removed(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     coord = _make_coordinator(monkeypatch)
 
@@ -542,14 +543,14 @@ def test_run_combined_strategy_sl_removed_tp_gated(monkeypatch, caplog):
 
     _assert_gated_trade(coord, caplog)
     assert result["risk"]["stop_loss"] == FRESH_SL
-    assert result["risk"]["take_profit"] == 112.0
+    assert result["risk"]["take_profit"] == FRESH_TP
     assert result["execution"] == {"trade_id": "t-1", "price": 100.0}
 
 
 # ── T4: analyse_ticker_async strategy-override site ──────────────────────
 
 
-def test_analyse_ticker_async_strategy_sl_removed_tp_gated(monkeypatch, caplog):
+def test_analyse_ticker_async_strategy_override_removed(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     coord = _make_coordinator(monkeypatch)
 
@@ -569,13 +570,13 @@ def test_analyse_ticker_async_strategy_sl_removed_tp_gated(monkeypatch, caplog):
 
     _assert_gated_trade(coord, caplog)
     assert result["risk"]["stop_loss"] == FRESH_SL
-    assert result["risk"]["take_profit"] == 112.0
+    assert result["risk"]["take_profit"] == FRESH_TP
 
     # Gated values also reach the stored forward row (signal mode)
     coord.signal_logger.store_forward_signal.assert_called_once()
     fwd_row = coord.signal_logger.store_forward_signal.call_args.args[0]
     assert fwd_row["stop_loss"] == FRESH_SL
-    assert fwd_row["take_profit"] == 112.0
+    assert fwd_row["take_profit"] == FRESH_TP
 
 
 # ── T6: static chokepoint check (R §9c) ──────────────────────────────────

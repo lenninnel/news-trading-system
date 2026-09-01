@@ -50,8 +50,10 @@ The cluster-fused paths cover signal_path ∈ {CLUSTER, CLUSTER_PARTIAL,
 FUSION_FALLBACK} — every path that takes votes from Momentum + Pullback +
 NewsCatalyst and emits an ensemble verdict.  This is intentionally
 distinct from ``strat_name`` (= router primary), which still drives the
-TP override and the per-strategy portfolio caps but does *not*
-identify the signal source.
+per-strategy portfolio caps but does *not* identify the signal source.
+(The strategy SL/TP override was removed 2026-09-01 — SL and TP on the
+analysis paths come solely from the RiskAgent; only forward-origin
+candidates still route through level_gate.)
 """
 
 from __future__ import annotations
@@ -1514,15 +1516,6 @@ class Coordinator:
             )
             print(f"  Strategy votes: {summary}")
 
-        # Router-selected vote — still drives the downstream take-profit
-        # override (the cluster decides direction/confidence, the primary
-        # strategy provides the TP level; stops come solely from the
-        # RiskAgent ATR path since 2026-09-01).
-        strategy_result = next(
-            (r for r in strategy_votes if r.strategy_name == strat_name),
-            None,
-        )
-
         # --- Fuse via cluster detector (falls back to combine_signals) ---
         combined_signal, conf, signal_path, vote_ctx = self._fuse_signals(
             ticker,
@@ -1593,23 +1586,14 @@ class Coordinator:
             regime=_effective_regime,
         )
 
-        # Override TP with the strategy-specific value when available —
-        # candidates route through the F2 chokepoint gate (level_gate.py).
-        # The strategy SL override was removed 2026-09-01: since the
-        # level-integrity invariant v2 it was rejected on every attempt
-        # (audited: 0 adoptions in the journal since 2026-08-24, all
-        # executed stops match the fresh RiskAgent calc). The RiskAgent
-        # ATR path is the only stop source.
-        if strategy_result is not None and not risk["skipped"]:
-            _gate_ctx = {
-                "ticker": ticker,
-                "session": session,
-                "origin": "strategy",
-                "fill_valid": bool(price_is_live and price and price > 0),
-            }
-            apply_level_override(
-                risk, "tp", strategy_result.take_profit, price, _gate_ctx,
-            )
+        # Strategy SL/TP override removed 2026-09-01: the SL leg had been
+        # rejected on every attempt since invariant v2 (audited: 0 journal
+        # adoptions since 2026-08-24, all executed stops match the fresh
+        # RiskAgent calc); the TP leg — ungated by model_mismatch — was
+        # silently adopting stale-price×1.04 levels (all 4 executed BUYs
+        # since 2026-08-24). The RiskAgent ATR path is now the only source
+        # for both levels on this path. Forward-origin gating (level_gate)
+        # is untouched.
 
         if verbose:
             if risk["skipped"]:
@@ -1948,15 +1932,6 @@ class Coordinator:
             session=session, regime=_regime_name,
         )
 
-        # Router-selected vote — drives the downstream take-profit
-        # override (the cluster decides direction/confidence, the primary
-        # strategy provides the TP level; stops come solely from the
-        # RiskAgent ATR path since 2026-09-01).
-        strategy_result = next(
-            (r for r in strategy_votes if r.strategy_name == strat_name),
-            None,
-        )
-
         # ── PEAD check (no API calls — pure data) ─────────────────────
         pead_result = self._run_pead(ticker, session=session)
 
@@ -2061,21 +2036,9 @@ class Coordinator:
                 regime=regime_info.get("regime"),
             )
 
-        # Override TP with the strategy-specific value when available —
-        # candidates route through the F2 chokepoint gate (level_gate.py).
-        # Strategy SL override removed 2026-09-01 (dead since invariant
-        # v2 — see the sync run_combined() twin above); the RiskAgent
-        # ATR path is the only stop source.
-        if strategy_result is not None and not risk["skipped"]:
-            _gate_ctx = {
-                "ticker": ticker,
-                "session": session,
-                "origin": "strategy",
-                "fill_valid": bool(price_is_live and price and price > 0),
-            }
-            apply_level_override(
-                risk, "tp", strategy_result.take_profit, price, _gate_ctx,
-            )
+        # Strategy SL/TP override removed 2026-09-01 (see the sync
+        # run_combined() twin above); the RiskAgent ATR path is the only
+        # source for both levels here. Forward-origin gating is untouched.
 
         # --- Execution ---
         execution = None
