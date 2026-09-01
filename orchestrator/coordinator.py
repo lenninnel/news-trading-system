@@ -50,7 +50,7 @@ The cluster-fused paths cover signal_path ∈ {CLUSTER, CLUSTER_PARTIAL,
 FUSION_FALLBACK} — every path that takes votes from Momentum + Pullback +
 NewsCatalyst and emits an ensemble verdict.  This is intentionally
 distinct from ``strat_name`` (= router primary), which still drives the
-SL/TP override and the per-strategy portfolio caps but does *not*
+TP override and the per-strategy portfolio caps but does *not*
 identify the signal source.
 """
 
@@ -1514,10 +1514,10 @@ class Coordinator:
             )
             print(f"  Strategy votes: {summary}")
 
-        # Router-selected vote — still drives the downstream stop-loss /
-        # take-profit override so the risk layer keeps its pre-cluster
-        # behaviour (the cluster decides direction/confidence, the primary
-        # strategy provides the SL/TP levels).
+        # Router-selected vote — still drives the downstream take-profit
+        # override (the cluster decides direction/confidence, the primary
+        # strategy provides the TP level; stops come solely from the
+        # RiskAgent ATR path since 2026-09-01).
         strategy_result = next(
             (r for r in strategy_votes if r.strategy_name == strat_name),
             None,
@@ -1593,8 +1593,13 @@ class Coordinator:
             regime=_effective_regime,
         )
 
-        # Override SL/TP with strategy-specific values when available —
+        # Override TP with the strategy-specific value when available —
         # candidates route through the F2 chokepoint gate (level_gate.py).
+        # The strategy SL override was removed 2026-09-01: since the
+        # level-integrity invariant v2 it was rejected on every attempt
+        # (audited: 0 adoptions in the journal since 2026-08-24, all
+        # executed stops match the fresh RiskAgent calc). The RiskAgent
+        # ATR path is the only stop source.
         if strategy_result is not None and not risk["skipped"]:
             _gate_ctx = {
                 "ticker": ticker,
@@ -1602,9 +1607,6 @@ class Coordinator:
                 "origin": "strategy",
                 "fill_valid": bool(price_is_live and price and price > 0),
             }
-            apply_level_override(
-                risk, "sl", strategy_result.stop_loss, price, _gate_ctx,
-            )
             apply_level_override(
                 risk, "tp", strategy_result.take_profit, price, _gate_ctx,
             )
@@ -1946,9 +1948,10 @@ class Coordinator:
             session=session, regime=_regime_name,
         )
 
-        # Router-selected vote — drives the downstream stop-loss /
-        # take-profit override (the cluster decides direction/confidence,
-        # the primary strategy provides the SL/TP levels).
+        # Router-selected vote — drives the downstream take-profit
+        # override (the cluster decides direction/confidence, the primary
+        # strategy provides the TP level; stops come solely from the
+        # RiskAgent ATR path since 2026-09-01).
         strategy_result = next(
             (r for r in strategy_votes if r.strategy_name == strat_name),
             None,
@@ -2058,8 +2061,11 @@ class Coordinator:
                 regime=regime_info.get("regime"),
             )
 
-        # Override SL/TP with strategy-specific values when available —
+        # Override TP with the strategy-specific value when available —
         # candidates route through the F2 chokepoint gate (level_gate.py).
+        # Strategy SL override removed 2026-09-01 (dead since invariant
+        # v2 — see the sync run_combined() twin above); the RiskAgent
+        # ATR path is the only stop source.
         if strategy_result is not None and not risk["skipped"]:
             _gate_ctx = {
                 "ticker": ticker,
@@ -2067,9 +2073,6 @@ class Coordinator:
                 "origin": "strategy",
                 "fill_valid": bool(price_is_live and price and price > 0),
             }
-            apply_level_override(
-                risk, "sl", strategy_result.stop_loss, price, _gate_ctx,
-            )
             apply_level_override(
                 risk, "tp", strategy_result.take_profit, price, _gate_ctx,
             )

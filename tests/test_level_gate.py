@@ -14,9 +14,10 @@ Covers (R-spec v1.1):
         literal prefix "F2-gate:", fields ticker/session/leg/reason/
         candidate/fill/kept-fresh present; adoption never WARNs.
     T4. Integration regression, strategy-override site in
-        analyse_ticker_async: wrong-side SL falls back to the fresh
-        calc, valid TP is adopted; track_trade AND the stored forward
-        signal both receive the gated values.
+        analyse_ticker_async: the strategy SL candidate never reaches
+        the gate (SL override removed 2026-09-01 — the RiskAgent is the
+        only stop source), valid TP is adopted; track_trade AND the
+        stored forward signal both receive the gated values.
     T5. Same regression shape for the strategy-override site in
         run_combined.
     T6. Static chokepoint check: coordinator.py contains ZERO direct
@@ -434,7 +435,7 @@ STRATEGY_VOTE = SimpleNamespace(
     strategy_name="Momentum",
     signal="BUY",
     confidence=80.0,
-    stop_loss=105.0,    # wrong side of the 100.0 fill → must be rejected
+    stop_loss=105.0,    # must never reach the gate — SL override removed 2026-09-01
     take_profit=112.0,  # valid → must be adopted
 )
 
@@ -506,23 +507,22 @@ def _make_coordinator(monkeypatch):
 
 
 def _assert_gated_trade(coord, caplog):
-    """Common assertions: fresh SL kept, TP adopted, one F2 WARNING."""
+    """Common assertions: fresh SL untouched (the strategy SL override was
+    removed 2026-09-01 — the candidate never reaches the gate, so no sl-leg
+    F2 line at all), TP still adopted through the gate."""
     coord.paper_trader.track_trade.assert_called_once()
     kwargs = coord.paper_trader.track_trade.call_args.kwargs
-    assert kwargs["stop_loss"] == FRESH_SL, "wrong-side SL → fresh calc kept"
+    assert kwargs["stop_loss"] == FRESH_SL, "RiskAgent SL is the only stop source"
     assert kwargs["take_profit"] == 112.0, "valid TP adopted"
 
-    warnings = _warnings(caplog)
-    assert len(warnings) == 1
-    msg = warnings[0].getMessage()
-    assert msg.startswith("F2-gate:")
-    assert "leg=sl" in msg and "reason=wrong_side" in msg
+    assert _warnings(caplog) == [], "no sl candidate offered → no F2 WARNING"
+    assert "leg=sl" not in caplog.text, "strategy SL must never reach the gate"
 
 
 # ── T5: run_combined strategy-override site ──────────────────────────────
 
 
-def test_run_combined_gates_strategy_override(monkeypatch, caplog):
+def test_run_combined_strategy_sl_removed_tp_gated(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     coord = _make_coordinator(monkeypatch)
 
@@ -549,7 +549,7 @@ def test_run_combined_gates_strategy_override(monkeypatch, caplog):
 # ── T4: analyse_ticker_async strategy-override site ──────────────────────
 
 
-def test_analyse_ticker_async_gates_strategy_override(monkeypatch, caplog):
+def test_analyse_ticker_async_strategy_sl_removed_tp_gated(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="orchestrator.level_gate")
     coord = _make_coordinator(monkeypatch)
 

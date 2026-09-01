@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -84,7 +84,7 @@ _REWARD_RISK_RATIO      = 2.0    # 2:1 take-profit
 _MIN_CONFIDENCE         = 30.0   # below this → no position
 
 # ── ATR stop-distance floor (Q-012 Familie 1) ──────────────────────────────────
-# The close-to-close ATR approximation collapses toward 0 on flat/low-vol tape,
+# The former close-to-close ATR approximation collapsed toward 0 on flat/low-vol tape,
 # so `stop_distance = ATR × multiplier` can shrink to ~entry → no downside
 # protection (observed on XOM/CVX/JPM Combined entries, stops only 0.02–0.28%
 # below entry). Floor the stop distance at k = 1.0% of the entry price.
@@ -92,6 +92,11 @@ _MIN_CONFIDENCE         = 30.0   # below this → no position
 # long-stop distribution (P5 = 1.08%): it lifts ONLY the degenerate <0.3% stops
 # and never touches a healthy stop. Not a range, not configurable.
 _ATR_STOP_FLOOR_PCT     = 0.01   # k = 1.0% of entry — minimum stop distance
+
+# Wilder ATR from the daily_ohlc store (replaces the close-to-close proxy,
+# which ran ~44% tighter than true ATR — KW35 stop-origin report).
+_ATR_PERIOD             = 14     # Wilder ATR period
+_ATR_LOOKBACK_DAYS      = 90     # calendar-day window read from daily_ohlc
 _WIN_PROB_BASE          = 0.50   # base win probability (random)
 _WIN_PROB_RANGE         = 0.30   # additional range driven by confidence
 
@@ -482,7 +487,6 @@ class RiskAgent(BaseAgent):
         atr_tp_multiplier: float = ATR_TP_MULTIPLIER,
         account_risk_pct: float = ACCOUNT_RISK_PCT,
         account_balance: float = 10_000.0,
-        prices: "pd.Series | None" = None,
     ) -> dict:
         """
         ATR-based stop-loss and take-profit calculation.
@@ -495,15 +499,12 @@ class RiskAgent(BaseAgent):
             atr_tp_multiplier:   ATR multiplier for take-profit (default 3.0).
             account_risk_pct:    Fraction of account risked per trade (default 0.01).
             account_balance:     Account value in USD.
-            prices:              Optional pre-fetched close prices (avoids API call).
 
         Returns:
             dict with stop_loss, take_profit, atr, stop_distance, rr_ratio,
             position_size_pct, shares.  Returns None values on failure.
         """
-        import pandas as pd
-
-        atr = self._fetch_atr(ticker, prices)
+        atr = self._fetch_atr(ticker)
         if atr is None or atr <= 0:
             log.debug("[%s] ATR unavailable — falling back to fixed stops", ticker)
             return {"atr": None, "atr_available": False}
@@ -555,31 +556,54 @@ class RiskAgent(BaseAgent):
             "atr_available": True,
         }
 
-    def _fetch_atr(
-        self, ticker: str, prices: "pd.Series | None" = None,
-    ) -> float | None:
-        """Compute ATR(14) from price data. Fetches via yfinance if needed."""
-        import pandas as pd
+    def _fetch_atr(self, ticker: str) -> float | None:
+        """
+        Wilder ATR(14) in dollars from the daily_ohlc store.
 
+        True Range per bar: max(H−L, |H−C_prev|, |L−C_prev|); the first
+        ATR is the simple mean of the first 14 TRs, every later bar uses
+        Wilder smoothing ATR_i = (ATR_{i-1}·13 + TR_i) / 14.
+
+        Uses raw ``close`` (not ``adj_close``) — the store convention
+        from Fix D3. Needs ≥ 15 bars; on fewer, returns None so the
+        caller's fixed-stop fallback takes over.
+        """
         try:
-            if prices is not None and len(prices) >= 15:
-                close = prices
-            else:
-                yf_ticker = self._yf_ticker(ticker)
-                data = yf.download(yf_ticker, period="1mo", interval="1d", progress=False)
-                if data.empty or len(data) < 15:
-                    return None
-                close = data["Close"].squeeze()
-
-            # ATR approximation using close-to-close (no High/Low needed)
-            daily_range = close.pct_change().abs().dropna()
-            if len(daily_range) < 14:
-                return None
-            atr_pct = float(daily_range.rolling(14).mean().iloc[-1])
-            return atr_pct * float(close.iloc[-1])
+            end = datetime.now(timezone.utc).date()
+            start = end - timedelta(days=_ATR_LOOKBACK_DAYS)
+            bars = self._db.get_daily_ohlc(ticker, start.isoformat(), end.isoformat())
         except Exception as exc:
-            log.debug("[%s] ATR fetch failed: %s", ticker, exc)
+            log.warning("[%s] ATR unavailable — daily_ohlc read failed: %s", ticker, exc)
             return None
+
+        if len(bars) < _ATR_PERIOD + 1:
+            log.warning(
+                "[%s] ATR unavailable — only %d daily_ohlc bars in store "
+                "(need %d); falling back to fixed stops",
+                ticker, len(bars), _ATR_PERIOD + 1,
+            )
+            return None
+
+        trs: list[float] = []
+        for prev, cur in zip(bars, bars[1:]):
+            high, low, prev_close = cur["high"], cur["low"], prev["close"]
+            if high is None or low is None or prev_close is None:
+                log.warning(
+                    "[%s] ATR unavailable — NULL high/low/close in daily_ohlc "
+                    "(date=%s); falling back to fixed stops",
+                    ticker, cur.get("date"),
+                )
+                return None
+            trs.append(max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            ))
+
+        atr = sum(trs[:_ATR_PERIOD]) / _ATR_PERIOD
+        for tr in trs[_ATR_PERIOD:]:
+            atr = (atr * (_ATR_PERIOD - 1) + tr) / _ATR_PERIOD
+        return atr
 
     # ------------------------------------------------------------------
     # Historical Kelly Criterion
