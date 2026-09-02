@@ -47,16 +47,15 @@ from storage.database import Database
 def _send_telegram(msg: str) -> None:
     """Best-effort Telegram alert mirroring emergency_stop.py's pattern."""
     try:
-        import yaml
-        watchlist_path = PROJECT_ROOT / "config" / "watchlist.yaml"
-        if not watchlist_path.exists():
-            return
-        with open(watchlist_path, encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
         from notifications.telegram_bot import TelegramNotifier
-        notifier = TelegramNotifier.from_config(cfg)
-        if notifier:
-            notifier.send_message(msg)
+        # Env-first (same credentials as the daemon); watchlist.yaml ships
+        # with telegram.enabled=false, so from_config alone never sends.
+        notifier = TelegramNotifier.from_env()
+        if notifier is None:
+            print("  [Telegram] not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+            return
+        if not notifier.send_message(msg):
+            print("  [Telegram] alert could not be delivered (see log)")
     except Exception as exc:
         print(f"  [Telegram] alert failed: {exc}")
 

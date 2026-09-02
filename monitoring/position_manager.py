@@ -50,6 +50,10 @@ _TRAILING_LOCK_PCT = 1.0         # trail locks in at least 1% gain
 # evaluate exits against a stale price.
 _MAX_BAR_AGE_MINUTES = 5
 
+# Consecutive market-hours cycles without a broker connection before the
+# outage is escalated to Telegram (3 × 60s = ~3 minutes).
+_RECONNECT_ALERT_AFTER = 3
+
 # Stuck-order cooldown: after a stop/TP SELL hits IBKR's STOP_MAX_WAIT and
 # is left in flight, we don't want to evaluate the same position again on
 # the next 60s cycle (which would submit a duplicate order). Wait this
@@ -99,6 +103,19 @@ class PositionManager:
         # row is a dead feed — the streak is carried in both the journal
         # line and the Telegram escalation so severity is readable.
         self._stale_streaks: dict[str, int] = {}
+
+        # Broker-connection outage tracking: consecutive cycles in which
+        # the trader could not be (re)connected during market hours. One
+        # failed reconnect is a Gateway hiccup; several in a row means no
+        # stop-loss is enforced — that is alerted once per outage, and
+        # the recovery is alerted once so the channel shows the full arc.
+        self._reconnect_failures: int = 0
+        self._reconnect_alerted: bool = False
+
+        # Exit orders IBKR cancelled/rejected: ticker → alerted flag so a
+        # rejected stop-loss SELL is reported once per ticker, not every
+        # 60s retry cycle. Cleared when a SELL for that ticker fills.
+        self._exit_rejected_alerted: set[str] = set()
 
         # Signal logger for audit trail
         from analytics.signal_logger import SignalLogger
@@ -363,6 +380,37 @@ class PositionManager:
             return False
         return True
 
+    def _track_broker_connection(self, connected: bool) -> None:
+        """Escalate a persistent broker outage to Telegram, once per outage.
+
+        Called once per market-hours cycle with the reconnect outcome.
+        Fires after ``_RECONNECT_ALERT_AFTER`` consecutive failures (a
+        single failure is a normal Gateway hiccup) and sends one recovery
+        message when the connection comes back. Never raises.
+        """
+        if connected:
+            if self._reconnect_alerted:
+                self._send_alert(
+                    f"✅ IBKR connection restored after "
+                    f"{self._reconnect_failures} failed cycle(s) — "
+                    f"stop-loss monitoring active again."
+                )
+            self._reconnect_failures = 0
+            self._reconnect_alerted = False
+            return
+
+        self._reconnect_failures += 1
+        if (self._reconnect_failures >= _RECONNECT_ALERT_AFTER
+                and not self._reconnect_alerted):
+            self._reconnect_alerted = True
+            self._send_alert(
+                f"🚨 IBKR CONNECTION LOST: PositionManager could not "
+                f"reconnect for {self._reconnect_failures} consecutive "
+                f"cycles (~{self._reconnect_failures * self._interval // 60} min). "
+                f"Stop-loss / take-profit are NOT enforced until it "
+                f"reconnects — check ibgateway."
+            )
+
     def _get_open_positions(self) -> list[dict]:
         """
         Get open positions with stop_loss/take_profit from trade history.
@@ -373,6 +421,7 @@ class PositionManager:
         connected = self._ensure_trader_connected()
         log.info("PM heartbeat: ensure_connected=%s, is_connected=%s",
                  connected, getattr(self._trader, "is_connected", lambda: "n/a")())
+        self._track_broker_connection(connected)
         if not connected:
             return []
         try:
@@ -595,6 +644,7 @@ class PositionManager:
         if filled:
             msg = f"{alert_emoji} {alert_label} hit: {ticker} {pnl_pct:+.1f}%"
             self._send_alert(msg)
+            self._exit_rejected_alerted.discard(ticker)
             self._log_event(
                 ticker, "SELL", current_price,
                 f"{trigger}_triggered at ${level:.2f}",
@@ -632,6 +682,17 @@ class PositionManager:
             "[%s] %s SELL did not fill (%s); next cycle will retry",
             ticker, alert_label, reason,
         )
+        # A broker-side cancellation is a rejection (insufficient
+        # permissions, halted symbol, ...), not a slow fill: retrying
+        # every cycle will not fix it, so say so — once per ticker.
+        if outcome == "cancelled" and ticker not in self._exit_rejected_alerted:
+            self._exit_rejected_alerted.add(ticker)
+            self._send_alert(
+                f"🚨 EXIT ORDER REJECTED: {ticker} {alert_label} SELL was "
+                f"cancelled by the broker ({reason}). The position is "
+                f"still open; retrying every cycle. Check IBKR Gateway / "
+                f"account state."
+            )
         return None
 
     # ------------------------------------------------------------------

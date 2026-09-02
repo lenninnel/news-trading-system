@@ -1,0 +1,24 @@
+# NTS watchdog — alerts on the ABSENCE of expected events (daemon down,
+# missed session, stale OHLC, missing backup, IB Gateway unreachable).
+# Independent of the daemon: stdlib-only script, plain-text Telegram,
+# own state file next to the DB (watchdog_state.json).
+#
+# Its own failure (crash, or a due message that could not be delivered
+# → exit 2) is routed through nts-alert@ so the watchdog never fails
+# silently; the daily 06:00 UTC status block is its liveness signal.
+[Unit]
+Description=NTS watchdog (absence alerting)
+After=network-online.target
+OnFailure=nts-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trading/news-trading-system
+EnvironmentFile=/home/trading/news-trading-system/.env
+ExecStart=/usr/bin/python3 /home/trading/news-trading-system/scripts/watchdog.py
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

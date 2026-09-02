@@ -389,7 +389,7 @@ def main() -> None:
     notifier = None
     if args.notify:
         from notifications.telegram_bot import TelegramNotifier
-        notifier = TelegramNotifier.from_config(cfg)
+        notifier = TelegramNotifier.from_env(cfg)
 
     monitor = HealthMonitor(cfg=cfg, notifier=notifier)
 

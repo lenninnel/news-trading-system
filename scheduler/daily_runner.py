@@ -1122,6 +1122,15 @@ class DailyScheduler:
                     if not self._position_manager_trader.ensure_connected():
                         log.error("IBKR reconnect failed — session will run without execution")
                         print("[scheduler] WARNING: IBKR reconnect failed", flush=True)
+                        if self._tg:
+                            try:
+                                self._tg._send(
+                                    f"\U0001f6a8 *IBKR reconnect failed before {run_name}*\n"
+                                    "Session runs without broker connection — "
+                                    "no execution, no stop enforcement. Check ibgateway."
+                                )
+                            except Exception:
+                                pass
             except Exception as exc:
                 log.warning("IBKR ensure_connected check failed (non-fatal): %s", exc)
 
@@ -1361,6 +1370,7 @@ class DailyScheduler:
         results = batch["results"]
         signals = []
         trades = 0
+        unfilled = []
         for r in results:
             if r is None:
                 continue
@@ -1368,8 +1378,16 @@ class DailyScheduler:
             conf = r.get("confidence", 0)
             ticker = r.get("ticker", "?")
             signals.append(f"  {ticker}: {sig} ({conf:.0%})")
-            if (r.get("execution") or {}).get("trade_id"):
+            execution = r.get("execution") or {}
+            if execution.get("trade_id"):
                 trades += 1
+            elif execution.get("outcome") in ("cancelled", "timeout"):
+                # Order reached the broker and did not fill (rejected /
+                # cancelled / timed out) — silent otherwise.
+                unfilled.append(
+                    f"  \u26a0\ufe0f {ticker} {execution.get('action', '?')} "
+                    f"{execution.get('skip_reason') or execution['outcome']}"
+                )
 
         lines = [
             f"\u2705 *{run_name}* complete",
@@ -1378,6 +1396,9 @@ class DailyScheduler:
         ]
         if trades:
             lines.append(f"Trades executed: {trades}")
+        if unfilled:
+            lines.append(f"\U0001f6a8 Orders NOT filled ({len(unfilled)}):")
+            lines.extend(unfilled[:6])
         if signals:
             lines.append("")
             lines.extend(signals[:12])

@@ -196,7 +196,11 @@ class TestStopLoss:
         with patch.object(pm, "_fetch_current_price", return_value=189.0):
             results = pm._check_all_positions()
 
-        notifier.send_price_alert.assert_not_called()
+        # No false "Stop-loss hit" — the only alert allowed here is the
+        # broker-rejection notice (tests/test_alert_gaps.py covers its dedupe).
+        for call in notifier.send_price_alert.call_args_list:
+            assert "hit" not in call[0][0]
+            assert call[0][0].startswith("🚨 EXIT ORDER REJECTED")
         assert results == []
 
 

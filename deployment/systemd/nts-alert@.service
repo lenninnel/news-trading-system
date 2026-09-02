@@ -1,0 +1,18 @@
+# Telegram alert for a failed systemd *user* unit (template).
+#
+# Wire any unit into Telegram with one line in its [Unit] section:
+#     OnFailure=nts-alert@%n.service
+# %n carries the ".service" suffix, so the instance name is e.g.
+# nts-alert@nts-ohlc-ingest.service.service — that is correct.
+#
+# Uses /usr/bin/python3 on purpose (stdlib-only script): the alert must
+# still fire when the application venv is what broke.
+[Unit]
+Description=NTS Telegram alert for failed unit %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trading/news-trading-system
+EnvironmentFile=/home/trading/news-trading-system/.env
+ExecStart=/usr/bin/python3 /home/trading/news-trading-system/scripts/nts_alert.py %i
+TimeoutStartSec=60

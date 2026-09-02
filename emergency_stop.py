@@ -174,23 +174,35 @@ def _log_to_db(action: str, reason: str | None) -> None:
 def _send_telegram(action: str, reason: str | None) -> None:
     """Send a Telegram alert about the kill-switch event (best-effort)."""
     try:
+        from notifications.telegram_bot import TelegramNotifier
+        # Env-first: the daemon and the ops units get their credentials
+        # from .env, and watchlist.yaml ships with telegram.enabled=false.
+        notifier = TelegramNotifier.from_env(_load_watchlist_cfg())
+        if notifier is None:
+            print("  [Telegram] not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+            return
+        icon = "🛑" if action != "resume" else "✅"
+        msg  = (
+            f"{icon} KILL SWITCH: {action.upper()}\n"
+            + (f"Reason: {reason}" if reason else "")
+        )
+        if not notifier.send_message(msg):
+            print("  [Telegram] Alert could not be delivered (see log)")
+    except Exception as exc:
+        print(f"  [Telegram] Alert failed: {exc}")
+
+
+def _load_watchlist_cfg() -> dict | None:
+    """Best-effort watchlist.yaml load (only used for the dashboard URL)."""
+    try:
         import yaml
         watchlist_path = PROJECT_ROOT / "config" / "watchlist.yaml"
         if not watchlist_path.exists():
-            return
+            return None
         with open(watchlist_path, encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
-        from notifications.telegram_bot import TelegramNotifier
-        notifier = TelegramNotifier.from_config(cfg)
-        if notifier:
-            icon = "🛑" if action != "resume" else "✅"
-            msg  = (
-                f"{icon} KILL SWITCH: {action.upper()}\n"
-                + (f"Reason: {reason}" if reason else "")
-            )
-            notifier.send_message(msg)
-    except Exception as exc:
-        print(f"  [Telegram] Alert failed: {exc}")
+            return yaml.safe_load(fh) or None
+    except Exception:
+        return None
 
 
 def cmd_stop_trading(reason: str | None) -> None:
