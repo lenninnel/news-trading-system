@@ -1,6 +1,9 @@
 [Unit]
 Description=NTS daily Polygon OHLC incremental ingest
 After=network.target
+# No OnFailure=telegram-alert@%n here: that template is a SYSTEM unit with a
+# root-only env file, unreachable from this --user unit. The script itself
+# sends a Telegram alert on every failure path (app credentials from .env).
 
 [Service]
 Type=oneshot

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Daily OHLC ingest from Polygon.io into the news_trading.db `daily_ohlc` table.
 
-Purpose: feed Research (Q-003 sizing, Q-Regime Stage-4) a clean point-in-time
-US daily price history. Fully decoupled from the live trading path — only
-the `daily_ohlc` table is touched, and no other module reads from it yet.
+Purpose: maintain a clean US daily price history. Since 2026-09-01 the live
+path depends on it: RiskAgent computes Wilder ATR(14) — and therefore stops,
+take-profits and sizing — from `daily_ohlc`. Staleness here means stale stops.
 
 Universe: US-20 only — `config/watchlist.yaml::us_tickers` (11 names) plus
 the US-only PEAD tickers in `config/settings.PEAD_TICKERS` (those without
@@ -11,10 +11,24 @@ a "." suffix; 9 names). Asserted to be exactly 20 uppercase tickers.
 
 Modes
 -----
---backfill     Fetch OHLC_BACKFILL_YEARS back to yesterday for all 20
+--backfill     Fetch OHLC_BACKFILL_YEARS back to the window end for all 20
                tickers and upsert.
 --incremental  Fetch a trailing 7-CALENDAR-DAY window for all 20 tickers
                and upsert. Idempotent; self-heals small gaps.
+
+Window end / expected freshness
+-------------------------------
+The window ends on *today* (UTC) once the US session is over
+(>= SAME_DAY_CUTOFF_UTC, 22:00 UTC — close is 20:00 UTC in DST, 21:00 UTC
+in winter), otherwise on yesterday. The nightly timer fires 22:30 UTC, so
+the production run always includes the just-closed session: after a run on
+trading day T, MAX(date) in the store must be T.
+
+Freshness gate: after upserting, every universe ticker's MAX(date) in the
+store must equal the last US trading day <= window end
+(data/market_calendar.py). Any stale ticker fails the run — a "success"
+that wrote no new rows is no longer possible. Unscheduled market closures
+(not in the calendar) cause one spurious failure; see market_calendar.py.
 
 Hygiene
 -------
@@ -30,13 +44,15 @@ Rows are FLAGGED, never dropped:
   - quality_flag=NULL                otherwise.
 
 Exit codes:
-    0 = ok
-    1 = aborted (universe mismatch / Polygon key missing / DB write failure)
+    0 = ok (all tickers fetched AND store is fresh through the expected day)
+    1 = aborted (universe mismatch / Polygon key missing / DB write failure /
+        fetch failure / freshness gate: stale MAX(date) for >=1 ticker)
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +73,7 @@ from config.settings import (  # noqa: E402
     PEAD_TICKERS,
     POLYGON_API_KEY,
 )
+from data.market_calendar import last_us_trading_day  # noqa: E402
 from data.polygon_feed import PolygonFeed  # noqa: E402
 from storage.database import Database  # noqa: E402
 
@@ -144,20 +161,72 @@ def flag_bars(bars: list[dict], extreme_pct: float) -> tuple[list[dict], list[tu
 # Date ranges
 # ---------------------------------------------------------------------------
 
-def _yesterday_utc() -> date:
-    return datetime.now(timezone.utc).date() - timedelta(days=1)
+# US session close is 20:00 UTC (DST) / 21:00 UTC (winter). Past this cutoff
+# the just-closed session's daily bar is fetched same-day; the nightly timer
+# (22:30 UTC) is always past it. Earlier runs end the window on yesterday so
+# an in-progress session can never be ingested as a partial bar.
+SAME_DAY_CUTOFF_UTC = 22
+
+
+def _window_end(now: datetime | None = None) -> date:
+    now = now or datetime.now(timezone.utc)
+    if now.hour >= SAME_DAY_CUTOFF_UTC:
+        return now.date()
+    return now.date() - timedelta(days=1)
 
 
 def backfill_range(years: int = OHLC_BACKFILL_YEARS) -> tuple[str, str]:
-    end = _yesterday_utc()
+    end = _window_end()
     start = end - timedelta(days=years * 365)
     return start.isoformat(), end.isoformat()
 
 
 def incremental_range() -> tuple[str, str]:
-    end = _yesterday_utc()
+    end = _window_end()
     start = end - timedelta(days=7)
     return start.isoformat(), end.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Failure alerting
+# ---------------------------------------------------------------------------
+
+def _alert_failure(message: str) -> None:
+    """Best-effort Telegram alert on ingest failure. Never raises — the
+    non-zero exit code remains the source of truth for the run status."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        logger.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — failure alert not sent")
+        return
+    try:
+        from notifications.telegram_bot import TelegramNotifier
+        TelegramNotifier(bot_token=token, chat_id=chat_id).send_error(
+            f"nts-ohlc-ingest FAILED: {message}"
+        )
+    except Exception as exc:
+        logger.warning("Telegram failure alert could not be sent: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate
+# ---------------------------------------------------------------------------
+
+def check_freshness(db, universe: list[str], end: str) -> tuple[str, list[tuple[str, str | None]]]:
+    """Verify the store holds the expected latest session for every ticker.
+
+    Returns (expected_date, stale) where `stale` lists (ticker, max_date)
+    for every ticker whose stored MAX(date) is missing or older than the
+    last US trading day <= `end`. Empty `stale` == fresh.
+    """
+    expected = last_us_trading_day(date.fromisoformat(end)).isoformat()
+    max_dates = db.get_daily_ohlc_max_dates(universe)
+    stale = [
+        (t, max_dates.get(t))
+        for t in universe
+        if max_dates.get(t) is None or max_dates[t] < expected
+    ]
+    return expected, stale
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +236,7 @@ def incremental_range() -> tuple[str, str]:
 def run(mode: str, years: int | None = None) -> int:
     if not POLYGON_API_KEY:
         logger.error("POLYGON_API_KEY is not set — refusing to run")
+        _alert_failure("POLYGON_API_KEY is not set")
         return 1
 
     universe = build_us20_universe()
@@ -176,6 +246,7 @@ def run(mode: str, years: int | None = None) -> int:
             "Expected exactly 20 tickers in US-20 universe, got %d. Aborting.",
             len(universe),
         )
+        _alert_failure(f"universe mismatch: expected 20 tickers, got {len(universe)}")
         return 1
 
     if mode == "backfill":
@@ -241,7 +312,24 @@ def run(mode: str, years: int | None = None) -> int:
         for t, d, f in flagged_detail:
             logger.info("  %s %s %s", t, d, f)
 
-    return 0 if not tickers_failed else 1
+    expected, stale = check_freshness(db, universe, end)
+    if stale:
+        stale_str = ", ".join(f"{t}={d or 'no rows'}" for t, d in stale)
+        logger.error(
+            "FRESHNESS GATE FAILED: expected MAX(date) >= %s (last US trading "
+            "day <= window end %s), but %d ticker(s) are stale: %s",
+            expected, end, len(stale), stale_str,
+        )
+        _alert_failure(
+            f"freshness gate: {len(stale)} ticker(s) below expected {expected}: {stale_str}"
+        )
+        return 1
+    logger.info("Freshness gate passed: all %d tickers at >= %s", len(universe), expected)
+
+    if tickers_failed:
+        _alert_failure(f"Polygon fetch failed for: {', '.join(tickers_failed)}")
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -269,7 +357,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.years is not None and args.incremental:
         parser.error("--years is only valid with --backfill")
     mode = "backfill" if args.backfill else "incremental"
-    return run(mode, years=args.years)
+    try:
+        return run(mode, years=args.years)
+    except Exception as exc:
+        logger.exception("Ingest crashed")
+        _alert_failure(f"crashed with {type(exc).__name__}: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
