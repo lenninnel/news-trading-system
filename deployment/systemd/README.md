@@ -41,7 +41,12 @@ ssh trading-vps 'journalctl --user -u nts-ohlc-ingest -n 30 --no-pager'
 - nts-mcp.service
 - nts-dashboard.service
 - nts-backup.timer (daily 00:30 UTC)
-- nts-ohlc-ingest.timer (daily 22:30 UTC — Polygon daily-bar incremental ingest into `daily_ohlc`)
+- nts-ohlc-ingest.timer (daily 22:30 UTC — Polygon daily-bar incremental ingest into `daily_ohlc`.
+  22:30 UTC is after the US close in both DST and winter, and the ingest window includes
+  *today* past 22:00 UTC, so after a run on trading day T the store's MAX(date) must be T.
+  A freshness gate enforces that per ticker against the US trading calendar
+  (`data/market_calendar.py`); a stale store exits 1 and sends a Telegram alert via the
+  app credentials — a silent "ok" on zero new rows is not possible.)
 - nts-preann-estimates.timer (daily 11:00 UTC — Q-013 recorded-only Benzinga T-1 pre-announcement estimate snapshot into `benzinga_estimate_preann_snapshot`; standalone, off the trading path)
 
 The unit files for the four existing nts-* services are NOT

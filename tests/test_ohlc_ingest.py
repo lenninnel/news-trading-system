@@ -234,3 +234,84 @@ def test_polygon_feed_survives_adjusted_failure(monkeypatch):
     assert len(bars) == 1
     assert bars[0]["close"] == 100.5
     assert bars[0]["adj_close"] is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Window end + freshness gate
+# ──────────────────────────────────────────────────────────────────────────────
+
+from datetime import date, datetime, timezone
+
+import scripts.ingest_ohlc as ingest
+from data.market_calendar import last_us_trading_day
+
+
+def test_window_end_same_day_after_cutoff():
+    """After 22:00 UTC the just-closed session is included in the window."""
+    late = datetime(2026, 8, 31, 22, 30, tzinfo=timezone.utc)
+    assert ingest._window_end(late) == date(2026, 8, 31)
+
+
+def test_window_end_yesterday_before_cutoff():
+    """Before the cutoff (market possibly still open) the window ends yesterday
+    so a partial in-progress bar can never be ingested."""
+    midday = datetime(2026, 8, 31, 14, 0, tzinfo=timezone.utc)
+    assert ingest._window_end(midday) == date(2026, 8, 30)
+
+
+def test_check_freshness_passes_when_current(tmp_db):
+    tmp_db.upsert_daily_ohlc([_bar(ticker="AAPL", date="2026-08-31")])
+    expected, stale = ingest.check_freshness(tmp_db, ["AAPL"], "2026-08-31")
+    assert expected == "2026-08-31"
+    assert stale == []
+
+
+def test_check_freshness_rolls_expectation_over_weekend(tmp_db):
+    """Window ending Sunday only expects Friday's bar — weekend is no lag."""
+    tmp_db.upsert_daily_ohlc([_bar(ticker="AAPL", date="2026-08-28")])
+    expected, stale = ingest.check_freshness(tmp_db, ["AAPL"], "2026-08-30")
+    assert expected == "2026-08-28"
+    assert stale == []
+
+
+def test_check_freshness_flags_stale_and_missing(tmp_db):
+    """The 31.08 incident shape: store stuck on Friday while Monday closed."""
+    tmp_db.upsert_daily_ohlc([_bar(ticker="AAPL", date="2026-08-28")])
+    expected, stale = ingest.check_freshness(tmp_db, ["AAPL", "MSFT"], "2026-08-31")
+    assert expected == "2026-08-31"
+    assert ("AAPL", "2026-08-28") in stale
+    assert ("MSFT", None) in stale
+
+
+def _run_with_fake_feed(tmp_db, monkeypatch, bar_date: str, alerts: list):
+    """Drive ingest.run('incremental') with a feed that returns one bar per
+    ticker dated `bar_date`. Returns the exit code."""
+    class FakeFeed:
+        def get_daily_aggs(self, ticker, start, end):
+            return [{
+                "date": bar_date, "open": 100.0, "high": 101.0,
+                "low": 99.0, "close": 100.5, "adj_close": 100.5,
+                "volume": 1_000_000,
+            }]
+
+    monkeypatch.setattr(ingest, "POLYGON_API_KEY", "test-key")
+    monkeypatch.setattr(ingest, "PolygonFeed", FakeFeed)
+    monkeypatch.setattr(ingest, "Database", lambda: tmp_db)
+    monkeypatch.setattr(ingest, "_alert_failure", alerts.append)
+    return ingest.run("incremental")
+
+
+def test_run_fails_on_stale_data(tmp_db, monkeypatch):
+    """A run whose freshest bar is older than the expected session exits 1
+    and alerts — a silent 'ok' on zero new rows is no longer possible."""
+    stale_day = "2020-01-02"  # far older than any expected session
+    rc = _run_with_fake_feed(tmp_db, monkeypatch, stale_day, alerts := [])
+    assert rc == 1
+    assert alerts and "freshness gate" in alerts[0]
+
+
+def test_run_passes_on_fresh_data(tmp_db, monkeypatch):
+    fresh_day = last_us_trading_day(ingest._window_end()).isoformat()
+    rc = _run_with_fake_feed(tmp_db, monkeypatch, fresh_day, alerts := [])
+    assert rc == 0
+    assert alerts == []

@@ -2203,6 +2203,30 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_daily_ohlc_max_dates(self, tickers: list[str]) -> dict[str, str | None]:
+        """Latest stored bar date per ticker (None for tickers with no rows).
+
+        Freshness source of truth for the ingest gate: reads what actually
+        landed in the store, so a silent write failure surfaces too.
+        """
+        result: dict[str, str | None] = {t.upper(): None for t in tickers}
+        if not result:
+            return result
+        placeholders = ",".join("?" for _ in result)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ticker, MAX(date) AS max_date
+                FROM daily_ohlc
+                WHERE ticker IN ({placeholders})
+                GROUP BY ticker
+                """,
+                tuple(result),
+            ).fetchall()
+        for r in rows:
+            result[r["ticker"]] = r["max_date"]
+        return result
+
     def _select(self, sql: str, params: tuple = ()) -> list[dict]:
         """Run a raw SELECT and return rows as dicts."""
         with self._connect() as conn:
