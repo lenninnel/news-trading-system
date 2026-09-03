@@ -641,6 +641,39 @@ class PositionManager:
         )
         outcome = (result or {}).get("outcome")
 
+        # Partial exit (2026-09-03): the trader recorded the filled
+        # portion in trade_history / portfolio_positions; the position is
+        # still open for the remainder.  Never treat this as a clean
+        # close — the trailing stop must survive and, on "stuck", the
+        # in-flight remainder must not be doubled by a retry.
+        if result and result.get("partial"):
+            filled_sh = result.get("filled_shares") or result.get("shares")
+            requested = result.get("requested_shares")
+            fill_px = result.get("price")
+            if outcome == "stuck":
+                self._stuck_orders[ticker] = time.monotonic()
+                tail = (
+                    "remainder still in flight at IBKR (NOT cancelled) — "
+                    "late fills are recorded automatically; check Gateway"
+                )
+            else:
+                tail = "remainder cancelled — next cycle retries the rest"
+            msg = (
+                f"⚠️ PARTIAL EXIT: {ticker} {alert_label} SELL filled "
+                f"{filled_sh}/{requested} sh @ ${fill_px:.2f}; {tail}"
+            )
+            self._send_alert(msg)
+            self._log_event(
+                ticker, "SELL", current_price,
+                f"{trigger}_partial_{filled_sh}_of_{requested} at ${level:.2f}",
+            )
+            return {
+                "ticker": ticker, "action": f"{trigger}_partial",
+                "price": current_price, "pnl_pct": pnl_pct,
+                "filled_shares": filled_sh, "requested_shares": requested,
+                "outcome": outcome,
+            }
+
         if filled:
             msg = f"{alert_emoji} {alert_label} hit: {ticker} {pnl_pct:+.1f}%"
             self._send_alert(msg)

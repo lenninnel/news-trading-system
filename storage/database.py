@@ -625,6 +625,10 @@ class Database:
             for table, col, typedef in [
                 ("runs", "source_breakdown", "TEXT"),
                 ("headline_scores", "source", "TEXT NOT NULL DEFAULT 'newsapi'"),
+                # News age (2026-09-03): provider publication time, ISO-8601
+                # UTC.  NULL = provider gave no timestamp (or it was
+                # unparseable) — never silently "now".
+                ("headline_scores", "published_at", "TEXT"),
             ]:
                 try:
                     conn.execute(
@@ -684,6 +688,15 @@ class Database:
                 ("commission",     "REAL"),
                 ("intended_price", "REAL"),
                 ("executed_price", "REAL"),
+                # Fill reconciliation (2026-09-03): every execution that
+                # exists at the broker must exist here, including the
+                # filled portion of a timed-out / cancelled / stuck order.
+                #   fill_status      'filled' | 'partial' | 'late'
+                #   requested_shares shares originally sent to the broker
+                #   broker_order_id  IBKR orderId for cross-checking
+                ("fill_status",      "TEXT"),
+                ("requested_shares", "INTEGER"),
+                ("broker_order_id",  "INTEGER"),
             ]:
                 try:
                     conn.execute(
@@ -809,26 +822,33 @@ class Database:
         score: int,
         reason: str,
         source: str = "newsapi",
+        published_at: "str | None" = None,
     ) -> None:
         """
         Persist a single headline score linked to a run.
 
         Args:
-            run_id:    ID of the parent run (from log_run).
-            headline:  Original headline text.
-            sentiment: bullish / bearish / neutral.
-            score:     Numeric score (+1 / 0 / -1).
-            reason:    Claude's one-sentence explanation.
-            source:    Data source: newsapi / stocktwits / reddit.
+            run_id:       ID of the parent run (from log_run).
+            headline:     Original headline text.
+            sentiment:    bullish / bearish / neutral.
+            score:        Numeric score (+1 / 0 / -1).
+            reason:       Claude's one-sentence explanation.
+            source:       Data source: newsapi / stocktwits / reddit.
+            published_at: Provider publication time as ISO-8601 UTC, or
+                          None when the provider supplied none.  Stored
+                          verbatim so the age at decision time can be
+                          evaluated later against runs.created_at.
         """
         with self._file_lock, self._write_lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO headline_scores
-                    (run_id, headline, sentiment, score, reason, source)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (run_id, headline, sentiment, score, reason, source,
+                     published_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, headline, sentiment, score, reason, source),
+                (run_id, headline, sentiment, score, reason, source,
+                 published_at),
             )
 
     @_retry_on_locked
@@ -1186,6 +1206,9 @@ class Database:
         commission: "float | None" = None,
         intended_price: "float | None" = None,
         executed_price: "float | None" = None,
+        fill_status: "str | None" = None,
+        requested_shares: "int | None" = None,
+        broker_order_id: "int | None" = None,
     ) -> int:
         """
         Append an immutable trade record and return its auto-generated ID.
@@ -1210,6 +1233,15 @@ class Database:
             executed_price: Actual fill price returned by the broker.  Equals
                             ``price`` for new rows; both retained so legacy
                             queries against ``price`` keep working.
+            fill_status:    "filled" (complete), "partial" (the filled
+                            portion of an order that timed out / was
+                            cancelled / is stuck) or "late" (shares that
+                            filled after the trader stopped waiting).
+                            None for paper trades and historical rows.
+            requested_shares: Shares originally sent to the broker; differs
+                            from ``shares`` on partial/late rows.
+            broker_order_id: Broker order id (IBKR orderId) for
+                            reconciliation against the broker's own book.
 
         Returns:
             The integer primary key of the newly inserted row.
@@ -1220,11 +1252,13 @@ class Database:
                 """
                 INSERT INTO trade_history
                     (ticker, action, shares, price, stop_loss, take_profit, pnl, created_at,
-                     strategy, commission, intended_price, executed_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     strategy, commission, intended_price, executed_price,
+                     fill_status, requested_shares, broker_order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (ticker, action, shares, price, stop_loss, take_profit, pnl, now,
-                 strategy, commission, intended_price, executed_price),
+                 strategy, commission, intended_price, executed_price,
+                 fill_status, requested_shares, broker_order_id),
             )
             return cur.lastrowid
 

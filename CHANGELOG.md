@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### 2026-09-03 — Data integrity in the execution path (dev)
+
+- **Fill reconciliation (`execution/ibkr_trader.py`)**: every execution that exists at the broker now exists in `trade_history` / `portfolio_positions`. A BUY that part-fills inside `ORDER_FILL_TIMEOUT` is cancelled for the remainder as before, but the filled shares are recorded (`fill_status='partial'`) after a `CANCEL_SETTLE_WAIT` so the quantity is the broker's final number. Broker-side cancels after a part-fill are recorded the same way. A stuck SELL (past `STOP_MAX_WAIT`) arms a `statusEvent` late-fill watcher that writes any later fill as `fill_status='late'`, with SL/TP/strategy carried over. `close_position` and `place_order` share the same write path. New `trade_history` columns: `fill_status`, `requested_shares`, `broker_order_id`. `PositionManager` treats a partial exit as still-open (alert `PARTIAL EXIT`, trailing stop kept, stuck cooldown so the in-flight remainder is not doubled).
+- **News age (`data/news_feed.py`, `orchestrator/coordinator.py`, `analytics/signal_logger.py`)**: `NewsFeed.fetch_articles()` keeps NewsAPI `publishedAt`; Marketaux / EODHD / StockTwits / Reddit items carry `published_at` too (UTC ISO-8601, `NULL` when the provider gave none). The timestamp rides on every scored headline into `headline_scores.published_at`, and the signal rows get `news_newest_published_at`, `news_age_minutes`, `news_ts_missing` (`signal_events`, both the NewsCatalyst strategy row and the Combined row). New helper `utils/timeparse.py`. No strategy logic reads the new fields.
+- **F2 gate visibility (`orchestrator/level_gate.py`)**: level adoption now logs at INFO. Diagnosis of the executed R:R spread (1.30–2.24 on 2026-09-01/02) is in `docs/DATA_INTEGRITY_2026-09-03.md`: not slippage — the gate rejects the forward SL (model_mismatch) but adopts the forward TP unchecked. Gate logic deliberately unchanged in this deploy.
+
 ### Planned
 - Live broker integration (Alpaca / IBKR paper API)
 - MacroAgent for economic indicator analysis (CPI, Fed rate decisions)

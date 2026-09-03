@@ -27,6 +27,7 @@ from config.settings import (
     REDDIT_CLIENT_SECRET,
     REDDIT_USER_AGENT,
 )
+from utils.timeparse import normalise_published
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,12 @@ class RedditFeed:
                     if post.selftext:
                         preview = post.selftext[:200]
                         text = f"{text} — {preview}"
-                    results.append({"text": text, "source": "reddit"})
+                    results.append({
+                        "text": text, "source": "reddit",
+                        # PRAW ``created_utc`` is epoch seconds (UTC).
+                        "published_at": normalise_published(
+                            getattr(post, "created_utc", None)),
+                    })
             return results[: self.max_posts]
         except Exception:
             return []
@@ -200,6 +206,8 @@ class StockTwitsFeed:
                 "text": body,
                 "source": "stocktwits",
                 "stocktwits_sentiment": st_sentiment,
+                # StockTwits ``created_at`` (UTC, Z-suffixed); None if absent.
+                "published_at": normalise_published(msg.get("created_at")),
             })
         return results
 

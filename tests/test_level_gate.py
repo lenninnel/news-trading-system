@@ -294,10 +294,12 @@ def test_adoption_emits_no_warning(caplog, leg, candidate):
     adopted = apply_level_override(risk, leg, candidate, FILL, _ctx())
     assert adopted is True
     assert _warnings(caplog) == []
-    # Adoption logs at most DEBUG
+    # Adoption logs at INFO (2026-09-03: was DEBUG — the invisible TP-leg
+    # adoption hid the R:R spread of 2026-09-01/02); never WARNING.
     for r in caplog.records:
         if r.name == "orchestrator.level_gate":
-            assert r.levelno <= logging.DEBUG
+            assert r.levelno <= logging.INFO
+            assert "adopted" in r.getMessage()
 
 
 # ── T7: level-integrity invariant v2 (model_mismatch) ────────────────────

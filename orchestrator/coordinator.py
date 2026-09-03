@@ -91,6 +91,7 @@ from execution.broker_factory import create_trader
 from execution.portfolio_manager import PortfolioManager
 from orchestrator.cluster_detector import ClusterDetector
 from orchestrator.level_gate import apply_level_override
+from utils.timeparse import age_minutes, parse_utc, to_iso_utc
 from storage.database import Database
 from strategies.base import StrategyResult
 from strategies.momentum import MomentumStrategy
@@ -404,6 +405,7 @@ class Coordinator:
                 # exist as an attribute. Default to empty/False.
                 "macro_context_used": bool(getattr(self, "macro_context", "")),
                 "signal_path": result.get("signal_path"),
+                **self._news_timing(sentiment.get("scored")),
             })
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
@@ -440,6 +442,9 @@ class Coordinator:
                 "price_at_signal": price,
                 "trade_executed": 0,
                 "trade_id": None,
+                "news_newest_published_at": indicators.get("news_newest_published_at"),
+                "news_age_minutes": indicators.get("news_age_minutes"),
+                "news_ts_missing": indicators.get("news_ts_missing"),
             })
         except Exception as exc:
             log.warning("Strategy result logging failed (non-fatal): %s", exc)
@@ -740,6 +745,58 @@ class Coordinator:
         self._log_signal_event(final_result, session=session)
         return final_result
 
+    # ------------------------------------------------------------------
+    # News age (2026-09-03)
+    # ------------------------------------------------------------------
+
+    def _fetch_newsapi_items(self, ticker: str) -> list[dict]:
+        """NewsAPI items as ``{"text", "source", "published_at"}``.
+
+        Uses ``NewsFeed.fetch_articles`` (keeps the provider's
+        ``publishedAt``).  Feed doubles that only expose ``fetch()``
+        still work — their items carry ``published_at=None``, i.e. age
+        unknown, never "now".
+        """
+        feed = self.news_feed
+        if callable(getattr(type(feed), "fetch_articles", None)):
+            return [
+                {"text": a["text"], "source": "newsapi",
+                 "published_at": a.get("published_at")}
+                for a in feed.fetch_articles(ticker)
+                if isinstance(a, dict) and a.get("text")
+            ]
+        return [
+            {"text": h, "source": "newsapi", "published_at": None}
+            for h in feed.fetch(ticker)
+        ]
+
+    @staticmethod
+    def _news_timing(scored: "list[dict] | None", now=None) -> dict:
+        """Age of the news behind a signal, from per-headline ``published_at``.
+
+        Returns ``news_newest_published_at`` (ISO UTC or None),
+        ``news_age_minutes`` (age of that newest item at ``now``, or
+        None) and ``news_ts_missing`` (headlines that carried no
+        provider timestamp).  All-None means no timestamped news
+        reached this decision — recorded as such, not as fresh.
+        """
+        newest = None
+        missing = 0
+        for item in scored or []:
+            ts = item.get("published_at") if isinstance(item, dict) else None
+            dt = parse_utc(ts)
+            if dt is None:
+                missing += 1
+                continue
+            if newest is None or dt > newest:
+                newest = dt
+        newest_iso = to_iso_utc(newest)
+        return {
+            "news_newest_published_at": newest_iso,
+            "news_age_minutes": age_minutes(newest_iso, now),
+            "news_ts_missing": missing,
+        }
+
     @staticmethod
     def _build_news_data(sentiment: dict) -> dict | None:
         """Build *news_data* dict for NewsCatalystStrategy from a sentiment result.
@@ -754,6 +811,9 @@ class Coordinator:
             "news_score": (avg + 1) / 2,  # map -1..+1 to 0..1
             "headline_count": len(scored),
             "sentiment_direction": sentiment.get("signal", "HOLD"),
+            # Observability only — NewsCatalyst passes these through to
+            # its indicators; no condition reads them.
+            **Coordinator._news_timing(scored),
         }
 
     def _run_news_catalyst(
@@ -1321,23 +1381,24 @@ class Coordinator:
         # NewsAPI
         if verbose:
             print(f"Fetching headlines for {ticker}...")
-        newsapi_headlines = self.news_feed.fetch(ticker)
-        for h in newsapi_headlines:
-            items.append({"text": h, "source": "newsapi"})
+        newsapi_items = self._fetch_newsapi_items(ticker)
+        items.extend(newsapi_items)
         if verbose:
-            print(f"  NewsAPI: {len(newsapi_headlines)} headline(s)")
+            print(f"  NewsAPI: {len(newsapi_items)} headline(s)")
 
         # StockTwits
         stocktwits_items = self.stocktwits_feed.fetch(ticker)
         for st in stocktwits_items:
-            items.append({"text": st["text"], "source": "stocktwits"})
+            items.append({"text": st["text"], "source": "stocktwits",
+                          "published_at": st.get("published_at")})
         if verbose:
             print(f"  StockTwits: {len(stocktwits_items)} message(s)")
 
         # Reddit
         reddit_items = self.reddit_feed.fetch(ticker)
         for rd in reddit_items:
-            items.append({"text": rd["text"], "source": "reddit"})
+            items.append({"text": rd["text"], "source": "reddit",
+                          "published_at": rd.get("published_at")})
         if verbose:
             print(f"  Reddit: {len(reddit_items)} post(s)")
 
@@ -1345,7 +1406,8 @@ class Coordinator:
         _last_sig = self._last_combined_signal(ticker)
         marketaux_items = self.marketaux_feed.fetch(ticker, signal_hint=_last_sig)
         for mx in marketaux_items:
-            items.append({"text": mx["text"], "source": "marketaux"})
+            items.append({"text": mx["text"], "source": mx.get("source", "marketaux"),
+                          "published_at": mx.get("published_at")})
         if verbose:
             print(f"  Marketaux: {len(marketaux_items)} article(s)")
 
@@ -1375,6 +1437,7 @@ class Coordinator:
             try:
                 result = self.sentiment_agent.run(text, ticker)
                 result["source"] = source
+                result["published_at"] = item.get("published_at")
                 scored.append(result)
                 if verbose:
                     icon = {"bullish": "+", "bearish": "-", "neutral": "~"}.get(
@@ -1407,6 +1470,7 @@ class Coordinator:
                 score=s["score"],
                 reason=s.get("reason", ""),
                 source=s.get("source", "newsapi"),
+                published_at=s.get("published_at"),
             )
 
         return {
@@ -1842,8 +1906,8 @@ class Coordinator:
             except Exception as exc:
                 log.warning("[%s] Market data fetch failed: %s", ticker, exc)
 
-            newsapi_headlines = await asyncio.to_thread(
-                self.news_feed.fetch, ticker,
+            newsapi_items = await asyncio.to_thread(
+                self._fetch_newsapi_items, ticker,
             )
             stocktwits_items = await asyncio.to_thread(
                 self.stocktwits_feed.fetch, ticker,
@@ -1862,20 +1926,24 @@ class Coordinator:
                 self.adanos_feed.fetch, ticker,
             )
 
-        # Build items list
-        items: list[dict] = []
-        for h in newsapi_headlines:
-            items.append({"text": h, "source": "newsapi"})
+        # Build items list — published_at rides along per item (None when
+        # the provider gave none; ApeWisdom/Adanos are aggregates).
+        items: list[dict] = list(newsapi_items)
         for st_item in stocktwits_items:
-            items.append({"text": st_item["text"], "source": "stocktwits"})
+            items.append({"text": st_item["text"], "source": "stocktwits",
+                          "published_at": st_item.get("published_at")})
         for rd in reddit_items:
-            items.append({"text": rd["text"], "source": "reddit"})
+            items.append({"text": rd["text"], "source": "reddit",
+                          "published_at": rd.get("published_at")})
         for mx in marketaux_items:
-            items.append({"text": mx["text"], "source": "marketaux"})
+            items.append({"text": mx["text"], "source": mx.get("source", "marketaux"),
+                          "published_at": mx.get("published_at")})
         for aw in apewisdom_items:
-            items.append({"text": aw["text"], "source": "apewisdom"})
+            items.append({"text": aw["text"], "source": "apewisdom",
+                          "published_at": None})
         for ad in adanos_items:
-            items.append({"text": ad["text"], "source": "adanos"})
+            items.append({"text": ad["text"], "source": "adanos",
+                          "published_at": None})
 
         # ── Phase 2: Sentiment scoring (Claude API) ────────────────────
         scored: list[dict] = []
@@ -1886,6 +1954,7 @@ class Coordinator:
                         self.sentiment_agent.run, item["text"], ticker,
                     )
                     result["source"] = item["source"]
+                    result["published_at"] = item.get("published_at")
                     scored.append(result)
                 except Exception:
                     pass
@@ -1988,6 +2057,7 @@ class Coordinator:
                     score=s["score"],
                     reason=s.get("reason", ""),
                     source=s.get("source", "newsapi"),
+                    published_at=s.get("published_at"),
                 )
 
             combined_id = self.db.log_combined_signal(
@@ -2363,8 +2433,8 @@ class Coordinator:
 
         # ── Phase 1: Data fetches ─────────────────────────────────────
         async with data_semaphore:
-            newsapi_headlines = await asyncio.to_thread(
-                self.news_feed.fetch, ticker,
+            newsapi_items = await asyncio.to_thread(
+                self._fetch_newsapi_items, ticker,
             )
             stocktwits_items = await asyncio.to_thread(
                 self.stocktwits_feed.fetch, ticker,
@@ -2374,13 +2444,13 @@ class Coordinator:
                 self._last_combined_signal(ticker),
             )
 
-        items: list[dict] = []
-        for h in newsapi_headlines:
-            items.append({"text": h, "source": "newsapi"})
+        items: list[dict] = list(newsapi_items)
         for st_item in stocktwits_items:
-            items.append({"text": st_item["text"], "source": "stocktwits"})
+            items.append({"text": st_item["text"], "source": "stocktwits",
+                          "published_at": st_item.get("published_at")})
         for mx in marketaux_items:
-            items.append({"text": mx["text"], "source": "marketaux"})
+            items.append({"text": mx["text"], "source": mx.get("source", "marketaux"),
+                          "published_at": mx.get("published_at")})
 
         # ── Phase 2: Sentiment scoring (Claude API) ───────────────────
         scored: list[dict] = []
@@ -2391,6 +2461,7 @@ class Coordinator:
                         self.sentiment_agent.run, item["text"], ticker,
                     )
                     result["source"] = item["source"]
+                    result["published_at"] = item.get("published_at")
                     scored.append(result)
                 except Exception:
                     pass

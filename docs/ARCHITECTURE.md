@@ -404,6 +404,8 @@ Individual headline sentiment scores, linked to `runs`.
 | sentiment | TEXT | bullish / bearish / neutral |
 | score | INTEGER | +1 / 0 / −1 |
 | reason | TEXT | Claude's one-sentence explanation |
+| source | TEXT | newsapi / marketaux / eodhd / reddit / stocktwits / apewisdom / adanos |
+| published_at | TEXT | Provider publication time, ISO-8601 UTC (since 2026-09-03). `NULL` = the provider supplied no timestamp or it was unparseable — never defaulted to the fetch time. Age at decision time = `runs.created_at − published_at`. |
 
 ### Table: `technical_signals`
 
@@ -496,6 +498,9 @@ Complete paper-trade log.
 | commission | REAL | Broker commission for the fill, in account currency. Populated for IBKR fills; `NULL` for paper trades and any trade where the broker did not return a `CommissionReport`. |
 | intended_price | REAL | Price the strategy saw at signal-trigger time (before the broker round-trip). Compared against `executed_price` to quantify slippage. `NULL` on historical rows. |
 | executed_price | REAL | Actual fill price returned by the broker. Equals `price` for new rows; both columns retained so legacy queries against `price` continue to work. `NULL` on historical rows. |
+| fill_status | TEXT | Since 2026-09-03 (IBKR rows only). `filled` = complete; `partial` = the filled portion of an order that timed out / was cancelled / is stuck (the remainder did not execute); `late` = shares that filled after the trader stopped waiting (stuck SELL, cancel race), written by the late-fill watcher. `NULL` on paper trades and historical rows. See `docs/DATA_INTEGRITY_2026-09-03.md`. |
+| requested_shares | INTEGER | Shares originally sent to the broker. Differs from `shares` on `partial` / `late` rows. `NULL` before 2026-09-03. |
+| broker_order_id | INTEGER | IBKR `orderId` for reconciliation against the broker's own execution log. Several rows may share one id (partial + late legs). |
 
 #### `strategy` values
 

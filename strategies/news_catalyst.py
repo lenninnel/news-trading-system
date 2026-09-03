@@ -41,6 +41,11 @@ class NewsCatalystStrategy(BaseStrategy):
                 - news_score: float (0-1 scale, higher = more positive)
                 - headline_count: int
                 - sentiment_direction: "BUY" | "SELL" | "HOLD"
+                - news_newest_published_at / news_age_minutes /
+                  news_ts_missing: observability only (2026-09-03) —
+                  passed through to ``indicators`` so signal_events can
+                  record the age of the news at decision time.  Not
+                  used in any condition.
         """
         reasoning: list[str] = []
         conditions_met = 0
@@ -112,6 +117,10 @@ class NewsCatalystStrategy(BaseStrategy):
             "pct_change": pct_change,
             "news_score": news_score,
             "headline_count": headline_count,
+            # News-age pass-through (logging only, no logic impact).
+            "news_newest_published_at": news_data.get("news_newest_published_at"),
+            "news_age_minutes": news_data.get("news_age_minutes"),
+            "news_ts_missing": news_data.get("news_ts_missing"),
         }
 
         # Confidence bonuses scale with the actual strength of each

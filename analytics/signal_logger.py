@@ -69,6 +69,16 @@ _FORWARD_VOTE_COLUMNS: list[tuple[str, str]] = [
     ("evaluated_at", "TEXT"),
 ]
 
+# News age (2026-09-03): publication time of the newest headline that
+# fed the signal, its age at decision time (signal_events.timestamp) and
+# how many headlines carried no provider timestamp.  NULL = no
+# timestamped news reached this signal — visible as missing.
+_NEWS_AGE_COLUMNS: list[tuple[str, str]] = [
+    ("news_newest_published_at", "TEXT"),
+    ("news_age_minutes", "REAL"),
+    ("news_ts_missing", "INTEGER"),
+]
+
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,6 +164,15 @@ class SignalLogger:
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
+                for col, typedef in _NEWS_AGE_COLUMNS:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE signal_events "
+                            f"ADD COLUMN {col} {typedef}"
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
         except Exception as exc:
             log.warning("signal_events table creation failed: %s", exc)
 
@@ -173,8 +192,11 @@ class SignalLogger:
                          sentiment_score, news_score, social_score,
                          bull_case, bear_case, debate_outcome,
                          price_at_signal, trade_executed, trade_id,
-                         regime, macro_context_used, signal_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         regime, macro_context_used, signal_path,
+                         news_newest_published_at, news_age_minutes,
+                         news_ts_missing)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?)
                     """,
                     (
                         now,
@@ -198,6 +220,9 @@ class SignalLogger:
                         signal_data.get("regime"),
                         int(bool(signal_data.get("macro_context_used", 0))),
                         signal_data.get("signal_path"),
+                        signal_data.get("news_newest_published_at"),
+                        signal_data.get("news_age_minutes"),
+                        signal_data.get("news_ts_missing"),
                     ),
                 )
         except Exception as exc:

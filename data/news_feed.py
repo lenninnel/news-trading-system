@@ -47,10 +47,15 @@ import requests
 from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL, get_search_term
 from utils.api_recovery import APIRecovery, CircuitOpenError
 from utils.network_recovery import NetworkMonitor, ResponseCache, get_cache
+from utils.timeparse import normalise_published
 
 log = logging.getLogger(__name__)
 
 _CACHE_KEY_PREFIX = "headlines"
+# Structured cache entries (title + publication time) live under a
+# separate prefix so the legacy list[str] entries — still written for
+# NewsAggregator and older readers — never mix with dicts.
+_ARTICLE_CACHE_KEY_PREFIX = "articles"
 
 # ---------------------------------------------------------------------------
 # NewsAPI-specific 24-hour cache (separate from the 1-hour global cache)
@@ -156,7 +161,22 @@ class NewsFeed:
 
     def fetch(self, ticker: str) -> list[str]:
         """
-        Fetch recent headlines mentioning *ticker*.
+        Fetch recent headlines mentioning *ticker* (titles only).
+
+        Thin wrapper over :meth:`fetch_articles` kept for callers that
+        only need text.  Anything that cares about news age must use
+        ``fetch_articles`` — this method drops the publication time.
+
+        Returns:
+            List of headline strings, capped at max_headlines.
+            Returns cached headlines when NewsAPI is unavailable.
+            Returns an empty list when neither live nor cached data exists.
+        """
+        return [a["text"] for a in self.fetch_articles(ticker)]
+
+    def fetch_articles(self, ticker: str) -> list[dict]:
+        """
+        Fetch recent articles mentioning *ticker* with their publication time.
 
         Successful responses are cached for 24 hours so that the system
         can operate in degraded mode (cached headlines) when NewsAPI is
@@ -170,9 +190,12 @@ class NewsFeed:
             ticker: Stock ticker symbol to search for (e.g. "AAPL").
 
         Returns:
-            List of headline strings, capped at max_headlines.
-            Returns cached headlines when NewsAPI is unavailable.
-            Returns an empty list when neither live nor cached data exists.
+            List of dicts ``{"text", "source", "published_at", "fetched_at"}``.
+            ``published_at`` is the provider's ``publishedAt`` as ISO-8601
+            UTC, or None when NewsAPI supplied none / it was unparseable
+            (never silently "now").  ``fetched_at`` is when this process
+            received the article (None for legacy cache entries that
+            predate the structured cache).
         """
         ticker = ticker.upper()
 
@@ -180,15 +203,16 @@ class NewsFeed:
         NetworkMonitor.check_and_update()
 
         cache_key = f"{_CACHE_KEY_PREFIX}:{ticker}"
+        article_key = f"{_ARTICLE_CACHE_KEY_PREFIX}:{ticker}"
 
         # -- Check 24h cache first (avoids unnecessary API calls) -------------
-        cached_24h, hit_24h = _newsapi_cache.get("newsapi", cache_key)
-        if hit_24h and cached_24h:
+        cached_24h = self._cached_articles(_newsapi_cache, article_key, cache_key)
+        if cached_24h:
             log.debug(
                 "NewsAPI 24h cache hit for %s (%d headlines)",
                 ticker, len(cached_24h),
             )
-            return list(cached_24h)
+            return cached_24h
 
         # -- Check daily rate limit -------------------------------------------
         if is_newsapi_limit_reached():
@@ -201,12 +225,15 @@ class NewsFeed:
         # -- Attempt live fetch -----------------------------------------------
         if not NetworkMonitor.is_degraded():
             try:
-                headlines = APIRecovery.call(
+                raw = APIRecovery.call(
                     "newsapi",
                     self._live_fetch,
                     ticker,
                     ticker=ticker,
                 )
+                # Normalise defensively: a wrapped/patched call may hand
+                # back plain titles — those get published_at=None.
+                articles = [a for a in (self._as_article(i) for i in raw) if a]
                 # Track the request
                 count = _increment_counter()
                 log.info(
@@ -214,10 +241,13 @@ class NewsFeed:
                     ticker, count, NEWSAPI_DAILY_LIMIT + 20,
                 )
 
-                # Cache in both the global 1h cache and the 24h NewsAPI cache
-                get_cache().set("newsapi", cache_key, headlines)
-                _newsapi_cache.set("newsapi", cache_key, headlines)
-                return headlines
+                # Cache in both the global 1h cache and the 24h NewsAPI
+                # cache — structured form plus the legacy title list.
+                titles = [a["text"] for a in articles]
+                for cache in (get_cache(), _newsapi_cache):
+                    cache.set("newsapi", article_key, articles)
+                    cache.set("newsapi", cache_key, titles)
+                return articles
             except CircuitOpenError as exc:
                 log.warning(
                     "NewsAPI circuit OPEN for %s — using cached headlines: %s",
@@ -270,27 +300,57 @@ class NewsFeed:
 
     # -- Internal helpers -----------------------------------------------------
 
-    def _serve_from_cache(self, ticker: str, cache_key: str) -> list[str]:
+    @staticmethod
+    def _as_article(item: object) -> dict | None:
+        """Normalise a cache entry (dict or legacy title string) to an article."""
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("title")
+            if not text:
+                return None
+            return {
+                "text": text,
+                "source": item.get("source", "newsapi"),
+                "published_at": item.get("published_at"),
+                "fetched_at": item.get("fetched_at"),
+            }
+        if isinstance(item, str) and item:
+            # Legacy list[str] entry — publication time unknown.
+            return {"text": item, "source": "newsapi",
+                    "published_at": None, "fetched_at": None}
+        return None
+
+    def _cached_articles(self, cache, article_key: str, cache_key: str) -> list[dict]:
+        """Read the structured entry first, fall back to the legacy title list."""
+        for key in (article_key, cache_key):
+            cached, hit = cache.get("newsapi", key)
+            if hit and cached:
+                articles = [a for a in (self._as_article(i) for i in cached) if a]
+                if articles:
+                    return articles
+        return []
+
+    def _serve_from_cache(self, ticker: str, cache_key: str) -> list[dict]:
         """Try to return headlines from the 24h cache, then the 1h cache."""
+        article_key = f"{_ARTICLE_CACHE_KEY_PREFIX}:{ticker}"
         # Try 24h cache first
-        cached_24h, hit_24h = _newsapi_cache.get("newsapi", cache_key)
-        if hit_24h and cached_24h:
+        cached_24h = self._cached_articles(_newsapi_cache, article_key, cache_key)
+        if cached_24h:
             log.warning(
-                "[DEGRADED MODE] newsapi: using %d cached headline(s) for %s (24h cache)",
+                "[DEGRADED MODE] newsapi: using %d cached headline(s) (24h) for %s",
                 len(cached_24h), ticker,
             )
             self._log_cache_hit(ticker, len(cached_24h))
-            return list(cached_24h)
+            return cached_24h
 
         # Then try global 1h cache
-        cached, hit = get_cache().get("newsapi", cache_key)
-        if hit and cached:
+        cached = self._cached_articles(get_cache(), article_key, cache_key)
+        if cached:
             log.warning(
                 "[DEGRADED MODE] newsapi: using %d cached headline(s) for %s",
                 len(cached), ticker,
             )
             self._log_cache_hit(ticker, len(cached))
-            return list(cached)
+            return cached
 
         # Nothing available
         log.warning(
@@ -299,8 +359,14 @@ class NewsFeed:
         )
         return []
 
-    def _live_fetch(self, ticker: str) -> list[str]:
-        """Raw HTTP call to NewsAPI; raises on any error."""
+    def _live_fetch(self, ticker: str) -> list[dict]:
+        """Raw HTTP call to NewsAPI; raises on any error.
+
+        Keeps ``publishedAt`` (UTC, ``Z``-suffixed) on every article.  A
+        missing or unparseable value becomes ``published_at=None`` and
+        is logged once per response — it must be visible as missing,
+        never defaulted to the fetch time.
+        """
         search_term = get_search_term(ticker)
         params = {
             "q":        search_term,
@@ -312,7 +378,29 @@ class NewsFeed:
         response = requests.get(NEWSAPI_URL, params=params, timeout=15)
         response.raise_for_status()
         articles = response.json().get("articles", [])
-        return [a["title"] for a in articles if a.get("title")]
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        out: list[dict] = []
+        missing_ts = 0
+        for a in articles:
+            title = a.get("title")
+            if not title:
+                continue
+            raw_ts = a.get("publishedAt")
+            published = normalise_published(raw_ts)
+            if published is None:
+                missing_ts += 1
+            out.append({
+                "text": title,
+                "source": "newsapi",
+                "published_at": published,
+                "fetched_at": fetched_at,
+            })
+        if missing_ts:
+            log.warning(
+                "NewsAPI: %d/%d article(s) for %s without a usable publishedAt "
+                "— stored as published_at=NULL", missing_ts, len(out), ticker,
+            )
+        return out
 
     # -- Recovery logging ------------------------------------------------------
 

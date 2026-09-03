@@ -40,6 +40,7 @@ import requests
 
 from config.settings import MARKETAUX_API_TOKEN, MAX_HEADLINES, is_german_ticker
 from data.eodhd_feed import EODHDFeed
+from utils.timeparse import normalise_published
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +216,8 @@ class MarketauxFeed:
                         "text": title,
                         "source": "eodhd",
                         "marketaux_sentiment": None,
+                        # EODHD ``date`` (ISO with offset); None if absent.
+                        "published_at": normalise_published(article.get("date")),
                     })
                     existing_titles.add(title)
         except Exception as exc:
@@ -235,6 +238,8 @@ class MarketauxFeed:
                 "text": title,
                 "source": "marketaux",
                 "marketaux_sentiment": sentiment,
+                # Marketaux ``published_at`` (UTC, Z-suffixed); None if absent.
+                "published_at": normalise_published(article.get("published_at")),
             })
 
         return results

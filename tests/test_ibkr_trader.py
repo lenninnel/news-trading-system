@@ -442,7 +442,8 @@ class TestDifferentiatedOrderTimeout:
         mock_ib.placeOrder.return_value = mock_trade
 
         with patch.object(mod, "ORDER_FILL_TIMEOUT", 0.05), \
-             patch.object(mod, "ORDER_POLL_INTERVAL", 0.005):
+             patch.object(mod, "ORDER_POLL_INTERVAL", 0.005), \
+             patch.object(mod, "CANCEL_SETTLE_WAIT", 0.02):
             result = trader.track_trade("AAPL", "BUY", 10, 150.0)
 
         assert result["skipped"] is True
@@ -609,7 +610,8 @@ class TestKillSwitch:
         mock_ib.placeOrder.return_value = trade
         with _kill_switch(True):
             result = trader.place_order("AAPL", 10, "SELL")
-        assert result == {"order_id": 7, "status": "Filled"}
+        assert result["order_id"] == 7 and result["status"] == "Filled"
+        assert result["trade_id"] == 42  # fills are recorded since 2026-09-03
 
     # -- switch inactive: normal path -------------------------------------
 
@@ -628,4 +630,5 @@ class TestKillSwitch:
         mock_ib.placeOrder.return_value = trade
         with _kill_switch(False):
             result = trader.place_order("AAPL", 10, "BUY")
-        assert result == {"order_id": 7, "status": "Filled"}
+        assert result["order_id"] == 7 and result["status"] == "Filled"
+        assert result["trade_id"] == 42  # fills are recorded since 2026-09-03

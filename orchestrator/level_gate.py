@@ -159,12 +159,18 @@ def apply_level_override(risk, leg, candidate, fill, ctx) -> bool:
                         deviation, _MODEL_TOLERANCE, risk.get(key),
                     )
                     return False
+        # Adoption is logged at INFO (was DEBUG until 2026-09-03): the
+        # asymmetric gate — model_mismatch on the sl leg only — silently
+        # combined a fresh SL with a forward TP on 4 of 5 executions on
+        # 2026-09-01/02 (executed R:R 1.30-2.24 against a 2.00 model).
+        # The journal must show which leg came from where.
+        fresh = risk.get(key)
         risk[key] = candidate
-        log.debug(
-            "F2-gate: adopted %s ticker=%s session=%s origin=%s "
-            "candidate=%s fill=%s",
-            leg, ctx.get("ticker"), ctx.get("session"), ctx.get("origin"),
-            candidate, fill,
+        log.info(
+            "F2-gate: adopted ticker=%s session=%s origin=%s leg=%s "
+            "candidate=%s fill=%s replaced fresh=%s",
+            ctx.get("ticker"), ctx.get("session"), ctx.get("origin"), leg,
+            candidate, fill, fresh,
         )
         return True
     else:

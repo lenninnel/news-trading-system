@@ -72,8 +72,16 @@ STOP_EXTENDED_TIMEOUT = 120.0
 STOP_MAX_WAIT = 300.0
 STOP_SLOW_POLL_INTERVAL = 10.0
 
+# After a BUY-timeout cancelOrder the order sits in PendingCancel for a
+# moment; fills can still land in that window (TXRH 2026-08-10: 100/132
+# filled at 13:45:34, cancel requested 13:46:03, Cancelled 13:46:03.4).
+# Wait this long for the cancel to settle before reading the final
+# filled quantity so the recorded partial is the broker's final number.
+CANCEL_SETTLE_WAIT = 5.0
+
 _TERMINAL_FILLED = {"Filled"}
 _TERMINAL_CANCELLED = {"Cancelled", "Inactive", "ApiCancelled"}
+_TERMINAL = _TERMINAL_FILLED | _TERMINAL_CANCELLED
 
 
 def _is_pytest_running() -> bool:
@@ -543,85 +551,15 @@ class IBKRTrader:
             wait_kwargs = {}
             dispatch_timeout = ORDER_FILL_TIMEOUT + 20.0
 
+        ctx = {
+            "ticker": ticker, "action": action, "requested_shares": shares,
+            "price": price, "stop_loss": stop_loss, "take_profit": take_profit,
+            "strategy": strategy,
+            "intended_price": intended_price if intended_price is not None else price,
+        }
+
         def _impl() -> dict:
-            contract = self._Stock(ticker, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-
-            order = self._MarketOrder(action, shares)
-            trade = self._ib.placeOrder(contract, order)
-            outcome, detail = self._wait_for_order_terminal(trade, **wait_kwargs)
-
-            if outcome != "filled":
-                self._handle_unfilled(trade, ticker, outcome, detail)
-                return {
-                    "trade_id": None, "ticker": ticker, "action": action,
-                    "shares": shares, "price": price,
-                    "stop_loss": stop_loss, "take_profit": take_profit,
-                    "pnl": 0.0, "total_value": 0.0,
-                    "skipped": True,
-                    "skip_reason": f"IBKR order {outcome}: {detail}",
-                    "outcome": outcome,
-                }
-
-            fill_price = trade.orderStatus.avgFillPrice or price
-            pnl = self._sync_position(ticker, action, shares, fill_price)
-
-            # Telemetry capture for execution-quality split.  Each value is
-            # isolated so a single failure (e.g. malformed CommissionReport
-            # on an exotic order) cannot block the trade record itself.
-            _intended_val = None
-            try:
-                _intended_val = intended_price if intended_price is not None else price
-            except Exception as exc:
-                log.warning("[%s] intended_price capture failed (non-fatal): %s", ticker, exc)
-            _executed_val = None
-            try:
-                _executed_val = fill_price
-            except Exception as exc:
-                log.warning("[%s] executed_price capture failed (non-fatal): %s", ticker, exc)
-            _commission_val: float | None = None
-            try:
-                fills = getattr(trade, "fills", None) or []
-                total = 0.0
-                seen_any = False
-                for f in fills:
-                    cr = getattr(f, "commissionReport", None)
-                    if cr is None:
-                        continue
-                    c = getattr(cr, "commission", None)
-                    if c is None:
-                        continue
-                    total += float(c)
-                    seen_any = True
-                _commission_val = total if seen_any else None
-            except Exception as exc:
-                log.warning("[%s] commission parse failed (non-fatal): %s", ticker, exc)
-            _strategy_val = None
-            try:
-                _strategy_val = strategy
-            except Exception as exc:
-                log.warning("[%s] strategy capture failed (non-fatal): %s", ticker, exc)
-
-            trade_id = self._db.log_trade_history(
-                ticker=ticker, action=action, shares=shares, price=fill_price,
-                stop_loss=stop_loss, take_profit=take_profit, pnl=pnl,
-                strategy=_strategy_val,
-                commission=_commission_val,
-                intended_price=_intended_val,
-                executed_price=_executed_val,
-            )
-
-            log.info(
-                "IBKR ORDER FILLED: %s %d shares @ $%.2f (trade_id=%s)",
-                action, shares, fill_price, trade_id,
-            )
-
-            return {
-                "trade_id": trade_id, "ticker": ticker, "action": action,
-                "shares": shares, "price": fill_price,
-                "stop_loss": stop_loss, "take_profit": take_profit,
-                "pnl": pnl, "total_value": round(shares * fill_price, 2),
-            }
+            return self._place_and_settle(ctx, wait_kwargs)
 
         return self._run_in_ib_loop(_impl, timeout=dispatch_timeout)
 
@@ -748,26 +686,24 @@ class IBKRTrader:
                     if qty == 0:
                         return False
                     side = "SELL" if qty > 0 else "BUY"
-                    contract = self._Stock(ticker.upper(), "SMART", "USD")
-                    self._ib.qualifyContracts(contract)
-                    order = self._MarketOrder(side, abs(qty))
-                    trade = self._ib.placeOrder(contract, order)
                     if side == "SELL":
-                        outcome, detail = self._wait_for_order_terminal(
-                            trade,
-                            timeout=STOP_MAX_WAIT,
-                            slow_poll_after=STOP_EXTENDED_TIMEOUT,
-                        )
+                        wait_kwargs = {
+                            "timeout": STOP_MAX_WAIT,
+                            "slow_poll_after": STOP_EXTENDED_TIMEOUT,
+                        }
                     else:
-                        outcome, detail = self._wait_for_order_terminal(trade)
-                    if outcome == "filled":
-                        log.info(
-                            "IBKR ORDER FILLED: %s %d shares of %s",
-                            side, abs(qty), ticker,
-                        )
-                        return True
-                    self._handle_unfilled(trade, ticker, outcome, detail)
-                    return False
+                        wait_kwargs = {}
+                    ctx = {
+                        "ticker": ticker.upper(), "action": side,
+                        "requested_shares": abs(qty), "price": None,
+                        "stop_loss": None, "take_profit": None,
+                        "strategy": None, "intended_price": None,
+                    }
+                    # Every fill — complete or partial — is recorded in
+                    # trade_history by _place_and_settle; True only when
+                    # the whole position is gone.
+                    result = self._place_and_settle(ctx, wait_kwargs)
+                    return bool(result.get("trade_id")) and not result.get("partial")
             return False
         # SELL path may wait up to STOP_MAX_WAIT; BUY path 30s. Use the
         # larger window so the dispatch never strands a slow SELL.
@@ -782,9 +718,11 @@ class IBKRTrader:
     ) -> dict:
         """Submit an order and return a dict with order_id.
 
-        This is a thin wrapper around IB's placeOrder — it does NOT sync
-        to the local DB or compute PnL.  Use ``track_trade`` for the
-        full pipeline.
+        Thin wrapper around IB's placeOrder without SL/TP or strategy
+        attribution.  Since 2026-09-03 every fill (complete or partial)
+        is still recorded in trade_history / portfolio_positions via
+        ``_place_and_settle`` so the broker book and the DB cannot
+        diverge.  Use ``track_trade`` for the full pipeline.
         """
         side = side.upper()
         if side not in ("BUY", "SELL"):
@@ -803,23 +741,31 @@ class IBKRTrader:
             log.warning("skipping non-US symbol %s — no US order path", ticker)
             raise ValueError(f"non-US symbol {ticker}: no US order path")
 
+        ctx = {
+            "ticker": ticker.upper(), "action": side, "requested_shares": qty,
+            "price": None, "stop_loss": None, "take_profit": None,
+            "strategy": None, "intended_price": None,
+        }
+
         def _impl() -> dict:
-            contract = self._Stock(ticker.upper(), "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-            order = self._MarketOrder(side, qty)
-            trade = self._ib.placeOrder(contract, order)
-            outcome, detail = self._wait_for_order_terminal(trade)
-            if outcome == "filled":
-                log.info(
-                    "IBKR ORDER FILLED: %s %d shares of %s",
-                    side, qty, ticker,
-                )
-                return {"order_id": trade.order.orderId, "status": "Filled"}
-            self._handle_unfilled(trade, ticker, outcome, detail)
+            result = self._place_and_settle(ctx, {})
+            outcome = result.get("outcome")
+            if result.get("trade_id") and not result.get("partial"):
+                status = "Filled"
+            elif result.get("partial"):
+                status = "PartiallyFilled"
+            elif outcome == "cancelled":
+                status = "Cancelled"
+            elif outcome == "stuck":
+                status = "Stuck"
+            else:
+                status = "Timeout"
             return {
-                "order_id": trade.order.orderId,
-                "status": "Cancelled" if outcome == "cancelled" else "Timeout",
-                "reason": detail,
+                "order_id": result.get("broker_order_id"),
+                "status": status,
+                "reason": result.get("skip_reason"),
+                "trade_id": result.get("trade_id"),
+                "filled_shares": result.get("filled_shares", 0),
             }
         return self._run_in_ib_loop(_impl, timeout=ORDER_FILL_TIMEOUT + 20.0)
 
@@ -1013,6 +959,306 @@ class IBKRTrader:
             )
         else:
             log.warning("IBKR ORDER TIMEOUT: %s — cancelled", ticker)
+
+    # ------------------------------------------------------------------
+    # Fill reconciliation (2026-09-03)
+    #
+    # Invariant: every execution that exists at the broker exists in
+    # trade_history / portfolio_positions — also on timeout, partial
+    # fill, cancel race or a SELL that fills after we stopped waiting.
+    # Before this, a BUY that part-filled inside ORDER_FILL_TIMEOUT was
+    # cancelled for the remainder and the filled shares were never
+    # written (UFPI/TXRH/CACI, 8 orphan SELLs, 2026-06..08).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _num(value: Any) -> float | None:
+        """Return ``value`` as float when it is a real number, else None.
+
+        MagicMock attributes and missing fields must never be mistaken
+        for a quantity (``int(MagicMock()) == 1``).
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _fill_state(self, trade) -> tuple[int, float | None]:
+        """(filled_shares, avg_fill_price) from the broker's orderStatus.
+
+        Either element degrades independently: ``0`` when the broker
+        reports no usable quantity, ``None`` when no usable price.
+        """
+        status = getattr(trade, "orderStatus", None)
+        filled = self._num(getattr(status, "filled", None)) or 0.0
+        avg = self._num(getattr(status, "avgFillPrice", None))
+        if not avg or avg <= 0:
+            avg = self._num(getattr(status, "lastFillPrice", None))
+        avg = avg if avg and avg > 0 else None
+        # A price without a quantity is still meaningful on the Filled
+        # path (quantity then defaults to the requested shares).
+        return (int(filled) if filled > 0 else 0), avg
+
+    @staticmethod
+    def _order_id(trade) -> int | None:
+        oid = getattr(getattr(trade, "order", None), "orderId", None)
+        return int(oid) if isinstance(oid, (int, float)) and not isinstance(oid, bool) else None
+
+    @staticmethod
+    def _order_status(trade) -> str:
+        return getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+
+    def _commission(self, trade) -> float | None:
+        """Sum CommissionReports over the fills seen so far; None if none."""
+        try:
+            fills = getattr(trade, "fills", None) or []
+            total = 0.0
+            seen_any = False
+            for f in fills:
+                cr = getattr(f, "commissionReport", None)
+                if cr is None:
+                    continue
+                c = self._num(getattr(cr, "commission", None))
+                if c is None:
+                    continue
+                total += c
+                seen_any = True
+            return total if seen_any else None
+        except Exception as exc:
+            log.warning("commission parse failed (non-fatal): %s", exc)
+            return None
+
+    def _record_fill(
+        self, ctx: dict, *, shares: int, fill_price: float,
+        fill_status: str, trade,
+    ) -> dict:
+        """Sync portfolio_positions and append the trade_history row.
+
+        Single write path for complete, partial and late fills so the
+        three cannot drift apart in what they persist.
+        """
+        ticker, action = ctx["ticker"], ctx["action"]
+        pnl = self._sync_position(ticker, action, shares, fill_price)
+        trade_id = self._db.log_trade_history(
+            ticker=ticker, action=action, shares=shares, price=fill_price,
+            stop_loss=ctx.get("stop_loss"), take_profit=ctx.get("take_profit"),
+            pnl=pnl, strategy=ctx.get("strategy"),
+            commission=self._commission(trade),
+            intended_price=ctx.get("intended_price"),
+            executed_price=fill_price,
+            fill_status=fill_status,
+            requested_shares=ctx.get("requested_shares"),
+            broker_order_id=self._order_id(trade),
+        )
+        log.log(
+            logging.INFO if fill_status == "filled" else logging.WARNING,
+            "IBKR ORDER %s: %s %d/%s shares of %s @ $%.2f (trade_id=%s, orderId=%s)",
+            fill_status.upper(), action, shares, ctx.get("requested_shares"),
+            ticker, fill_price, trade_id, self._order_id(trade),
+        )
+        return {
+            "trade_id": trade_id, "ticker": ticker, "action": action,
+            "shares": shares, "price": fill_price,
+            "stop_loss": ctx.get("stop_loss"), "take_profit": ctx.get("take_profit"),
+            "pnl": pnl, "total_value": round(shares * fill_price, 2),
+            "skipped": False,
+            "fill_status": fill_status,
+            "filled_shares": shares,
+            "requested_shares": ctx.get("requested_shares"),
+            "broker_order_id": self._order_id(trade),
+        }
+
+    def _place_and_settle(self, ctx: dict, wait_kwargs: dict) -> dict:
+        """Place a market order, wait, and persist whatever filled.
+
+        Must run on the IB loop thread (callers dispatch via
+        ``_run_in_ib_loop``).  Outcomes:
+
+        * filled      → full row, ``fill_status='filled'``.
+        * timeout     → cancel the remainder (BUY semantics), wait up to
+                        CANCEL_SETTLE_WAIT for the cancel to settle, then
+                        record the filled portion as ``'partial'``.  If
+                        the fill beat the cancel the order is simply
+                        filled.
+        * cancelled   → broker cancelled; record any filled portion.
+        * stuck       → SELL past STOP_MAX_WAIT, NOT cancelled; record any
+                        filled portion and arm a late-fill watcher that
+                        writes the rest as ``'late'`` when it lands.
+
+        Return dict: ``skipped=True`` only when nothing filled.  A partial
+        carries ``partial=True``, ``outcome``, ``unfilled_shares`` and the
+        recorded ``shares`` so callers can distinguish it from a clean
+        fill.
+        """
+        ticker, action = ctx["ticker"], ctx["action"]
+        shares = int(ctx["requested_shares"])
+        price = ctx.get("price")
+
+        contract = self._Stock(ticker, "SMART", "USD")
+        self._ib.qualifyContracts(contract)
+        order = self._MarketOrder(action, shares)
+        trade = self._ib.placeOrder(contract, order)
+        outcome, detail = self._wait_for_order_terminal(trade, **wait_kwargs)
+
+        if outcome != "filled":
+            self._handle_unfilled(trade, ticker, outcome, detail)
+            if outcome == "timeout":
+                # Let the cancel settle so orderStatus.filled is final.
+                settled, settled_status = self._wait_for_order_terminal(
+                    trade, timeout=CANCEL_SETTLE_WAIT,
+                )
+                if settled == "filled":
+                    log.warning(
+                        "IBKR ORDER %s: fill arrived before the cancel took "
+                        "effect — treating as filled", ticker,
+                    )
+                    outcome, detail = "filled", settled_status
+
+        if outcome == "filled":
+            filled, avg = self._fill_state(trade)
+            qty = filled if filled > 0 else shares
+            fill_price = avg if avg else self._num(price)
+            if fill_price is None:
+                log.error(
+                    "IBKR ORDER FILLED without a usable price: %s %s — "
+                    "recording at 0.0 so the fill is not lost", action, ticker,
+                )
+                fill_price = 0.0
+            return self._record_fill(
+                ctx, shares=qty, fill_price=fill_price,
+                fill_status="filled", trade=trade,
+            )
+
+        # Not (fully) filled — reconcile whatever the broker did fill.
+        filled, avg = self._fill_state(trade)
+        order_id = self._order_id(trade)
+        terminal = self._order_status(trade) in _TERMINAL
+        skip_reason = f"IBKR order {outcome}: {detail}"
+
+        if filled <= 0:
+            if not terminal:
+                self._watch_late_fills(trade, ctx, recorded_shares=0, recorded_avg=None)
+            return {
+                "trade_id": None, "ticker": ticker, "action": action,
+                "shares": shares, "price": price,
+                "stop_loss": ctx.get("stop_loss"), "take_profit": ctx.get("take_profit"),
+                "pnl": 0.0, "total_value": 0.0,
+                "skipped": True, "skip_reason": skip_reason,
+                "outcome": outcome,
+                "filled_shares": 0, "requested_shares": shares,
+                "broker_order_id": order_id,
+            }
+
+        fill_price = avg if avg else self._num(price)
+        if fill_price is None:
+            log.error(
+                "IBKR PARTIAL FILL without a usable price: %s %s %d sh — "
+                "recording at 0.0 so the fill is not lost", action, ticker, filled,
+            )
+            fill_price = 0.0
+        log.warning(
+            "IBKR ORDER %s with PARTIAL FILL: %s %d/%d shares of %s filled "
+            "@ $%.2f — recording the filled portion (orderId=%s)",
+            outcome.upper(), action, filled, shares, ticker, fill_price, order_id,
+        )
+        record = self._record_fill(
+            ctx, shares=filled, fill_price=fill_price,
+            fill_status="partial", trade=trade,
+        )
+        if not terminal:
+            self._watch_late_fills(
+                trade, ctx, recorded_shares=filled, recorded_avg=fill_price,
+            )
+        record.update({
+            "partial": True,
+            "outcome": outcome,
+            "unfilled_shares": shares - filled,
+            "skip_reason": f"{skip_reason} — partial fill {filled}/{shares} recorded",
+        })
+        return record
+
+    def _watch_late_fills(
+        self, trade, ctx: dict, *, recorded_shares: int,
+        recorded_avg: float | None,
+    ) -> bool:
+        """Arm a statusEvent listener that records fills landing after we
+        stopped waiting (stuck SELL, cancel still pending).
+
+        Runs on the IB loop thread (ib_insync emits events there), so
+        the DB write is the same path as a synchronous fill.  Returns
+        False when the trade object offers no event to hook — then the
+        gap is logged loudly instead of silently.
+        """
+        ev = getattr(trade, "statusEvent", None)
+        connect = getattr(ev, "connect", None)
+        ticker, action = ctx["ticker"], ctx["action"]
+        requested = int(ctx["requested_shares"])
+        order_id = self._order_id(trade)
+        if ev is None or not callable(connect):
+            log.error(
+                "IBKR LATE-FILL WATCH unavailable for %s %s orderId=%s "
+                "(%d/%d recorded) — reconcile against the broker manually",
+                action, ticker, order_id, recorded_shares, requested,
+            )
+            return False
+
+        state = {"shares": recorded_shares, "avg": recorded_avg or 0.0, "done": False}
+
+        def _on_status(tr, *_args) -> None:
+            if state["done"]:
+                return
+            try:
+                filled, avg = self._fill_state(tr)
+                if filled > state["shares"]:
+                    new = filled - state["shares"]
+                    late_px = None
+                    if avg:
+                        # Marginal price of the late shares from the two
+                        # cumulative averages; fall back to the cumulative
+                        # average if the arithmetic is degenerate.
+                        late_px = (avg * filled - state["avg"] * state["shares"]) / new
+                        if late_px <= 0:
+                            late_px = avg
+                    if late_px is None:
+                        late_px = self._num(ctx.get("price")) or 0.0
+                    self._record_fill(
+                        ctx, shares=new, fill_price=round(late_px, 4),
+                        fill_status="late", trade=tr,
+                    )
+                    state["shares"] = filled
+                    state["avg"] = avg or state["avg"]
+                if self._order_status(tr) in _TERMINAL:
+                    state["done"] = True
+                    try:
+                        ev.disconnect(_on_status)
+                    except Exception:
+                        pass
+                    log.warning(
+                        "IBKR LATE-FILL WATCH closed: %s %s orderId=%s status=%s "
+                        "total recorded %d/%d",
+                        action, ticker, order_id, self._order_status(tr),
+                        state["shares"], requested,
+                    )
+            except Exception as exc:
+                log.error(
+                    "IBKR LATE-FILL WATCH handler failed for %s orderId=%s: %s",
+                    ticker, order_id, exc,
+                )
+
+        try:
+            connect(_on_status)
+        except Exception as exc:
+            log.error(
+                "IBKR LATE-FILL WATCH could not attach for %s orderId=%s: %s",
+                ticker, order_id, exc,
+            )
+            return False
+        log.warning(
+            "IBKR LATE-FILL WATCH armed: %s %s orderId=%s (%d/%d recorded so far)",
+            action, ticker, order_id, recorded_shares, requested,
+        )
+        return True
 
     def _sync_position(
         self, ticker: str, action: str, shares: int, fill_price: float,

@@ -87,7 +87,7 @@ class TestMarketauxParsing:
 
         assert len(results) == 1
         item = results[0]
-        assert set(item.keys()) == {"text", "source", "marketaux_sentiment"}
+        assert set(item.keys()) == {"text", "source", "marketaux_sentiment", "published_at"}
 
     @patch("data.marketaux_feed.requests.get")
     def test_skips_articles_without_title(self, mock_get):
