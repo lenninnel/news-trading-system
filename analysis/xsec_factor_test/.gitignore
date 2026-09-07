@@ -1,0 +1,4 @@
+# raw Polygon cache (~1.6 GB) — rebuild with: python fetch_polygon.py --all
+cache/
+*.log
+.venv/
