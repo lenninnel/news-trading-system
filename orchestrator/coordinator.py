@@ -89,7 +89,11 @@ from data.marketaux_feed import MarketauxFeed
 from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFeed, is_reddit_configured
 from execution.broker_factory import create_trader
 from execution.portfolio_manager import PortfolioManager
-from orchestrator.cluster_detector import ClusterDetector
+from orchestrator.cluster_detector import (
+    GATE_CONFLICTING,
+    GATE_REJECTED,
+    ClusterDetector,
+)
 from orchestrator.level_gate import apply_level_pair_override
 from utils.timeparse import age_minutes, parse_utc, to_iso_utc
 from storage.database import Database
@@ -372,6 +376,7 @@ class Coordinator:
             sentiment_score = None if is_pead else (avg + 1) / 2  # map -1..1 to 0..1
 
             execution = result.get("execution") or {}
+            gate = result.get("cluster_gate") or {}
 
             # Debate removed (Q-014) — the bull_case/bear_case/debate_outcome
             # columns stay in the schema but no longer receive debate output.
@@ -405,6 +410,10 @@ class Coordinator:
                 # exist as an attribute. Default to empty/False.
                 "macro_context_used": bool(getattr(self, "macro_context", "")),
                 "signal_path": result.get("signal_path"),
+                "cluster_gate": gate.get("status"),
+                "cluster_votes": gate.get("votes"),
+                "cluster_direction": gate.get("direction"),
+                "cluster_voters": gate.get("voters"),
                 **self._news_timing(sentiment.get("scored")),
             })
         except Exception as exc:
@@ -950,6 +959,19 @@ class Coordinator:
                         ticker, len(strategy_votes),
                         self._EXPECTED_VOTE_COUNT, voters,
                     )
+                if cluster.gate_status == GATE_REJECTED:
+                    # Agreement gate (2026-09-07): one side only, but
+                    # fewer distinct sources than the threshold.  The
+                    # verdict is already HOLD; this line is the journal
+                    # contract (grep "Cluster-gate:").
+                    log.info(
+                        "Cluster-gate: rejected ticker=%s direction=%s "
+                        "votes=%d sources=%d min=%d voters=%s",
+                        ticker, cluster.vote_direction,
+                        cluster.cluster_strength, cluster.distinct_sources,
+                        self._cluster_detector.MIN_AGREEING_STRATEGIES,
+                        ",".join(cluster.agreeing_strategies),
+                    )
                 if cluster.cluster_signal == "CONFLICTING":
                     vote_ctx = None
                 else:
@@ -965,6 +987,12 @@ class Coordinator:
                         "directional_count": cluster.cluster_strength,
                         "strongest_supplier": cluster.strongest_supplier,
                         "boost_applied": cluster.boost_applied,
+                        # Agreement-gate carry-along → signal_events
+                        # cluster_* columns (see _cluster_gate_fields).
+                        "gate_status": cluster.gate_status,
+                        "gate_votes": cluster.cluster_strength,
+                        "gate_direction": cluster.vote_direction,
+                        "gate_voters": ",".join(cluster.agreeing_strategies),
                     }
                 return (
                     cluster.cluster_signal,
@@ -985,6 +1013,38 @@ class Coordinator:
             technical_confidence=fallback_technical_confidence,
         )
         return label, conf, "FUSION_FALLBACK", None
+
+    @staticmethod
+    def _cluster_gate_fields(
+        vote_ctx: dict | None,
+        combined_signal: str,
+        signal_path: str | None,
+    ) -> dict | None:
+        """signal_events cluster_* payload for one Combined row.
+
+        Only runs that actually went through ClusterDetector get a
+        value (signal_path CLUSTER / CLUSTER_PARTIAL).  CONFLICTING
+        carries no vote_ctx by design (A4) but is still a detector exit,
+        so it is recorded from the signal itself.  PEAD override and
+        FUSION_FALLBACK never reached the gate → None → NULL columns.
+        """
+        if not (signal_path or "").startswith("CLUSTER"):
+            return None
+        if vote_ctx and vote_ctx.get("gate_status"):
+            return {
+                "status": vote_ctx["gate_status"],
+                "votes": vote_ctx.get("gate_votes"),
+                "direction": vote_ctx.get("gate_direction"),
+                "voters": vote_ctx.get("gate_voters"),
+            }
+        if combined_signal == "CONFLICTING":
+            return {
+                "status": GATE_CONFLICTING,
+                "votes": None,
+                "direction": None,
+                "voters": None,
+            }
+        return None
 
     @staticmethod
     def _apply_signal_floor(ticker: str, signal: str, conf: float) -> float:
@@ -1802,6 +1862,9 @@ class Coordinator:
             "regime": regime_info,
             "strategy_name": strat_name,
             "signal_path": signal_path,
+            "cluster_gate": self._cluster_gate_fields(
+                vote_ctx, combined_signal, signal_path,
+            ),
         }
 
         # Signal analytics logging (fire-and-forget)
@@ -2279,6 +2342,9 @@ class Coordinator:
             "regime": regime_info,
             "strategy_name": strat_name,
             "signal_path": signal_path,
+            "cluster_gate": self._cluster_gate_fields(
+                vote_ctx, combined_signal, signal_path,
+            ),
             "is_scanner_candidate": is_scanner_candidate,
             "elapsed_s": round(elapsed, 2),
         }

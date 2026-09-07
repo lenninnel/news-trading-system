@@ -149,8 +149,28 @@ def test_two_vote_cluster_attribution(tmp_db):
 # ── (b) solo vote ────────────────────────────────────────────────────────
 
 
-def test_solo_vote_attribution(tmp_db):
+def test_solo_vote_is_rejected_by_agreement_gate(tmp_db):
+    """Since the agreement gate (2026-09-07) a solo vote never trades:
+    the verdict is HOLD and vote_ctx carries the gate outcome."""
     coord = _bare_coord(tmp_db)
+    signal, conf, path, vote_ctx = _fuse(coord, SOLO_VOTE)
+
+    assert (signal, path) == ("HOLD", "CLUSTER")
+    assert vote_ctx["directional_count"] == 1
+    assert vote_ctx["strongest_supplier"] is None
+    assert vote_ctx["boost_applied"] is None
+    assert vote_ctx["gate_status"] == "rejected_min_agreement"
+    assert vote_ctx["gate_votes"] == 1
+    assert vote_ctx["gate_direction"] == "BUY"
+    assert vote_ctx["gate_voters"] == "Momentum"
+
+
+def test_solo_vote_attribution(tmp_db):
+    """Attribution write for a directional_count=1 vector (pre-gate era
+    forward rows can still carry one) — the gate itself is exercised
+    above; here the detector runs with the gate threshold at 1."""
+    coord = _bare_coord(tmp_db)
+    coord._cluster_detector.MIN_AGREEING_STRATEGIES = 1
     signal, conf, path, vote_ctx = _fuse(coord, SOLO_VOTE)
 
     assert vote_ctx["directional_count"] == 1
@@ -271,14 +291,24 @@ def test_fusion_decisions_pinned():
 
     # 2-vote agreement: base 0.65 + 0.10 boost
     assert _fuse(coord, TWO_VOTE)[:3] == ("BUY", 0.75, "CLUSTER")
-    # solo: base 0.65, no boost
+    # solo: rejected by the agreement gate (2026-09-07) → HOLD at the
+    # HOLD-vote convention max(0.40, 0.45) * 0.8 = 0.36
+    assert _fuse(coord, SOLO_VOTE)[:3] == ("HOLD", 0.36, "CLUSTER")
+    # solo with the gate at 1 = the pre-gate decision, byte-identical
+    coord._cluster_detector.MIN_AGREEING_STRATEGIES = 1
     assert _fuse(coord, SOLO_VOTE)[:3] == ("BUY", 0.65, "CLUSTER")
+    coord._cluster_detector.MIN_AGREEING_STRATEGIES = 2
     # conflicting: fixed 0.10
     assert _fuse(coord, CONFLICTING_VOTE)[:3] == (
         "CONFLICTING", 0.10, "CLUSTER",
     )
-    # partial cluster (2 of 3 votes)
-    assert _fuse(coord, TWO_VOTE[:2])[:3] == ("BUY", 0.65, "CLUSTER_PARTIAL")
+    # partial cluster (2 of 3 votes) — Momentum BUY + Pullback HOLD is a
+    # solo vote, so the gate turns it into HOLD (0.40 * 0.8 = 0.32)
+    assert _fuse(coord, TWO_VOTE[:2])[:3] == ("HOLD", 0.32, "CLUSTER_PARTIAL")
+    # partial cluster with two agreeing votes still passes
+    assert _fuse(coord, [TWO_VOTE[0], TWO_VOTE[2]])[:3] == (
+        "BUY", 0.75, "CLUSTER_PARTIAL",
+    )
     # no votes → combine_signals fallback (BUY/BUY agreement bonus:
     # max(0.5, 0.6) * 1.1 = 0.66)
     label, conf, path, ctx = _fuse(coord, [])

@@ -79,6 +79,20 @@ _NEWS_AGE_COLUMNS: list[tuple[str, str]] = [
     ("news_ts_missing", "INTEGER"),
 ]
 
+# Cluster agreement gate (2026-09-07): written on every Combined row that
+# went through ClusterDetector.  cluster_gate ∈ {passed,
+# rejected_min_agreement, no_directional, conflicting, no_votes};
+# cluster_votes = agreeing directional votes ≥ MIN_CONFIDENCE;
+# cluster_direction = BUY|SELL of those votes; cluster_voters = the
+# strategies behind them, comma-joined.  NULL on strategy rows and on the
+# paths that never reach the detector (PEAD override, FUSION_FALLBACK).
+_CLUSTER_GATE_COLUMNS: list[tuple[str, str]] = [
+    ("cluster_gate", "TEXT"),
+    ("cluster_votes", "INTEGER"),
+    ("cluster_direction", "TEXT"),
+    ("cluster_voters", "TEXT"),
+]
+
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,7 +178,7 @@ class SignalLogger:
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
-                for col, typedef in _NEWS_AGE_COLUMNS:
+                for col, typedef in _NEWS_AGE_COLUMNS + _CLUSTER_GATE_COLUMNS:
                     try:
                         conn.execute(
                             f"ALTER TABLE signal_events "
@@ -194,9 +208,12 @@ class SignalLogger:
                          price_at_signal, trade_executed, trade_id,
                          regime, macro_context_used, signal_path,
                          news_newest_published_at, news_age_minutes,
-                         news_ts_missing)
+                         news_ts_missing,
+                         cluster_gate, cluster_votes, cluster_direction,
+                         cluster_voters)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?)
+                            ?, ?, ?,
+                            ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -223,6 +240,10 @@ class SignalLogger:
                         signal_data.get("news_newest_published_at"),
                         signal_data.get("news_age_minutes"),
                         signal_data.get("news_ts_missing"),
+                        signal_data.get("cluster_gate"),
+                        signal_data.get("cluster_votes"),
+                        signal_data.get("cluster_direction"),
+                        signal_data.get("cluster_voters"),
                     ),
                 )
         except Exception as exc:

@@ -231,6 +231,32 @@ ATR_STOP_MULTIPLIER: float = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))
 ATR_TP_MULTIPLIER: float = float(os.environ.get("ATR_TP_MULTIPLIER", "3.0"))
 ACCOUNT_RISK_PCT: float = float(os.environ.get("ACCOUNT_RISK_PCT", "0.01"))
 
+# ---------------------------------------------------------------------------
+# Cluster agreement gate (2026-09-07) — the one place these live.
+# docs/CLUSTER_AGREEMENT_GATE_2026-09-07.md
+# ---------------------------------------------------------------------------
+# ClusterDetector emits a directional verdict only when at least this many
+# *distinct vote sources* point the same way (each vote ≥ MIN_CONFIDENCE).
+# Below the threshold the verdict is HOLD and the run is logged to
+# signal_events with cluster_gate='rejected_min_agreement' plus the vote
+# count, direction and voters.  1 restores the pre-gate behaviour (a solo
+# vote passes).  Not an env override on purpose: the value is a trading
+# rule, not a deployment knob.
+CLUSTER_MIN_AGREEING_STRATEGIES: int = 2
+
+# Strategy name → vote source.  Strategies mapped to the same source count
+# ONCE toward the threshold (two votes fed by one input stream are not
+# convergence).  Default: every strategy is its own source.  Momentum and
+# NewsCatalyst share the sentiment feed and the 20-day volume ratio (see
+# the doc, §2 — they co-fire 3.4× more often than independence predicts);
+# mapping both to one source is the knob for folding them.  Left
+# unfolded here — that is a decision, not a default.
+CLUSTER_VOTE_SOURCES: dict[str, str] = {
+    "Momentum": "Momentum",
+    "Pullback": "Pullback",
+    "NewsCatalyst": "NewsCatalyst",
+}
+
 PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
     "PEAD_EARNINGS_CACHE_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "walk-forward-backtest" / "data" / "ibkr_earnings_cache.json"),
