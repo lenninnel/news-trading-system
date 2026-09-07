@@ -18,7 +18,10 @@ state  ohlc           daily_ohlc holds the last completed US trading day
                       (ingest runs 22:30 UTC, expected from 23:00 UTC on)
 state  timer:*        nts-ohlc-ingest.timer / nts-backup.timer are active
 state  backup         newest file in the backup dir is younger than 26 h
-state  gateway        IB Gateway API port accepts TCP (after 2 misses)
+state  gateway        IB Gateway API port accepts TCP (after 2 misses;
+                      a NEW outage inside the nightly Gateway maintenance
+                      window, default 00:00–06:15 UTC, is shown but not
+                      alerted — see check_gateway)
 state  disk           ≥ 1 GB free on the DB volume
 state  db             the SQLite DB opens and answers
 event  restarts       nts-trading auto-restarted since the last check
@@ -57,7 +60,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -127,6 +130,13 @@ class Config:
     realert_hours: float = 6.0
     heartbeat_utc_hour: int = 6
     gateway_fail_cycles: int = 2
+    # Nightly IB Gateway maintenance window (UTC, [start, end), may wrap
+    # midnight). Determined from the data 2026-09-07 (watchdog journal +
+    # state, ibc-restart.timer on claw): the API port closes at 00:00 UTC
+    # (Gateway auto-logoff) and comes back with the root-side
+    # ibc-restart.timer at 06:00 UTC (listening again within ~40 s). The
+    # 15-min tail past 06:00 covers the restart itself. None = no window.
+    gateway_maint_window: tuple[time, time] | None = (time(0, 0), time(6, 15))
     disk_min_gb: float = 1.0
     pre_sessions_enabled: bool = True
     schedule: list[dict] = field(default_factory=lambda: list(_SCHEDULE))
@@ -155,7 +165,52 @@ class Config:
             backup_max_age_h=float(os.environ.get("NTS_WATCHDOG_BACKUP_MAX_AGE_H", "26")),
             disk_min_gb=float(os.environ.get("NTS_WATCHDOG_DISK_MIN_GB", "1")),
             pre_sessions_enabled=_env_bool("ENABLE_PRE_SESSIONS", True),
+            gateway_maint_window=parse_window(
+                os.environ.get("NTS_WATCHDOG_GATEWAY_MAINT_UTC", "00:00-06:15")
+            ),
         )
+
+
+def parse_window(spec: str | None) -> tuple[time, time] | None:
+    """'HH:MM-HH:MM' (UTC) → (start, end); '' / None / 'off' → None.
+
+    Raises ValueError on malformed input so a typo in .env fails the unit
+    loudly (OnFailure → nts-alert@) instead of silently disabling the
+    window or the check.
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec or spec.lower() in ("off", "none", "0"):
+        return None
+    try:
+        start_s, end_s = spec.split("-")
+        start = time.fromisoformat(start_s.strip())
+        end = time.fromisoformat(end_s.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"NTS_WATCHDOG_GATEWAY_MAINT_UTC={spec!r}: expected 'HH:MM-HH:MM'"
+        ) from exc
+    if start == end:
+        raise ValueError(
+            f"NTS_WATCHDOG_GATEWAY_MAINT_UTC={spec!r}: start and end must differ"
+        )
+    return (start, end)
+
+
+def in_window(now: datetime, window: tuple[time, time] | None) -> bool:
+    """True if ``now`` (UTC) falls in [start, end); handles midnight wrap."""
+    if window is None:
+        return False
+    start, end = window
+    t = now.astimezone(timezone.utc).time().replace(tzinfo=None)
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end
+
+
+def _fmt_window(window: tuple[time, time]) -> str:
+    return f"{window[0].strftime('%H:%M')}–{window[1].strftime('%H:%M')} UTC"
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +274,21 @@ class Check:
     kind: str           # "state" | "event" | "info"
     ok: bool | None     # None = informational / could not evaluate
     detail: str
+    muted: bool = False  # condition present but alert deliberately suppressed
+                         # (planned maintenance); shown honestly in the
+                         # status block, never counted as failing
 
     @property
     def failing(self) -> bool:
         return self.kind == "state" and self.ok is False
+
+    @property
+    def mark(self) -> str:
+        if self.kind == "info":
+            return "·"
+        if self.muted:
+            return "⏸"
+        return "✓" if self.ok else "✗"
 
 
 def _fmt_ts(dt: datetime) -> str:
@@ -404,19 +470,58 @@ def check_backup(cfg: Config, probes: Probes) -> Check:
 
 
 def check_gateway(cfg: Config, probes: Probes, state: dict) -> Check:
+    """IB Gateway API port reachable.
+
+    Alert after ``gateway_fail_cycles`` consecutive misses — except when
+    the outage BEGAN inside the nightly maintenance window
+    (``gateway_maint_window``): the Gateway logs off at 00:00 UTC and is
+    restarted by the root-side ibc-restart.timer at 06:00 UTC every day,
+    so unreachability in that window is the plan, not an incident. Inside
+    the window a fresh outage is reported as a muted check (visible in
+    the status block as ⏸, never a 🚨). The moment the window ends and
+    the port is still closed, the check fails and alerts as usual, naming
+    the time of the first miss. An outage that was already failing when
+    the window opened stays failing through it (no bogus recovery, no
+    second alert) and reports its true recovery time.
+    """
+    now = probes.now()
     reachable = bool(probes.tcp_open(cfg.ibkr_host, cfg.ibkr_port))
-    streak = 0 if reachable else int(state.get("gateway_fail_streak", 0)) + 1
+    prev_streak = int(state.get("gateway_fail_streak", 0))
+    streak = 0 if reachable else prev_streak + 1
     state["gateway_fail_streak"] = streak
+    if reachable:
+        state.pop("gateway_fail_since", None)
+    elif prev_streak == 0 or not state.get("gateway_fail_since"):
+        state["gateway_fail_since"] = now.isoformat(timespec="seconds")
     target = f"{cfg.ibkr_host}:{cfg.ibkr_port}"
+
     if reachable:
         return Check("gateway", "IB Gateway", "state", True, f"{target} accepts connections")
     if streak < cfg.gateway_fail_cycles:
-        # A single miss is the Gateway's own nightly restart — wait one more cycle.
+        # A single miss is tolerated (Gateway restart, transient) — wait one more cycle.
         return Check("gateway", "IB Gateway", "state", True,
                      f"{target} unreachable ({streak}/{cfg.gateway_fail_cycles} misses, tolerated)")
+
+    since = state.get("gateway_fail_since") or now.isoformat(timespec="seconds")
+    since_txt = since[:16].replace("T", " ") + " UTC"
+    already_failing = "gateway" in state.get("failing", {})
+    window = cfg.gateway_maint_window
+    if window is not None and in_window(now, window) and not already_failing:
+        return Check(
+            "gateway", "IB Gateway", "state", True,
+            f"{target} unreachable for {streak} consecutive checks (since {since_txt}) — "
+            f"inside the nightly Gateway maintenance window {_fmt_window(window)}, "
+            f"alert suppressed; alerts if still down after the window",
+            muted=True,
+        )
+    tail = ""
+    if window is not None and not already_failing and in_window(
+        datetime.fromisoformat(since), window
+    ):
+        tail = f" — did not come back after the maintenance window {_fmt_window(window)}"
     return Check("gateway", "IB Gateway", "state", False,
-                 f"{target} unreachable for {streak} consecutive checks — "
-                 f"no execution, no stop enforcement possible")
+                 f"{target} unreachable for {streak} consecutive checks (since {since_txt})"
+                 f"{tail} — no execution, no stop enforcement possible")
 
 
 def check_disk(cfg: Config, probes: Probes) -> Check:
@@ -616,10 +721,13 @@ def compose(cfg: Config, probes: Probes, state: dict, checks: list[Check],
         for c in checks:
             if c.kind == "event":
                 continue
-            mark = "·" if c.kind == "info" else ("✓" if c.ok else "✗")
-            lines.append(f"{mark} {c.label}: {c.detail}")
+            lines.append(f"{c.mark} {c.label}: {c.detail}")
         n_fail = sum(1 for c in checks if c.failing)
-        lines.append(f"{n_fail} failing check(s)." if n_fail else "All checks passing.")
+        n_muted = sum(1 for c in checks if c.muted)
+        summary = f"{n_fail} failing check(s)." if n_fail else "All checks passing."
+        if n_muted:
+            summary += f" {n_muted} muted (planned maintenance)."
+        lines.append(summary)
 
     return Outcome("\n".join(lines), new_failures, reminders, recoveries, events, heartbeat_due)
 

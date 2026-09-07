@@ -369,6 +369,173 @@ class TestOtherChecks:
         assert "OHLC" not in h.sent[0]
 
 
+# ── gateway maintenance window ──────────────────────────────────────────────
+#
+# Data 2026-09-07 (claw): the Gateway API port closes at 00:00 UTC every
+# night and is brought back by the root-side ibc-restart.timer at 06:00 UTC.
+# Watchdog journal 09-03..09-07: 🚨 NEW at 00:00:26, "recovered after 6.0 h"
+# at 06:00:26/41, every night. The window suppresses the alert for a
+# planned outage — nothing else.
+
+def _night(tmp_path, *, down_from=0, up_at=6):
+    """Harness starting Sun 2026-09-06 23:30 UTC; tcp probe follows a
+    nightly outage [down_from:00, up_at:00) on 2026-09-07."""
+    h = Harness(tmp_path, now=datetime(2026, 9, 6, 23, 30, tzinfo=timezone.utc),
+                max_ohlc="2026-09-04",                       # Fri before the weekend
+                sessions=[("XETRA_PRE", "2026-09-07"), ("XETRA_OPEN", "2026-09-07")])
+    # heartbeat for 09-06 already sent → nothing else fires at 23:30
+    h.cfg.state_path.write_text(json.dumps({"failing": {}, "last_heartbeat_date": "2026-09-06",
+                                            "nrestarts": 0, "gateway_fail_streak": 0}))
+
+    def probe(_h, _p):
+        t = h.now
+        if t.date() == date(2026, 9, 7) and down_from <= t.hour < up_at:
+            return False
+        return True
+    h.probes = wd.Probes(now=lambda: h.now, systemctl_show=h.systemd, tcp_open=probe,
+                         disk_free_gb=lambda p: h.free_gb, hostname=lambda: "claw")
+    return h
+
+
+def _step_through(h, until: datetime, step_min=15):
+    while h.now <= until:
+        assert h.run() == 0
+        h.advance(minutes=step_min)
+
+
+class TestGatewayMaintenanceWindow:
+    def test_nightly_restart_produces_no_alert_only_honest_heartbeat(self, tmp_path):
+        """Replay of one real night: down 00:00–06:00, back at 06:00."""
+        h = _night(tmp_path)
+        _step_through(h, datetime(2026, 9, 7, 6, 30, tzinfo=timezone.utc))
+        alarms = [m for m in h.sent if "🚨" in m or "NEW  IB Gateway" in m]
+        assert alarms == [], f"planned outage must not alert: {alarms}"
+        assert not any("recovered" in m for m in h.sent), "never failing → no recovery line"
+        # exactly the daily status block, and it shows the Gateway up (06:00 restart)
+        assert len(h.sent) == 1
+        assert h.sent[0].startswith("🫀 NTS watchdog status")
+        assert "✓ IB Gateway: 127.0.0.1:4002 accepts connections" in h.sent[0]
+        assert "All checks passing." in h.sent[0]
+        assert h.state()["failing"] == {}
+        assert h.state()["gateway_fail_streak"] == 0
+        assert "gateway_fail_since" not in h.state()
+
+    def test_heartbeat_inside_window_shows_muted_line_not_failure(self, tmp_path):
+        """If the status block fires while the port is still closed (e.g.
+        restart slower than the 06:00 tick), the line is shown as ⏸ with
+        the since-time — information kept, alert suppressed."""
+        h = _night(tmp_path, up_at=7)     # Gateway back only at 07:00 today
+        h.cfg.heartbeat_utc_hour = 5      # status block at 05:00, inside the window
+        _step_through(h, datetime(2026, 9, 7, 5, 0, tzinfo=timezone.utc))
+        assert len(h.sent) == 1
+        text = h.sent[0]
+        assert "🚨" not in text
+        assert ("⏸ IB Gateway: 127.0.0.1:4002 unreachable for 21 consecutive checks "
+                "(since 2026-09-07 00:00 UTC) — inside the nightly Gateway maintenance "
+                "window 00:00–06:15 UTC, alert suppressed; alerts if still down after the window") in text
+        assert "All checks passing. 1 muted (planned maintenance)." in text
+        assert h.state()["failing"] == {}
+
+    def test_not_back_after_window_alerts_at_first_tick_outside(self, tmp_path):
+        """Restart failed: still down at 06:15 → 🚨 immediately, naming the
+        first miss; later recovery is reported with the true duration."""
+        h = _night(tmp_path, up_at=8)
+        _step_through(h, datetime(2026, 9, 7, 6, 0, tzinfo=timezone.utc))
+        assert not any("🚨" in m for m in h.sent)
+        assert h.run() == 0                                  # 06:15 — window over
+        msg = h.sent[-1]
+        assert msg.startswith("🚨 NTS watchdog — claw — 2026-09-07 06:15 UTC")
+        assert ("NEW  IB Gateway: 127.0.0.1:4002 unreachable for 26 consecutive checks "
+                "(since 2026-09-07 00:00 UTC) — did not come back after the maintenance "
+                "window 00:00–06:15 UTC — no execution, no stop enforcement possible") in msg
+        assert "gateway" in h.state()["failing"]
+        h.advance(minutes=15); h.run()                       # 06:30 still down → silent
+        assert h.sent[-1] is msg
+        h.now = datetime(2026, 9, 7, 8, 0, tzinfo=timezone.utc); h.run()
+        assert "OK   IB Gateway recovered after 1.8 h" in h.sent[-1]
+        assert h.state()["failing"] == {}
+
+    def test_outage_outside_window_unchanged(self, tmp_path):
+        """A real daytime outage: 2 misses → 🚨 within 30 min, STILL after
+        6 h, ✅ recovery — exactly the pre-window behaviour."""
+        h = Harness(tmp_path, sessions=[("XETRA_PRE", "2026-09-01"), ("XETRA_OPEN", "2026-09-01")])
+        h.run()                                              # 10:30 heartbeat
+        h.tcp_ok = False
+        h.advance(minutes=15); h.run()                       # 10:45 miss 1 tolerated
+        assert len(h.sent) == 1
+        h.advance(minutes=15); h.run()                       # 11:00 miss 2 → alert
+        assert ("NEW  IB Gateway: 127.0.0.1:4002 unreachable for 2 consecutive checks "
+                "(since 2026-09-01 10:45 UTC) — no execution, no stop enforcement possible") in h.sent[-1]
+        assert "maintenance" not in h.sent[-1]
+        h.advance(hours=6); h.run()
+        assert "STILL IB Gateway (since 2026-09-01 11:00)" in h.sent[-1]
+        h.tcp_ok = True
+        h.advance(minutes=15); h.run()
+        assert "OK   IB Gateway recovered after 6.2 h" in h.sent[-1]
+
+    def test_outage_that_started_before_window_stays_failing_through_it(self, tmp_path):
+        """Down since 22:00: alerted at 22:30, must NOT flip to ok at 00:00
+        (no bogus recovery / re-alert) and reports the real 8 h outage
+        when the 06:00 restart brings it back."""
+        h = _night(tmp_path, down_from=0, up_at=6)
+        h.now = datetime(2026, 9, 6, 22, 0, tzinfo=timezone.utc)
+        real_probe = h.probes.tcp_open
+        h.probes.tcp_open = lambda a, b: False if h.now.date() == date(2026, 9, 6) else real_probe(a, b)
+        _step_through(h, datetime(2026, 9, 6, 22, 30, tzinfo=timezone.utc))
+        assert any("NEW  IB Gateway" in m for m in h.sent)
+        n_before = len(h.sent)
+        _step_through(h, datetime(2026, 9, 7, 5, 45, tzinfo=timezone.utc))
+        later = h.sent[n_before:]
+        assert not any("recovered" in m or "NEW  IB Gateway" in m for m in later)
+        assert [m for m in later if "STILL IB Gateway (since 2026-09-06 22:15)" in m], "6 h reminder still comes"
+        assert "gateway" in h.state()["failing"]
+        h.now = datetime(2026, 9, 7, 6, 0, tzinfo=timezone.utc); h.run()
+        assert "OK   IB Gateway recovered after 7.8 h" in h.sent[-1]
+
+    def test_window_disabled_restores_old_behaviour(self, tmp_path):
+        h = _night(tmp_path)
+        h.cfg.gateway_maint_window = None
+        _step_through(h, datetime(2026, 9, 7, 0, 15, tzinfo=timezone.utc))
+        assert any("NEW  IB Gateway: 127.0.0.1:4002 unreachable for 2 consecutive checks" in m
+                   for m in h.sent)
+
+    @pytest.mark.parametrize("spec,expected", [
+        ("00:00-06:15", (wd.time(0, 0), wd.time(6, 15))),
+        (" 23:30 - 06:00 ", (wd.time(23, 30), wd.time(6, 0))),
+        ("", None), ("off", None), (None, None),
+    ])
+    def test_parse_window(self, spec, expected):
+        assert wd.parse_window(spec) == expected
+
+    @pytest.mark.parametrize("spec", ["00:00", "6-7", "00:00-00:00", "aa:bb-cc:dd"])
+    def test_parse_window_rejects_garbage_loudly(self, spec):
+        with pytest.raises(ValueError):
+            wd.parse_window(spec)
+
+    @pytest.mark.parametrize("hour,minute,inside", [
+        (23, 59, False), (0, 0, True), (3, 0, True), (6, 14, True), (6, 15, False), (12, 0, False),
+    ])
+    def test_in_window_default(self, hour, minute, inside):
+        now = datetime(2026, 9, 7, hour, minute, tzinfo=timezone.utc)
+        assert wd.in_window(now, (wd.time(0, 0), wd.time(6, 15))) is inside
+
+    @pytest.mark.parametrize("hour,minute,inside", [
+        (23, 29, False), (23, 30, True), (2, 0, True), (5, 59, True), (6, 0, False), (22, 0, False),
+    ])
+    def test_in_window_wraps_midnight(self, hour, minute, inside):
+        now = datetime(2026, 9, 7, hour, minute, tzinfo=timezone.utc)
+        assert wd.in_window(now, (wd.time(23, 30), wd.time(6, 0))) is inside
+
+    def test_env_window_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("DB_PATH", str(tmp_path / "db.sqlite"))
+        monkeypatch.setenv("NTS_WATCHDOG_GATEWAY_MAINT_UTC", "23:45-06:30")
+        assert wd.Config.from_env().gateway_maint_window == (wd.time(23, 45), wd.time(6, 30))
+        monkeypatch.setenv("NTS_WATCHDOG_GATEWAY_MAINT_UTC", "")
+        assert wd.Config.from_env().gateway_maint_window is None
+        monkeypatch.delenv("NTS_WATCHDOG_GATEWAY_MAINT_UTC")
+        assert wd.Config.from_env().gateway_maint_window == (wd.time(0, 0), wd.time(6, 15))
+
+
 # ── delivery + state robustness ─────────────────────────────────────────────
 
 class TestDelivery:

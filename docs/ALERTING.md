@@ -50,7 +50,7 @@ use it — before, they called a non-existent `send_message` on a notifier that
 | OHLC ingest **did not run / no new data** | **yes** | watchdog (`ohlc`) | `MAX(date)` in `daily_ohlc` must be the last US trading day once it is ≥ 23:00 UTC; uses `data/market_calendar.py` (Labor Day etc.) |
 | Ingest / backup timer disabled | **yes** | watchdog (`timer:*`) | |
 | Backup missing (> 26 h) | **yes** | watchdog (`backup`) + `nts-alert@` on unit failure | |
-| IB Gateway unreachable | **yes** | watchdog (`gateway`) | TCP to `IBKR_HOST:IBKR_PORT`, after 2 consecutive misses (tolerates the nightly Gateway restart) |
+| IB Gateway unreachable | **yes** | watchdog (`gateway`) | TCP to `IBKR_HOST:IBKR_PORT`, after 2 consecutive misses. An outage that *starts* inside the nightly maintenance window (00:00–06:15 UTC) is muted, not alerted — see §3a |
 | IBKR connection lost in the daemon | **yes** | PositionManager | market hours only: after 3 consecutive failed reconnect cycles, once per outage, plus "✅ restored" |
 | IBKR reconnect failed before a session | **yes** | daemon | "🚨 IBKR reconnect failed before US_OPEN" |
 | PositionManager failed to start | yes | daemon | |
@@ -74,8 +74,11 @@ use it — before, they called a non-existent `send_message` on a notifier that
 
 * MIDDAY session start/summary (existing design: the monitor session is too noisy). A MIDDAY crash still reports via "Scheduler error", and a missed MIDDAY via the watchdog.
 * XETRA duplicate-run skips (deploy overlap noise).
-* A single failed IBKR reconnect cycle, a single Gateway port miss
-  (Gateway restarts nightly), a single missing session before its grace.
+* A single failed IBKR reconnect cycle, a single Gateway port miss, a
+  single missing session before its grace.
+* The Gateway's nightly maintenance gap 00:00–06:00 UTC (§3a): shown in
+  the status block as ⏸ if it happens to be open at heartbeat time,
+  never a 🚨.
 * Exit orders that *time out* (not rejected): the PositionManager retries
   next cycle; only broker-side cancellation is alerted.
 * Watchdog runs where nothing changed: no message at all. Silence between
@@ -110,6 +113,48 @@ then, if unattended, a `STILL daemon (since 2026-09-01 10:45): …` line at
 systemd's own restart limit was hit, `nts-alert@` additionally posts
 `❌ nts-trading.service FAILED on claw …` with the last 15 journal lines.
 
+### 3a. IB Gateway maintenance window (2026-09-07)
+
+Data, not assumption. Watchdog journal + state on `claw`, five nights
+2026-09-03 → 09-07 (every night since the watchdog went live): the port
+probe flips to unreachable at the 00:00:26 run (23:45 was fine) and is
+back at the 06:00:26/41 run (05:45 still down) — `🚨 NEW … unreachable
+for 2 consecutive checks` at 00:00 and `✅ OK … recovered after 6.0 h`
+at 06:00, five times. Cause on the host: the Gateway logs off at 00:00
+UTC (its own auto-logoff; the IBC ini on `claw` sets no restart time),
+and the root-side `ibc-restart.timer` (`OnCalendar=*-*-* 06:00:00 UTC`,
+`systemctl restart ibgateway.service`) brings it back —
+`ExecMainStartTimestamp=06:00:01`, port listening within ~40 s. Six
+hours of no Gateway is the plan, and it sits entirely outside US RTH.
+
+Behaviour (`check_gateway`):
+
+* Unreachable **inside** the window and not already failing → the check
+  is `muted`: no NEW, no STILL, no OK line; the state file never marks
+  it failing. If the 06:00 status block catches it still down, the line
+  reads `⏸ IB Gateway: … unreachable for N consecutive checks (since
+  2026-09-07 00:00 UTC) — inside the nightly Gateway maintenance window
+  00:00–06:15 UTC, alert suppressed; …` and the summary says
+  `… 1 muted (planned maintenance).`
+* Still unreachable at the first run **after** the window (06:15) →
+  `🚨 NEW IB Gateway: … unreachable for 26 consecutive checks (since
+  2026-09-07 00:00 UTC) — did not come back after the maintenance window
+  00:00–06:15 UTC — …`, then STILL every 6 h and OK on recovery with the
+  true duration.
+* Outage that **started before** the window (e.g. 22:00) → alerted at
+  22:30 as before, stays failing through the window (no bogus recovery
+  or second alert), STILL reminders continue, `OK … recovered after
+  7.8 h` when the 06:00 restart brings it back.
+* Outage **outside** the window → unchanged: 2 misses → 🚨 within 30 min,
+  STILL every 6 h, ✅ recovery. The first-miss time is now part of the
+  line.
+
+Window: `NTS_WATCHDOG_GATEWAY_MAINT_UTC=HH:MM-HH:MM` (default
+`00:00-06:15`, may wrap midnight, empty/`off` disables; a malformed
+value fails the unit loudly via `nts-alert@`). The 15-min tail past
+06:00 covers the restart itself. If the root-side timer ever moves,
+move the window with it.
+
 **How you know the watchdog itself is alive:** the 🫀 status block arrives
 every morning at 06:00 UTC (08:00 Berlin summer). If it does not, one of
 these is broken — watchdog script, its timer, `.env` credentials, Telegram,
@@ -123,8 +168,9 @@ Tunables (env, all optional): `NTS_WATCHDOG_DB` (default `DB_PATH` →
 `/home/trading/trading-data/news_trading.db`), `NTS_WATCHDOG_STATE`,
 `NTS_WATCHDOG_SESSION_GRACE_MIN=20`, `NTS_WATCHDOG_REALERT_HOURS=6`,
 `NTS_WATCHDOG_HEARTBEAT_UTC_HOUR=6`, `NTS_WATCHDOG_BACKUP_MAX_AGE_H=26`,
-`NTS_WATCHDOG_DISK_MIN_GB=1`, `NTS_BACKUP_DST_DIR`, `IBKR_HOST`, `IBKR_PORT`,
-`ENABLE_PRE_SESSIONS` (XETRA_PRE expectation follows the daemon's flag).
+`NTS_WATCHDOG_DISK_MIN_GB=1`, `NTS_WATCHDOG_GATEWAY_MAINT_UTC=00:00-06:15`,
+`NTS_BACKUP_DST_DIR`, `IBKR_HOST`, `IBKR_PORT`, `ENABLE_PRE_SESSIONS`
+(XETRA_PRE expectation follows the daemon's flag).
 
 ## 4. Install on the VPS (as `trading`, after `git pull` of the merged main)
 

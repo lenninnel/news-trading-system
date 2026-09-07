@@ -90,7 +90,7 @@ from data.social_feed import AdanosFeed, ApeWisdomFeed, RedditFeed, StockTwitsFe
 from execution.broker_factory import create_trader
 from execution.portfolio_manager import PortfolioManager
 from orchestrator.cluster_detector import ClusterDetector
-from orchestrator.level_gate import apply_level_override
+from orchestrator.level_gate import apply_level_pair_override
 from utils.timeparse import age_minutes, parse_utc, to_iso_utc
 from storage.database import Database
 from strategies.base import StrategyResult
@@ -2691,13 +2691,17 @@ class Coordinator:
                 )
 
             if not risk["skipped"]:
-                # Use forward signal SL/TP if available — candidates
-                # route through the F2 chokepoint gate (level_gate.py):
-                # adopt a forward level only when it sits on the correct
-                # side of the actual fill price (long-only BUY path);
-                # non-adoption keeps the fresh risk_agent calc per leg.
+                # Use forward signal SL/TP if available — the candidate
+                # PAIR routes through the F2 chokepoint gate
+                # (level_gate.py): both legs must sit on the correct side
+                # of the fill (long-only BUY path) AND both must satisfy
+                # the level-integrity invariant v2 against the fresh
+                # risk_agent calc; otherwise BOTH fresh levels are kept.
                 # 2026-07-02: stale US_PRE levels landed above the fill
-                # (TRGP/VRT SL) or below it (AAPL TP).
+                # (TRGP/VRT SL) or below it (AAPL TP). 2026-09-01/02:
+                # per-leg gating combined a fresh SL with a forward TP
+                # (executed R:R 1.30–2.24 vs the 2.00 model) — hence the
+                # all-or-nothing pair rule (2026-09-07).
                 _gate_ctx = {
                     "ticker": ticker,
                     "session": session,
@@ -2705,12 +2709,8 @@ class Coordinator:
                     "fill_valid": bool(current_price and current_price > 0),
                 }
                 for fwd in pending:
-                    apply_level_override(
-                        risk, "sl", fwd.get("stop_loss"),
-                        current_price, _gate_ctx,
-                    )
-                    apply_level_override(
-                        risk, "tp", fwd.get("take_profit"),
+                    apply_level_pair_override(
+                        risk, fwd.get("stop_loss"), fwd.get("take_profit"),
                         current_price, _gate_ctx,
                     )
                     break  # use first matching forward signal

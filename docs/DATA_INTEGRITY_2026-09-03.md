@@ -9,6 +9,8 @@ measurable.
 2. News age — the publication time of every processed headline is kept
    and persisted through to the signal.
 3. Executed R:R spread — diagnosed, not fixed (finding below).
+   → fixed 2026-09-07 by the symmetric pair rule, see
+   `docs/LEVEL_GATE_SYMMETRY_2026-09-07.md`.
 
 ---
 

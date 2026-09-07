@@ -778,20 +778,24 @@ class TestF2ForwardOverrideSanityGate:
     WARNING.
 
     Since the F2 chokepoint migration (R-spec v1.1) the gate lives in
-    orchestrator/level_gate.apply_level_override; this site's former
-    inline comparisons, WARNINGs, and broad fail-to-fresh try/except
-    were replaced by two helper calls per pending signal (S6a).
+    orchestrator/level_gate; this site's former inline comparisons,
+    WARNINGs, and broad fail-to-fresh try/except were replaced by helper
+    calls per pending signal (S6a). Since 2026-09-07 the site calls the
+    PAIR helper (apply_level_pair_override): a rejected leg keeps BOTH
+    fresh levels, so SL and TP never come from different runs (the
+    2026-09-01/02 R:R spread, docs/DATA_INTEGRITY_2026-09-03.md).
     """
 
     # Fresh risk_agent levels per case (correct-side, distinct from the
     # forward levels so accept vs reject is unambiguous). Since the
-    # level-integrity invariant v2 (model_mismatch, tolerance 0.05) the
-    # synthetic fresh SL of an accepted leg must sit within tolerance of
-    # the forward SL — AAPL's fresh SL is chosen accordingly; TRGP/VRT
-    # reject at wrong_side before the invariant runs.
+    # level-integrity invariant v2 (model_mismatch, tolerance 0.05, on
+    # both legs since 2026-09-07) the synthetic fresh level of the leg
+    # that passes on its own must sit within tolerance of the forward
+    # level — AAPL's fresh SL and TRGP/VRT's fresh TP are chosen
+    # accordingly; the wrong-side leg rejects before the invariant runs.
     FRESH = {
-        "TRGP": (254.89, 270.55),
-        "VRT": (306.71, 325.50),
+        "TRGP": (254.89, 289.50),
+        "VRT": (306.71, 399.00),
         "AAPL": (283.60, 320.17),
         "HLTH": (98.50, 103.00),
     }
@@ -862,19 +866,21 @@ class TestF2ForwardOverrideSanityGate:
         ]
 
     @pytest.mark.parametrize(
-        "ticker,fill,fwd_sl,fwd_tp,sl_accepted,tp_accepted",
+        "ticker,fill,fwd_sl,fwd_tp,wrong_leg",
         [
-            ("TRGP", 257.67, 262.7772, 289.8278, False, True),
-            ("VRT", 310.00, 328.1236, 399.2282, False, True),
-            ("AAPL", 304.92, 283.5728, 300.9344, True, False),
+            ("TRGP", 257.67, 262.7772, 289.8278, "sl"),
+            ("VRT", 310.00, 328.1236, 399.2282, "sl"),
+            ("AAPL", 304.92, 283.5728, 300.9344, "tp"),
         ],
     )
     def test_replay_2026_07_02(
-        self, caplog, ticker, fill, fwd_sl, fwd_tp, sl_accepted, tp_accepted,
+        self, caplog, ticker, fill, fwd_sl, fwd_tp, wrong_leg,
     ):
         """Replay of the three 2026-07-02 fills with the real forward
-        levels: wrong-side legs are rejected (fresh kept + WARNING),
-        correct-side legs are adopted."""
+        levels: the wrong-side leg is rejected (WARNING) and — pair rule —
+        the other leg is held back as pair_rejected, so BOTH fresh
+        levels execute. (Before 2026-09-07 the correct-side leg was
+        adopted alone, i.e. a mixed pair.)"""
         fresh_sl, fresh_tp = self.FRESH[ticker]
         c = self._make_coordinator(
             fill=fill, fwd_sl=fwd_sl, fwd_tp=fwd_tp,
@@ -884,23 +890,26 @@ class TestF2ForwardOverrideSanityGate:
             result = self._run(c, ticker)
 
         risk = result["risk"]
-        assert risk["stop_loss"] == (fwd_sl if sl_accepted else fresh_sl)
-        assert risk["take_profit"] == (fwd_tp if tp_accepted else fresh_tp)
+        assert risk["stop_loss"] == fresh_sl
+        assert risk["take_profit"] == fresh_tp
 
         warnings = self._f2_warnings(caplog)
-        assert len(warnings) == (not sl_accepted) + (not tp_accepted)
-        if not sl_accepted:
-            assert any(
-                f"origin=forward leg=sl reason=wrong_side candidate={fwd_sl} "
-                f"fill={fill} kept fresh={fresh_sl}" in w
-                for w in warnings
-            )
-        if not tp_accepted:
-            assert any(
-                f"origin=forward leg=tp reason=wrong_side candidate={fwd_tp} "
-                f"fill={fill} kept fresh={fresh_tp}" in w
-                for w in warnings
-            )
+        assert len(warnings) == 2, "one line per leg"
+        other_leg = "tp" if wrong_leg == "sl" else "sl"
+        wrong_cand = fwd_sl if wrong_leg == "sl" else fwd_tp
+        wrong_fresh = fresh_sl if wrong_leg == "sl" else fresh_tp
+        other_cand = fwd_tp if wrong_leg == "sl" else fwd_sl
+        other_fresh = fresh_tp if wrong_leg == "sl" else fresh_sl
+        assert any(
+            f"origin=forward leg={wrong_leg} reason=wrong_side candidate={wrong_cand} "
+            f"fill={fill} kept fresh={wrong_fresh}" in w
+            for w in warnings
+        )
+        assert any(
+            f"origin=forward leg={other_leg} reason=pair_rejected candidate={other_cand} "
+            f"other_leg={wrong_leg}:wrong_side fill={fill} kept fresh={other_fresh}" in w
+            for w in warnings
+        )
 
         # The trade executes with the gated levels.
         kwargs = c.paper_trader.track_trade.call_args.kwargs
@@ -911,11 +920,12 @@ class TestF2ForwardOverrideSanityGate:
         """Correct-side forward levels are adopted verbatim (level
         continuity: the exact objects, no transformation) and no
         F2-gate WARNING is emitted."""
-        # fwd_sl within invariant tolerance of the fresh 98.50:
-        # |98.50 − 98.45| / (100 − 98.50) = 0.0333 ≤ 0.05
+        # both legs within invariant tolerance of the fresh levels:
+        # sl |98.50 − 98.45| / (100 − 98.50) = 0.0333 ≤ 0.05
+        # tp |103.00 − 103.10| / (103.00 − 100) = 0.0333 ≤ 0.05
         fresh_sl, fresh_tp = self.FRESH["HLTH"]
         c = self._make_coordinator(
-            fill=100.00, fwd_sl=98.45, fwd_tp=106.00,
+            fill=100.00, fwd_sl=98.45, fwd_tp=103.10,
             fresh_sl=fresh_sl, fresh_tp=fresh_tp,
         )
         fwd_row = c.signal_logger.get_pending_forward_signals.return_value[0]
@@ -928,12 +938,12 @@ class TestF2ForwardOverrideSanityGate:
         assert risk["stop_loss"] is fwd_row["stop_loss"]
         assert risk["take_profit"] is fwd_row["take_profit"]
         assert risk["stop_loss"] == 98.45
-        assert risk["take_profit"] == 106.00
+        assert risk["take_profit"] == 103.10
         assert self._f2_warnings(caplog) == []
 
         kwargs = c.paper_trader.track_trade.call_args.kwargs
         assert kwargs["stop_loss"] == 98.45
-        assert kwargs["take_profit"] == 106.00
+        assert kwargs["take_profit"] == 103.10
 
     def test_corrupt_forward_value_raises(self):
         """MIGRATION NOTE (F2 chokepoint, R-spec v1.1 S6a): the former
