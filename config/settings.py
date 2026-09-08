@@ -261,6 +261,30 @@ CLUSTER_VOTE_SOURCES: dict[str, str] = {
     "NewsCatalyst": "NewsCatalyst",
 }
 
+# ---------------------------------------------------------------------------
+# Re-entry lock after a stop-loss exit (PortfolioManager gate 1b)
+# docs/REENTRY_LOCK_2026-09-08.md
+# ---------------------------------------------------------------------------
+# After a round trip ends in a stop-loss exit, the same ticker cannot be
+# bought again for this many US trading sessions (data.market_calendar —
+# weekends AND full-day holidays do not count as sessions). 0 = same session
+# only, 1 = the pre-2026-09 Q-016 cool-down. Every rejected BUY is written to
+# signal_events (strategy='PortfolioManager', signal_path='REENTRY_LOCK')
+# with the stop timestamp, the sessions elapsed / remaining and the first
+# eligible session. 5 = one trading week: in the audited book (2026-05-04 …
+# 2026-09-04, 78 after-stop re-entries) 62 % of them landed within 4
+# sessions, sessions 5–6 were empty, and the tail beyond is diffuse — the
+# lock covers the dense cluster and ends at the empirical break. Not an env
+# override on purpose: a trading rule, not a deployment knob.
+REENTRY_LOCK_SESSIONS: int = 5
+
+# Whether a TRAILING-stop exit (PositionManager 'stop_loss_triggered' at a
+# level above the entry stop, i.e. a profitable exit after a >2 % run-up)
+# also arms the lock. Off: the lock covers stop-LOSS exits only, which is
+# what the rule says. The audit found re-entries after trailing exits
+# equally poor (N=47, −1.00 % per trade) — that is reported, not folded in.
+REENTRY_LOCK_INCLUDE_TRAILING: bool = False
+
 PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
     "PEAD_EARNINGS_CACHE_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "walk-forward-backtest" / "data" / "ibkr_earnings_cache.json"),

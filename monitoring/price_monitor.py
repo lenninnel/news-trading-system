@@ -21,8 +21,10 @@ Modes
 
 Market hours (active if ANY market is open)
 -------------------------------------------
-  US (NYSE)   Mon–Fri  09:30–16:00  America/New_York
-  EU (XETRA)  Mon–Fri  09:00–17:30  Europe/Berlin
+  US (NYSE)   trading days (Mon–Fri minus full-day NYSE holidays,
+              data.market_calendar)  09:30–16:00  America/New_York
+  EU (XETRA)  Mon–Fri  09:00–17:30  Europe/Berlin  (no EU holiday
+              calendar in the repo — weekday only, documented gap)
 
 Alert spam protection
 ---------------------
@@ -60,6 +62,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import DB_PATH                           # noqa: E402
+from data.market_calendar import is_us_trading_day, next_us_rth_open  # noqa: E402
 from execution.paper_trader import PaperTrader                # noqa: E402
 from storage.database import Database                         # noqa: E402
 
@@ -499,7 +502,12 @@ class PriceMonitor:
     # ------------------------------------------------------------------
 
     def _is_market_hours(self) -> bool:
-        """Return True if US NYSE or EU XETRA is currently open."""
+        """Return True if US NYSE or EU XETRA is currently open.
+
+        US: trading day per data.market_calendar (weekday, not a full-day
+        NYSE holiday) and 09:30–16:00 ET. EU: weekday and 09:00–17:30 CET
+        (no EU holiday calendar available).
+        """
         now_et  = datetime.now(_TZ_ET)
         now_cet = datetime.now(_TZ_CET)
         weekday = now_et.weekday()   # 0=Mon … 4=Fri; 5=Sat, 6=Sun
@@ -507,10 +515,10 @@ class PriceMonitor:
         if weekday >= 5:             # Weekend — both markets closed
             return False
 
-        # US NYSE: 09:30–16:00 ET
+        # US NYSE: 09:30–16:00 ET on a trading day
         us_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
         us_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-        if us_open <= now_et <= us_close:
+        if is_us_trading_day(now_et.date()) and us_open <= now_et <= us_close:
             return True
 
         # EU XETRA: 09:00–17:30 CET
@@ -535,32 +543,18 @@ class PriceMonitor:
         eu_open  = now_cet.replace(hour=9,  minute=0,  second=0, microsecond=0)
         eu_close = now_cet.replace(hour=17, minute=30, second=0, microsecond=0)
 
-        us = "US open" if us_open <= now_et <= us_close else "US closed"
+        if not is_us_trading_day(now_et.date()):
+            us = "US holiday"
+        else:
+            us = "US open" if us_open <= now_et <= us_close else "US closed"
         eu = "EU open" if eu_open <= now_cet <= eu_close else "EU closed"
         return f"{us}, {eu}"
 
     def _seconds_until_open(self) -> float:
-        """Return seconds until the next market session opens."""
-        now_et  = datetime.now(_TZ_ET)
-        weekday = now_et.weekday()
-
-        # Days until next weekday (0=Mon)
-        if weekday >= 5:
-            days_ahead = (7 - weekday)   # 5→2, 6→1
-        else:
-            days_ahead = 0
-
-        import datetime as _dt
-        next_open_local = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        if days_ahead == 0 and now_et >= next_open_local:
-            # Past open today → tomorrow
-            next_open_local = next_open_local + _dt.timedelta(days=1)
-            if next_open_local.weekday() >= 5:
-                next_open_local = next_open_local + _dt.timedelta(days=2)
-        elif days_ahead > 0:
-            next_open_local = next_open_local + _dt.timedelta(days=days_ahead)
-
-        diff = (next_open_local - now_et).total_seconds()
+        """Seconds until the next US regular-session open (09:30 New York
+        on the next trading day — weekends and NYSE holidays skipped)."""
+        now_et = datetime.now(_TZ_ET)
+        diff = (next_us_rth_open(now_et) - now_et).total_seconds()
         return max(diff, 60.0)
 
 

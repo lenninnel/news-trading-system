@@ -624,6 +624,7 @@ class Coordinator:
                             proposed_usd = float(risk["shares"]) * float(price)
                             allowed, pm_reason = self._portfolio_manager.can_add_position(
                                 ticker, "PEAD", proposed_usd,
+                                session=session, price=price,
                             )
                             if not allowed:
                                 pm_blocked = True
@@ -1768,6 +1769,7 @@ class Coordinator:
                     proposed_usd = float(risk["shares"]) * float(price)
                     allowed, pm_reason = self._portfolio_manager.can_add_position(
                         ticker, strat_name, proposed_usd,
+                        session=session, price=price,
                     )
                     if not allowed:
                         pm_blocked = True
@@ -2206,6 +2208,7 @@ class Coordinator:
                             proposed_usd = float(risk["shares"]) * float(price)
                             allowed, reason = self._portfolio_manager.can_add_position(
                                 ticker, strat_name, proposed_usd,
+                                session=session, price=price,
                             )
                             if not allowed:
                                 pm_blocked = True
@@ -2810,6 +2813,7 @@ class Coordinator:
                                 proposed_usd = float(risk["shares"]) * float(current_price)
                                 allowed, pm_reason = self._portfolio_manager.can_add_position(
                                     ticker, strat_name, proposed_usd,
+                                    session=session, price=current_price,
                                 )
                                 if not allowed:
                                     pm_blocked = True

@@ -1,8 +1,12 @@
 """Minimal US (NYSE/Nasdaq) trading-day calendar — pure Python, no network.
 
 Used by the OHLC ingest freshness gate to compute the *expected* most recent
-completed trading session for a given date. Full-day holidays only; early
-closes (half days) still produce a daily bar and need no special handling.
+completed trading session for a given date, by the PositionManager /
+PriceMonitor stale-feed guards to know whether a regular session is running
+at all, and by the PortfolioManager re-entry lock to count trading sessions
+since a stop-loss exit. Full-day holidays only; early closes (half days)
+still produce a daily bar, are treated as full sessions here, and need no
+special handling for any of those callers.
 
 Known limitation: unscheduled closures (e.g. a national day of mourning) are
 not modelled. On such a day the freshness gate fails once with a clear
@@ -10,8 +14,13 @@ message — a human seeing "market was closed" can ignore that single alert.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
+from zoneinfo import ZoneInfo
+
+NY_TZ = ZoneInfo("America/New_York")
+US_RTH_OPEN = time(9, 30)    # regular trading hours, America/New_York
+US_RTH_CLOSE = time(16, 0)
 
 
 def _easter_sunday(year: int) -> date:
@@ -84,3 +93,55 @@ def last_us_trading_day(d: date) -> date:
     while not is_us_trading_day(d):
         d -= timedelta(days=1)
     return d
+
+
+def next_us_trading_day(d: date) -> date:
+    """First US trading day strictly after `d`."""
+    d += timedelta(days=1)
+    while not is_us_trading_day(d):
+        d += timedelta(days=1)
+    return d
+
+
+def us_sessions_between(start: date, end: date) -> int:
+    """Number of US trading sessions in the half-open range (start, end].
+
+    0 when `end` is on or before `start`. Same-day = 0, the next trading day
+    = 1 — the counter the re-entry lock and its audit use, so a holiday
+    (e.g. Fri 2026-07-03) between a stop and a re-entry does not count as a
+    session the ticker sat out.
+    """
+    if end <= start:
+        return 0
+    n = 0
+    d = start
+    while d < end:
+        d += timedelta(days=1)
+        if is_us_trading_day(d):
+            n += 1
+    return n
+
+
+def is_us_rth(now: datetime) -> bool:
+    """True while the US regular session is open: a trading day (weekday,
+    not a full-day holiday) between 09:30 and 16:00 America/New_York.
+
+    `now` must be timezone-aware; it is converted to New York time here.
+    """
+    if now.tzinfo is None:
+        raise ValueError("is_us_rth needs a timezone-aware datetime")
+    local = now.astimezone(NY_TZ)
+    if not is_us_trading_day(local.date()):
+        return False
+    return US_RTH_OPEN <= local.time() < US_RTH_CLOSE
+
+
+def next_us_rth_open(now: datetime) -> datetime:
+    """Next 09:30 New York open strictly after `now` on a trading day."""
+    if now.tzinfo is None:
+        raise ValueError("next_us_rth_open needs a timezone-aware datetime")
+    local = now.astimezone(NY_TZ)
+    d = local.date()
+    if not (is_us_trading_day(d) and local.time() < US_RTH_OPEN):
+        d = next_us_trading_day(d)
+    return datetime.combine(d, US_RTH_OPEN, tzinfo=NY_TZ)

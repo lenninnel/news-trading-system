@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 # the NYSE opens at 13:30 UTC, so the monitor was skipping the first
 # hour of every summer trading day.
 _NY_TZ = ZoneInfo("America/New_York")
+from data.market_calendar import is_us_trading_day  # noqa: E402
 _MARKET_OPEN_LOCAL = (9, 30)    # 9:30 AM ET
 _MARKET_CLOSE_LOCAL = (16, 0)   # 4:00 PM ET
 
@@ -49,6 +50,13 @@ _TRAILING_LOCK_PCT = 1.0         # trail locks in at least 1% gain
 # stop/TP/trailing exit — better to skip the ticker (fail closed) than to
 # evaluate exits against a stale price.
 _MAX_BAR_AGE_MINUTES = 5
+# STALE FEED alerting cadence (2026-09-08): one Telegram message when a
+# ticker's feed turns stale during RTH, then one reminder every
+# _STALE_REALERT_MINUTES while it stays stale, one recovery line when a
+# fresh bar returns.  Every stale poll still writes a journal WARNING.
+# Before this the alert fired on every 60 s poll (Labor Day 2026-09-07:
+# several hundred messages for six tickers on a closed market).
+_STALE_REALERT_MINUTES = 60
 
 # Consecutive market-hours cycles without a broker connection before the
 # outage is escalated to Telegram (3 × 60s = ~3 minutes).
@@ -103,6 +111,10 @@ class PositionManager:
         # row is a dead feed — the streak is carried in both the journal
         # line and the Telegram escalation so severity is readable.
         self._stale_streaks: dict[str, int] = {}
+        # Stale-feed alert state: ticker → monotonic time of the last
+        # Telegram escalation. Present = an outage alert is outstanding
+        # for that ticker (recovery line owed when a fresh bar returns).
+        self._stale_alerted_at: dict[str, float] = {}
 
         # Broker-connection outage tracking: consecutive cycles in which
         # the trader could not be (re)connected during market hours. One
@@ -233,9 +245,11 @@ class PositionManager:
 
     @staticmethod
     def _is_market_hours() -> bool:
-        """Return True if it's a US-Eastern weekday between 9:30 and 16:00."""
+        """True during the US regular session: a trading day (weekday that
+        is not a full-day NYSE holiday, per data.market_calendar) between
+        9:30 and 16:00 America/New_York."""
         now = datetime.now(_NY_TZ)
-        if now.weekday() >= 5:  # weekend
+        if now.weekday() >= 5 or not is_us_trading_day(now.date()):
             return False
 
         now_minutes = now.hour * 60 + now.minute
@@ -746,11 +760,14 @@ class PositionManager:
         open. Outside RTH a stale last bar is expected (the feed idles
         overnight) and only a journal WARNING is written.
 
-        NOTE: "RTH" here is _is_market_hours(), which is weekday + time
-        window ONLY, because the scheduler has no market-holiday calendar
-        (B1 finding, 2026-08-25). On a US market holiday this check will
-        treat the day as RTH and escalate on stale bars. The holiday
-        calendar is its own ticket. Do not pretend otherwise.
+        "RTH" is _is_market_hours(): weekday, not a full-day NYSE holiday
+        (data.market_calendar), 09:30–16:00 New York. Until 2026-09-08 it
+        was weekday + time window only and escalated all through Labor Day.
+
+        ALERT CADENCE: first stale poll in RTH → one Telegram message; while
+        the feed stays stale → one reminder every _STALE_REALERT_MINUTES;
+        first fresh bar after an alerted outage → one recovery line. The
+        journal WARNING is written on every stale poll regardless.
         """
         try:
             import yfinance as yf
@@ -786,19 +803,40 @@ class PositionManager:
                     streak,
                 )
                 if self._is_market_hours():
-                    self._send_alert(
-                        f"⚠️ STALE FEED: {ticker} last bar "
-                        f"{age_min:.1f}min old during market hours — "
-                        f"{streak} consecutive stale poll(s). Exits "
-                        f"cannot be evaluated."
-                    )
+                    self._maybe_alert_stale(ticker, age_min, streak)
                 return None
 
             self._stale_streaks.pop(ticker, None)
+            self._alert_stale_recovered(ticker)
             return float(data["Close"].iloc[-1])
         except Exception as exc:
             log.warning("yfinance fetch failed for %s: %s", ticker, exc)
             return None
+
+    def _maybe_alert_stale(self, ticker: str, age_min: float, streak: int) -> None:
+        """Escalate a stale feed once at onset, then every
+        _STALE_REALERT_MINUTES while it persists."""
+        now = time.monotonic()
+        last = self._stale_alerted_at.get(ticker)
+        if last is not None and (now - last) < _STALE_REALERT_MINUTES * 60:
+            return
+        self._stale_alerted_at[ticker] = now
+        prefix = "⚠️ STALE FEED" if last is None else "⚠️ STALE FEED (still)"
+        self._send_alert(
+            f"{prefix}: {ticker} last bar {age_min:.1f}min old during "
+            f"market hours — {streak} consecutive stale poll(s). Exits "
+            f"cannot be evaluated. Next reminder in "
+            f"{_STALE_REALERT_MINUTES}min unless the feed recovers."
+        )
+
+    def _alert_stale_recovered(self, ticker: str) -> None:
+        """One recovery line when a fresh bar follows an alerted outage."""
+        if self._stale_alerted_at.pop(ticker, None) is None:
+            return
+        self._send_alert(
+            f"✅ FEED RECOVERED: {ticker} fresh bar received — exit "
+            f"evaluation resumed."
+        )
 
     # ------------------------------------------------------------------
     # Logging & notifications

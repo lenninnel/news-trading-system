@@ -474,6 +474,30 @@ class TestMarketHours:
             mock_dt_cls.now.return_value = weekend
             assert PositionManager._is_market_hours() is False
 
+    @pytest.mark.parametrize("holiday_iso", [
+        "2026-09-07T10:00:00",  # Labor Day (Mon) — the 2026-09-07 alert storm
+        "2026-07-03T10:00:00",  # Independence Day observed (Fri)
+        "2026-11-26T10:00:00",  # Thanksgiving (Thu)
+        "2026-12-25T10:00:00",  # Christmas (Fri)
+    ])
+    def test_us_holidays_are_closed(self, holiday_iso):
+        """A weekday full-day NYSE holiday at 10:00 ET is NOT market hours."""
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        now = _dt.fromisoformat(holiday_iso).replace(tzinfo=ZoneInfo("America/New_York"))
+        assert now.weekday() < 5
+        with patch("monitoring.position_manager.datetime") as mock_dt_cls:
+            mock_dt_cls.now.return_value = now
+            assert PositionManager._is_market_hours() is False
+
+    def test_regular_weekday_after_holiday_is_open(self):
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        now = _dt(2026, 9, 8, 10, 0, tzinfo=ZoneInfo("America/New_York"))  # Tue
+        with patch("monitoring.position_manager.datetime") as mock_dt_cls:
+            mock_dt_cls.now.return_value = now
+            assert PositionManager._is_market_hours() is True
+
 
 # ── test: signal logging ─────────────────────────────────────────────
 
@@ -629,21 +653,71 @@ class TestStalePriceGuard:
         assert self._fetch(pm, stale_df, now) is None
         assert pm._stale_streaks["AAPL"] == 1  # restarted, not continued
 
-    def test_rth_stale_escalates_with_streak(self):
+    def test_rth_stale_escalates_once_at_onset(self):
+        """Several stale polls in a row → ONE Telegram message (the journal
+        WARNING still lands every poll); the streak keeps counting."""
         from datetime import timedelta
         now = self._rth_now()
         df = self._price_df(now - timedelta(minutes=6))
         notifier = MagicMock()
         pm = self._make_pm(notifier=notifier)
 
-        self._fetch(pm, df, now)
-        self._fetch(pm, df, now)
+        for _ in range(5):
+            self._fetch(pm, df, now)
 
-        assert notifier.send_price_alert.call_count == 2
-        last_msg = notifier.send_price_alert.call_args[0][0]
-        assert "STALE FEED" in last_msg
-        assert "AAPL" in last_msg
-        assert "2 consecutive" in last_msg
+        assert notifier.send_price_alert.call_count == 1
+        msg = notifier.send_price_alert.call_args[0][0]
+        assert "STALE FEED" in msg and "AAPL" in msg
+        assert "1 consecutive" in msg
+        assert "Exits cannot be evaluated" in msg
+        assert pm._stale_streaks["AAPL"] == 5
+
+    def test_rth_stale_reminder_after_interval_then_recovery(self):
+        """Reminder once _STALE_REALERT_MINUTES have passed, one recovery line
+        on the first fresh bar, and a fresh onset alert if it goes stale again."""
+        from datetime import timedelta
+        import monitoring.position_manager as pm_mod
+        now = self._rth_now()
+        stale = self._price_df(now - timedelta(minutes=6))
+        fresh = self._price_df(now - timedelta(minutes=1))
+        notifier = MagicMock()
+        pm = self._make_pm(notifier=notifier)
+
+        clock = [1000.0]
+        with patch.object(pm_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            self._fetch(pm, stale, now)                       # onset → alert 1
+            clock[0] += (pm_mod._STALE_REALERT_MINUTES - 1) * 60
+            self._fetch(pm, stale, now)                       # inside interval → quiet
+            assert notifier.send_price_alert.call_count == 1
+            clock[0] += 2 * 60
+            self._fetch(pm, stale, now)                       # past interval → reminder
+            assert notifier.send_price_alert.call_count == 2
+            assert "still" in notifier.send_price_alert.call_args[0][0]
+            assert "3 consecutive" in notifier.send_price_alert.call_args[0][0]
+
+            assert self._fetch(pm, fresh, now) == 205.0        # recovery line
+            assert notifier.send_price_alert.call_count == 3
+            assert "FEED RECOVERED" in notifier.send_price_alert.call_args[0][0]
+            assert "AAPL" not in pm._stale_alerted_at
+
+            assert self._fetch(pm, fresh, now) == 205.0        # no second recovery line
+            assert notifier.send_price_alert.call_count == 3
+
+            self._fetch(pm, stale, now)                       # new outage → new onset
+            assert notifier.send_price_alert.call_count == 4
+            assert "still" not in notifier.send_price_alert.call_args[0][0]
+
+    def test_holiday_stale_bar_is_not_escalated(self):
+        """Labor Day 2026-09-07 10:00 ET: stale bars are expected (market
+        closed) → journal only, no Telegram. Price stays unevaluable."""
+        from datetime import datetime as _dt, timedelta
+        now = _dt(2026, 9, 7, 10, 0, tzinfo=self._et())
+        df = self._price_df(now - timedelta(hours=66))   # Friday's last bar
+        notifier = MagicMock()
+        pm = self._make_pm(notifier=notifier)
+        assert self._fetch(pm, df, now) is None
+        notifier.send_price_alert.assert_not_called()
+        assert pm._stale_streaks["AAPL"] == 1
 
     def test_outside_rth_no_escalation(self, caplog):
         from datetime import timedelta

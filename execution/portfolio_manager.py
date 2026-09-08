@@ -30,13 +30,19 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from config.settings import DB_PATH, DRAWDOWN_HALT_THRESHOLD
+from config.settings import (
+    DB_PATH,
+    DRAWDOWN_HALT_THRESHOLD,
+    REENTRY_LOCK_INCLUDE_TRAILING,
+    REENTRY_LOCK_SESSIONS,
+)
 from data.alpaca_data import AlpacaDataClient
+from data.market_calendar import NY_TZ, next_us_trading_day, us_sessions_between
 from execution.paper_trader import PaperTrader
 from storage.database import Database
 
@@ -61,16 +67,26 @@ _SECTOR_MAP: dict[str, str] = {
 _SECTOR_CACHE: dict[str, str] = {}   # ticker → normalised sector (process-level cache)
 
 
-# ── Recently-stopped cool-down (Q-016) ─────────────────────────────────────────
-# Block a BUY on a ticker whose LAST closed round-trip ended in a STOP exit
-# within the cool-down window (blind time gate — no downtrend/price condition).
-# Exit-reason is NOT persisted, so the stop is reconstructed live from
-# trade_history: a closing SELL is a STOP when its executed price (fallback:
-# price) is at/below the opening BUY's stop_loss, allowing a small tolerance for
-# gap-throughs.  Named here so N and the tolerance are tunable without hunting
-# magic numbers.
-_COOLDOWN_STOP_TOL = 0.003   # 0.3% below stop_loss still counts as a stop exit
-_COOLDOWN_SESSIONS = 1       # block re-entry within this many trading sessions
+# ── Re-entry lock after a stop-loss exit (Q-016 → 2026-09-08) ──────────────────
+# Block a BUY on a ticker whose LAST closed round-trip ended in a stop-loss
+# exit within REENTRY_LOCK_SESSIONS US trading sessions (blind time gate — no
+# downtrend/price condition).  The stop is reconstructed from trade_history:
+# a closing SELL is a stop-loss exit when its executed price (fallback: price)
+# is at/below the opening BUY's stop_loss, allowing a small tolerance for
+# gap-throughs.  On the audited book this rule and the PositionManager's own
+# 'stop_loss_triggered' rows agree on 84/84 entry stops and flag 0/57
+# trailing exits and 0/24 targets (scripts/reentry_after_stop_audit.py).
+# Session counting is holiday-aware (data.market_calendar): the 1-session
+# cool-down it replaces counted Fri 2026-07-03 (a holiday) as a session and
+# let two re-entries through.  Trailing-stop exits (a PositionManager
+# 'stop_loss_triggered' row at a level above the entry stop) arm the lock
+# only when REENTRY_LOCK_INCLUDE_TRAILING is set.
+_COOLDOWN_STOP_TOL = 0.003   # 0.3% above stop_loss still counts as a stop exit
+_COOLDOWN_SESSIONS = REENTRY_LOCK_SESSIONS
+# PositionManager logs its SELL decision to signal_events a few seconds
+# around the trade_history row; this is the match window for that lookup.
+_PM_EXIT_MATCH_BEFORE_S = 15 * 60
+_PM_EXIT_MATCH_AFTER_S = 2 * 60
 
 
 def _fetch_sector(ticker: str) -> str:
@@ -224,6 +240,8 @@ class PortfolioManager:
         ticker: str,
         strategy: str,
         amount_usd: float,
+        session: str | None = None,
+        price: float | None = None,
     ) -> tuple[bool, str]:
         """
         Check whether a new position in *ticker* is allowed under all limits.
@@ -232,6 +250,9 @@ class PortfolioManager:
             ticker:     Stock ticker symbol.
             strategy:   Strategy requesting the trade.
             amount_usd: Dollar value of the proposed position.
+            session:    Scheduler session name (US_OPEN, PEAD_OPEN, …); only
+                        carried into the signal_events row a rejection writes.
+            price:      Proposed entry price, same purpose.
 
         Returns:
             (allowed, reason)  — reason is empty string when allowed.
@@ -257,14 +278,22 @@ class PortfolioManager:
             self._log_violation(ticker, strategy, amount_usd, "duplicate", reason)
             return False, reason
 
-        # 1b. Recently-stopped cool-down (Q-016). A just-stopped ticker is no
-        #     longer held, so the duplicate gate above cannot catch it; this is
-        #     a per-ticker eligibility gate that blocks a re-entry within
-        #     _COOLDOWN_SESSIONS trading sessions of the last STOP exit. Fails
-        #     OPEN — a guard bug must never block all trading.
-        cooled, cd_reason = self._recently_stopped(ticker)
-        if cooled:
+        # 1b. Re-entry lock after a stop-loss exit (Q-016, widened 2026-09-08).
+        #     A just-stopped ticker is no longer held, so the duplicate gate
+        #     above cannot catch it; this is a per-ticker eligibility gate that
+        #     blocks a re-entry within _COOLDOWN_SESSIONS trading sessions of
+        #     the last stop-loss exit.  Every caller that can open a position
+        #     (run_combined, run_combined_us_open, the cached US_OPEN executor,
+        #     the PEAD path) comes through here, so this is the single place
+        #     the lock lives.  A rejection is written to portfolio_violations
+        #     AND to signal_events (reason + remaining sessions) so the effect
+        #     can be measured later.  Fails OPEN — a guard bug must never block
+        #     all trading.
+        lock = self._reentry_lock_status(ticker)
+        if lock is not None:
+            cd_reason = lock["reason"]
             self._log_violation(ticker, strategy, amount_usd, "cooldown_stop", cd_reason)
+            self._log_reentry_lock_event(ticker, strategy, session, price, lock)
             return False, cd_reason
 
         # 2. Total position cap
@@ -760,22 +789,34 @@ class PortfolioManager:
             log.warning("Could not persist portfolio violation: %s", exc)
 
     def _recently_stopped(self, ticker: str) -> tuple[bool, "str | None"]:
-        """Return (blocked, reason) when *ticker*'s LAST closed round-trip ended
-        in a STOP exit within ``_COOLDOWN_SESSIONS`` trading sessions of today.
+        """(blocked, reason) view of :meth:`_reentry_lock_status`."""
+        lock = self._reentry_lock_status(ticker)
+        if lock is None:
+            return False, None
+        return True, lock["reason"]
 
-        Exit-reason is not persisted (Q-015/Q-016 finding), so the stop is
-        reconstructed live from ``trade_history`` — the same method the diagnosis
-        used: FIFO-pair BUYs with SELLs to find the last completed round-trip,
-        then classify it a STOP when the closing SELL's executed price (fallback:
-        ``price``) is at/below the opening BUY's ``stop_loss`` * (1 +
-        ``_COOLDOWN_STOP_TOL``).  Session gap reuses the trading-day counter from
-        ``data.events_feed`` (same-day = 0, next trading day = 1).
+    def _reentry_lock_status(self, ticker: str) -> "dict | None":
+        """Return the active re-entry lock for *ticker*, or None.
 
-        BLIND cool-down: no downtrend/price condition — purely the time gate.
+        Locked when the ticker's LAST closed round-trip ended in a stop-loss
+        exit (see the module constants for the classification) and fewer than
+        ``_COOLDOWN_SESSIONS + 1`` US trading sessions have passed since that
+        exit — same session = 0, next trading day = 1; weekends and full-day
+        holidays are not sessions (``data.market_calendar``).
 
-        Fails OPEN on any ambiguity (no closed round-trip, no opening stop_loss,
-        unparseable prices/dates) or read error — a guard bug must never block
-        all trading.
+        The returned dict carries what the log row needs::
+
+            exit_kind      "stop_loss" | "trailing_stop"
+            stop_at        ISO timestamp of the closing SELL
+            stop_date      New York date of that SELL
+            gap_sessions   sessions elapsed since the stop (as of today)
+            remaining      sessions still locked after today
+            eligible_from  first New York date a BUY is allowed again
+            reason         human-readable sentence for logs / violations
+
+        Fails OPEN on any ambiguity (no closed round-trip, no opening
+        stop_loss, unparseable prices/dates) or read error — a guard bug must
+        never block all trading.
         """
         ticker = ticker.upper()
         try:
@@ -787,8 +828,8 @@ class PortfolioManager:
                     (ticker,),
                 ).fetchall()
         except Exception as exc:
-            log.warning("recently-stopped read failed for %s: %s", ticker, exc)
-            return False, None
+            log.warning("re-entry lock read failed for %s: %s", ticker, exc)
+            return None
 
         # FIFO-pair BUYs with SELLs to isolate the LAST completed round-trip.
         open_buys: list = []
@@ -801,54 +842,130 @@ class PortfolioManager:
                 if open_buys:
                     last_rt = (open_buys.pop(0), r)  # FIFO
         if last_rt is None:
-            return False, None  # never closed a round-trip → nothing to cool down
+            return None  # never closed a round-trip → nothing to lock
 
         buy, sell = last_rt
         stop = buy["stop_loss"]
         if stop is None:
-            return False, None  # cannot classify a stop without the opening stop
+            return None  # cannot classify a stop without the opening stop
 
         close_px = sell["executed_price"]
         if close_px is None:
             close_px = sell["price"]
         if close_px is None:
-            return False, None
+            return None
 
         try:
             stop = float(stop)
             close_px = float(close_px)
-        except (TypeError, ValueError):
-            return False, None
-        if stop <= 0:
-            return False, None
-
-        # STOP classification — blind, price-vs-stop only.
-        if close_px > stop * (1.0 + _COOLDOWN_STOP_TOL):
-            return False, None  # last exit was a target/other, not a stop
-
-        # Trading-session gap between the stop (SELL date) and today (UTC).
-        try:
-            from data.events_feed import _trading_days_between
             sell_dt = datetime.fromisoformat(sell["created_at"])
-            if sell_dt.tzinfo is not None:
-                sell_dt = sell_dt.astimezone(timezone.utc)
-            sell_date = sell_dt.date()
-            today = datetime.now(timezone.utc).date()
-            if sell_date > today:
-                return False, None  # future-dated anomaly → fail open
-            gap = _trading_days_between(sell_date, today)
-        except Exception as exc:
-            log.warning("recently-stopped gap calc failed for %s: %s", ticker, exc)
-            return False, None
+        except (TypeError, ValueError):
+            return None
+        if stop <= 0:
+            return None
+        if sell_dt.tzinfo is None:
+            sell_dt = sell_dt.replace(tzinfo=timezone.utc)
 
-        if 0 <= gap <= _COOLDOWN_SESSIONS:
-            reason = (
-                f"Cool-down: {ticker} was stopped out on {sell_date.isoformat()} "
-                f"({gap} trading session{'' if gap == 1 else 's'} ago) — blocking "
-                f"re-entry within {_COOLDOWN_SESSIONS} session(s)"
-            )
-            return True, reason
-        return False, None
+        # Classification — price-vs-entry-stop first (blind, no PM row needed).
+        if close_px <= stop * (1.0 + _COOLDOWN_STOP_TOL):
+            exit_kind = "stop_loss"
+        elif REENTRY_LOCK_INCLUDE_TRAILING and self._pm_logged_stop_exit(ticker, sell_dt):
+            exit_kind = "trailing_stop"
+        else:
+            return None  # target / other exit → no lock
+
+        # Trading-session gap between the stop and today, in New York dates.
+        try:
+            stop_date = sell_dt.astimezone(NY_TZ).date()
+            today = datetime.now(NY_TZ).date()
+            if stop_date > today:
+                return None  # future-dated anomaly → fail open
+            gap = us_sessions_between(stop_date, today)
+            eligible_from = stop_date
+            for _ in range(_COOLDOWN_SESSIONS + 1):
+                eligible_from = next_us_trading_day(eligible_from)
+        except Exception as exc:
+            log.warning("re-entry lock gap calc failed for %s: %s", ticker, exc)
+            return None
+
+        if gap > _COOLDOWN_SESSIONS:
+            return None
+
+        remaining = _COOLDOWN_SESSIONS - gap
+        label = "stop-loss" if exit_kind == "stop_loss" else "trailing-stop"
+        reason = (
+            f"Re-entry lock: {ticker} {label} exit on {stop_date.isoformat()} "
+            f"({gap} of {_COOLDOWN_SESSIONS} trading session{'' if _COOLDOWN_SESSIONS == 1 else 's'} elapsed, "
+            f"{remaining} remaining) — no BUY before {eligible_from.isoformat()}"
+        )
+        return {
+            "exit_kind": exit_kind,
+            "stop_at": sell_dt.isoformat(),
+            "stop_date": stop_date.isoformat(),
+            "gap_sessions": gap,
+            "remaining": remaining,
+            "eligible_from": eligible_from.isoformat(),
+            "reason": reason,
+        }
+
+    def _pm_logged_stop_exit(self, ticker: str, sell_dt: datetime) -> bool:
+        """True when PositionManager logged a 'stop_loss_triggered' SELL for
+        *ticker* around *sell_dt* (its signal_events row lands within seconds
+        of the trade_history row).  Used only for the trailing-stop option;
+        any read problem counts as "no such row" (fail open)."""
+        try:
+            lo = (sell_dt - timedelta(seconds=_PM_EXIT_MATCH_BEFORE_S)).astimezone(timezone.utc)
+            hi = (sell_dt + timedelta(seconds=_PM_EXIT_MATCH_AFTER_S)).astimezone(timezone.utc)
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM signal_events WHERE ticker = ? "
+                    "AND strategy = 'PositionManager' AND signal = 'SELL' "
+                    "AND bull_case LIKE 'stop_loss_triggered%' "
+                    "AND timestamp BETWEEN ? AND ? LIMIT 1",
+                    (ticker, lo.isoformat(), hi.isoformat()),
+                ).fetchone()
+            return row is not None
+        except Exception as exc:
+            log.warning("re-entry lock PM-row lookup failed for %s: %s", ticker, exc)
+            return False
+
+    def _log_reentry_lock_event(
+        self,
+        ticker: str,
+        strategy: str,
+        session: "str | None",
+        price: "float | None",
+        lock: dict,
+    ) -> None:
+        """Write the rejected BUY to signal_events (never raises).
+
+        Row shape: strategy='PortfolioManager', signal='HOLD',
+        signal_path='REENTRY_LOCK', trade_executed=0; bear_case carries the
+        machine-readable detail (exit kind, stop timestamp, sessions elapsed /
+        remaining, eligible date), bull_case the strategy that asked.
+        """
+        try:
+            from analytics.signal_logger import SignalLogger
+            SignalLogger(db=self._db).log({
+                "session": session,
+                "ticker": ticker,
+                "strategy": "PortfolioManager",
+                "signal": "HOLD",
+                "signal_path": "REENTRY_LOCK",
+                "trade_executed": 0,
+                "price_at_signal": price,
+                "bull_case": f"BUY requested by {strategy}",
+                "bear_case": (
+                    f"reentry_lock: {lock['exit_kind']} exit at {lock['stop_at']}; "
+                    f"sessions_elapsed={lock['gap_sessions']}; "
+                    f"sessions_remaining={lock['remaining']}; "
+                    f"lock_sessions={_COOLDOWN_SESSIONS}; "
+                    f"eligible_from={lock['eligible_from']}"
+                ),
+                "debate_outcome": "BUY_REJECTED",
+            })
+        except Exception as exc:
+            log.warning("re-entry lock signal_events write failed for %s: %s", ticker, exc)
 
     def _check_drawdown_halt(self) -> tuple[bool, str]:
         """Return (halted, reason). Reason is empty when not halted.
