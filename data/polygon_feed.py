@@ -1,9 +1,13 @@
 """
 Polygon.io data feed for point-in-time daily OHLC aggregates.
 
-Single purpose: feed the Research-side `daily_ohlc` table built by
-`scripts/ingest_ohlc.py`. NOT wired into the live trading path — do not
-import from agents/, risk/, or execution/.
+Single purpose: feed the `daily_ohlc` table built by `scripts/ingest_ohlc.py`.
+NOT wired into the live trading path — do not import from agents/, risk/,
+or execution/.
+
+Since 2026-09-08 this is the ROLLBACK source (OHLC_SOURCE=polygon); the
+default is data/alpaca_ohlc_feed.py. The Polygon Stocks Starter plan was
+cancelled; the key falls back to the free tier described below.
 
 Free-tier limits (as of 2026-05): 5 requests / minute, 2-year history.
 This module paces calls at ~12s gaps and retries 429 / 5xx with
@@ -77,8 +81,9 @@ class PolygonFeed:
         Returns:
             List of dicts with keys:
               date (str YYYY-MM-DD), open, high, low, close (RAW unadjusted),
-              adj_close (split/dividend-adjusted close, may be None if the
-              adjusted call fails), volume (int).
+              adj_close (SPLIT-adjusted close — Polygon's adjusted=true does
+              not apply dividends; may be None if the adjusted call fails),
+              volume (int).
 
         Raises:
             RuntimeError on persistent fetch failure of the RAW series.

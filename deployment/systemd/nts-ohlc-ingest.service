@@ -1,5 +1,5 @@
 [Unit]
-Description=NTS daily Polygon OHLC incremental ingest
+Description=NTS daily OHLC incremental ingest (source: config.settings.OHLC_SOURCE, default alpaca)
 After=network.target
 OnFailure=nts-alert@%n.service
 # nts-alert@ is the USER-scope alert template (deployment/systemd/

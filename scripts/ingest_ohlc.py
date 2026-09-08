@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Daily OHLC ingest from Polygon.io into the news_trading.db `daily_ohlc` table.
+"""Daily OHLC ingest into the news_trading.db `daily_ohlc` table.
+
+Source: `config.settings.OHLC_SOURCE` — "alpaca" (default since 2026-09-08,
+`data/alpaca_ohlc_feed.py`, free Basic plan, 200 req/min) or "polygon"
+(rollback, `data/polygon_feed.py`, free tier 5 req/min). Both feeds return
+the same bar shape, so hygiene, upsert and the freshness gate are
+source-agnostic; each row records its origin in `daily_ohlc.source`.
 
 Purpose: maintain a clean US daily price history. Since 2026-09-01 the live
 path depends on it: RiskAgent computes Wilder ATR(14) — and therefore stops,
@@ -45,8 +51,9 @@ Rows are FLAGGED, never dropped:
 
 Exit codes:
     0 = ok (all tickers fetched AND store is fresh through the expected day)
-    1 = aborted (universe mismatch / Polygon key missing / DB write failure /
-        fetch failure / freshness gate: stale MAX(date) for >=1 ticker)
+    1 = aborted (universe mismatch / source credentials missing / unknown
+        OHLC_SOURCE / DB write failure / fetch failure / freshness gate:
+        stale MAX(date) for >=1 ticker)
 """
 from __future__ import annotations
 
@@ -70,9 +77,11 @@ if str(_REPO_ROOT) not in sys.path:
 from config.settings import (  # noqa: E402
     OHLC_BACKFILL_YEARS,
     OHLC_EXTREME_MOVE_PCT,
+    OHLC_SOURCE,
     PEAD_TICKERS,
     POLYGON_API_KEY,
 )
+from data.alpaca_ohlc_feed import AlpacaOHLCFeed  # noqa: E402
 from data.market_calendar import last_us_trading_day  # noqa: E402
 from data.polygon_feed import PolygonFeed  # noqa: E402
 from storage.database import Database  # noqa: E402
@@ -230,14 +239,38 @@ def check_freshness(db, universe: list[str], end: str) -> tuple[str, list[tuple[
 
 
 # ---------------------------------------------------------------------------
+# Source selection
+# ---------------------------------------------------------------------------
+
+def build_feed(source: str):
+    """Return the bar feed for `source`, or raise RuntimeError with the reason
+    (unknown source / missing credentials). Every feed exposes
+    get_daily_aggs(ticker, start, end) -> list[dict] with the store's bar shape."""
+    if source == "alpaca":
+        feed = AlpacaOHLCFeed()
+        if not feed.available:
+            raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY are not set")
+        return feed
+    if source == "polygon":
+        if not POLYGON_API_KEY:
+            raise RuntimeError("POLYGON_API_KEY is not set")
+        return PolygonFeed()
+    raise RuntimeError(f"unknown OHLC_SOURCE={source!r} (expected 'alpaca' or 'polygon')")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def run(mode: str, years: int | None = None) -> int:
-    if not POLYGON_API_KEY:
-        logger.error("POLYGON_API_KEY is not set — refusing to run")
-        _alert_failure("POLYGON_API_KEY is not set")
+    source = OHLC_SOURCE
+    try:
+        feed = build_feed(source)
+    except RuntimeError as exc:
+        logger.error("%s — refusing to run", exc)
+        _alert_failure(str(exc))
         return 1
+    logger.info("OHLC source: %s", source)
 
     universe = build_us20_universe()
     logger.info("Universe (%d): %s", len(universe), universe)
@@ -259,7 +292,6 @@ def run(mode: str, years: int | None = None) -> int:
 
     logger.info("Date range: %s..%s (mode=%s)", start, end, mode)
 
-    feed = PolygonFeed()
     db = Database()
 
     total_rows = 0
@@ -272,19 +304,19 @@ def run(mode: str, years: int | None = None) -> int:
         try:
             bars = feed.get_daily_aggs(ticker, start, end)
         except Exception as exc:
-            logger.error("Polygon fetch failed for %s: %s", ticker, exc)
+            logger.error("%s fetch failed for %s: %s", source, ticker, exc)
             tickers_failed.append(ticker)
             continue
 
         if not bars:
-            logger.warning("Polygon returned 0 bars for %s [%s..%s]", ticker, start, end)
+            logger.warning("%s returned 0 bars for %s [%s..%s]", source, ticker, start, end)
             tickers_ok += 1
             continue
 
-        # Tag ticker on each bar so the flag log carries it.
+        # Tag ticker + origin on each bar so the flag log and the store carry it.
         for b in bars:
             b["ticker"] = ticker
-            b["source"] = "polygon"
+            b["source"] = source
 
         bars, _ = flag_bars(bars, OHLC_EXTREME_MOVE_PCT)
         flagged = [b for b in bars if b.get("quality_flag")]
@@ -327,7 +359,7 @@ def run(mode: str, years: int | None = None) -> int:
     logger.info("Freshness gate passed: all %d tickers at >= %s", len(universe), expected)
 
     if tickers_failed:
-        _alert_failure(f"Polygon fetch failed for: {', '.join(tickers_failed)}")
+        _alert_failure(f"{source} fetch failed for: {', '.join(tickers_failed)}")
         return 1
     return 0
 

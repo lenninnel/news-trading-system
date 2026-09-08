@@ -118,7 +118,11 @@ DB_PATH: str = os.environ.get("DB_PATH", "news_trading.db")
 # Daily OHLC ingest (Research-side; scripts/ingest_ohlc.py → daily_ohlc table)
 # ---------------------------------------------------------------------------
 
-OHLC_BACKFILL_YEARS: int = 2          # Polygon free tier supports 2yr daily; covers 252d windows
+# Daily-bar source for scripts/ingest_ohlc.py: "alpaca" (default since 2026-09-08,
+# free Basic plan, SIP daily bars, 200 req/min) or "polygon" (rollback: free tier,
+# 5 req/min, 2yr history). Decision + bar comparison: docs/OHLC_SOURCE_SWITCH_2026-09-08.md
+OHLC_SOURCE: str = os.environ.get("OHLC_SOURCE", "alpaca")
+OHLC_BACKFILL_YEARS: int = 2          # both free tiers cover >= 2yr daily; covers 252d windows
 OHLC_EXTREME_MOVE_PCT: float = 0.50   # soft-flag threshold (quality_flag='EXTREME_MOVE'), NOT a reject
 
 # ---------------------------------------------------------------------------

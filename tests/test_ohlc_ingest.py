@@ -1,6 +1,6 @@
-"""Unit tests for the Polygon OHLC ingest pipeline.
+"""Unit tests for the daily OHLC ingest pipeline.
 
-Mocks the Polygon HTTP layer — no network, no real key needed.
+Mocks the Polygon and Alpaca HTTP layers — no network, no real key needed.
 
 Covers:
   - schema: daily_ohlc table is created on Database init
@@ -294,8 +294,7 @@ def _run_with_fake_feed(tmp_db, monkeypatch, bar_date: str, alerts: list):
                 "volume": 1_000_000,
             }]
 
-    monkeypatch.setattr(ingest, "POLYGON_API_KEY", "test-key")
-    monkeypatch.setattr(ingest, "PolygonFeed", FakeFeed)
+    monkeypatch.setattr(ingest, "build_feed", lambda source: FakeFeed())
     monkeypatch.setattr(ingest, "Database", lambda: tmp_db)
     monkeypatch.setattr(ingest, "_alert_failure", alerts.append)
     return ingest.run("incremental")
@@ -315,3 +314,169 @@ def test_run_passes_on_fresh_data(tmp_db, monkeypatch):
     rc = _run_with_fake_feed(tmp_db, monkeypatch, fresh_day, alerts := [])
     assert rc == 0
     assert alerts == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Alpaca feed: HTTP mocked (default source since 2026-09-08)
+# ──────────────────────────────────────────────────────────────────────────────
+
+from data.alpaca_ohlc_feed import AlpacaOHLCFeed
+
+
+def _mock_alpaca_response(symbol, bars, next_page_token=None):
+    """Fake requests.Response for /v2/stocks/bars; `bars` = [(date, o, h, l, c, v)]."""
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "bars": {symbol: [
+            {"t": f"{d}T04:00:00Z", "o": o, "h": h, "l": l, "c": c, "v": v, "n": 1, "vw": c}
+            for d, o, h, l, c, v in bars
+        ]},
+        "next_page_token": next_page_token,
+    }
+    return resp
+
+
+def test_alpaca_feed_parses_and_pairs_raw_split(monkeypatch):
+    """Raw bars carry the store fields; adj_close comes from adjustment=split."""
+    seen = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.append(dict(params))
+        if params["adjustment"] == "split":
+            return _mock_alpaca_response("AAPL", [("2026-09-04", 100, 101, 99, 99.5, 1_000)])
+        return _mock_alpaca_response("AAPL", [("2026-09-04", 100, 101, 99, 100.5, 1_000)])
+
+    monkeypatch.setattr(AlpacaOHLCFeed, "_respect_rate_limit", lambda self: None)
+    monkeypatch.setattr("data.alpaca_ohlc_feed.requests.get", fake_get)
+
+    feed = AlpacaOHLCFeed(api_key="k", secret_key="s")
+    bars = feed.get_daily_aggs("AAPL", "2026-09-01", "2026-09-04")
+    assert bars == [{
+        "date": "2026-09-04", "open": 100.0, "high": 101.0, "low": 99.0,
+        "close": 100.5, "volume": 1_000, "adj_close": 99.5,
+    }]
+    # consolidated tape, raw first, then split-only (never dividend-adjusted)
+    assert [p["adjustment"] for p in seen] == ["raw", "split"]
+    assert all(p["feed"] == "sip" and p["timeframe"] == "1Day" for p in seen)
+
+
+def test_alpaca_feed_survives_split_failure(monkeypatch):
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if params["adjustment"] == "split":
+            raise RuntimeError("simulated split-call failure")
+        return _mock_alpaca_response("AAPL", [("2026-09-04", 100, 101, 99, 100.5, 1_000)])
+
+    monkeypatch.setattr(AlpacaOHLCFeed, "_respect_rate_limit", lambda self: None)
+    monkeypatch.setattr("data.alpaca_ohlc_feed.requests.get", fake_get)
+
+    bars = AlpacaOHLCFeed(api_key="k", secret_key="s").get_daily_aggs("AAPL", "2026-09-01", "2026-09-04")
+    assert len(bars) == 1 and bars[0]["close"] == 100.5 and bars[0]["adj_close"] is None
+
+
+def test_alpaca_feed_follows_page_token(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(params.get("page_token"))
+        if params["adjustment"] == "split":
+            return _mock_alpaca_response("AAPL", [])
+        if params.get("page_token") is None:
+            return _mock_alpaca_response("AAPL", [("2026-09-03", 1, 2, 1, 1.5, 10)], next_page_token="p2")
+        return _mock_alpaca_response("AAPL", [("2026-09-04", 1, 2, 1, 1.6, 10)])
+
+    monkeypatch.setattr(AlpacaOHLCFeed, "_respect_rate_limit", lambda self: None)
+    monkeypatch.setattr("data.alpaca_ohlc_feed.requests.get", fake_get)
+
+    bars = AlpacaOHLCFeed(api_key="k", secret_key="s").get_daily_aggs("AAPL", "2026-09-01", "2026-09-04")
+    assert [b["date"] for b in bars] == ["2026-09-03", "2026-09-04"]
+    assert calls[:2] == [None, "p2"]
+
+
+def test_alpaca_feed_non_retryable_4xx_raises(monkeypatch):
+    """The free-plan SIP recency 403 (or bad credentials) must fail the ticker
+    immediately — no retry loop, no silent empty result."""
+    from unittest.mock import MagicMock
+    resp = MagicMock(); resp.status_code = 403
+    resp.text = '{"message":"subscription does not permit querying recent SIP data"}'
+    n = {"calls": 0}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        n["calls"] += 1
+        return resp
+
+    monkeypatch.setattr(AlpacaOHLCFeed, "_respect_rate_limit", lambda self: None)
+    monkeypatch.setattr("data.alpaca_ohlc_feed.requests.get", fake_get)
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        AlpacaOHLCFeed(api_key="k", secret_key="s").get_daily_aggs("AAPL", "2026-09-01", "2026-09-04")
+    assert n["calls"] == 1
+
+
+def test_alpaca_end_clamped_to_sip_recency_margin():
+    """A window ending today is asked for as now - margin (>= 15 min back);
+    a window ending in the past keeps its end-of-day timestamp. At the
+    nightly 22:30 UTC run this yields 22:10 UTC, after the US close."""
+    now = datetime(2026, 9, 8, 22, 30, tzinfo=timezone.utc)
+    assert AlpacaOHLCFeed._clamp_end("2026-09-08", now) == "2026-09-08T22:10:00Z"
+    assert AlpacaOHLCFeed._clamp_end("2026-09-04", now) == "2026-09-04T23:59:59Z"
+
+
+def test_alpaca_feed_requires_credentials():
+    feed = AlpacaOHLCFeed(api_key="", secret_key="")
+    assert not feed.available
+    with pytest.raises(RuntimeError, match="ALPACA_API_KEY"):
+        feed.get_daily_aggs("AAPL", "2026-09-01", "2026-09-04")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Source selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_build_feed_alpaca_default(monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    assert isinstance(ingest.build_feed("alpaca"), AlpacaOHLCFeed)
+
+
+def test_build_feed_missing_credentials(monkeypatch):
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ALPACA_API_KEY"):
+        ingest.build_feed("alpaca")
+    monkeypatch.setattr(ingest, "POLYGON_API_KEY", "")
+    with pytest.raises(RuntimeError, match="POLYGON_API_KEY"):
+        ingest.build_feed("polygon")
+
+
+def test_build_feed_polygon_rollback(monkeypatch):
+    monkeypatch.setattr(ingest, "POLYGON_API_KEY", "test-key")
+    assert isinstance(ingest.build_feed("polygon"), PolygonFeed)
+
+
+def test_build_feed_unknown_source():
+    with pytest.raises(RuntimeError, match="unknown OHLC_SOURCE"):
+        ingest.build_feed("yahoo")
+
+
+def test_run_aborts_and_alerts_without_credentials(tmp_db, monkeypatch):
+    """Missing credentials: exit 1 + Telegram alert, nothing written."""
+    alerts = []
+    monkeypatch.setattr(ingest, "OHLC_SOURCE", "alpaca")
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+    monkeypatch.setattr(ingest, "Database", lambda: tmp_db)
+    monkeypatch.setattr(ingest, "_alert_failure", alerts.append)
+    assert ingest.run("incremental") == 1
+    assert alerts and "ALPACA_API_KEY" in alerts[0]
+    assert tmp_db.get_daily_ohlc_max_dates(["AAPL"]).get("AAPL") is None
+
+
+def test_run_stamps_source_on_rows(tmp_db, monkeypatch):
+    """Rows written by the run carry OHLC_SOURCE in daily_ohlc.source."""
+    fresh_day = last_us_trading_day(ingest._window_end()).isoformat()
+    monkeypatch.setattr(ingest, "OHLC_SOURCE", "alpaca")
+    rc = _run_with_fake_feed(tmp_db, monkeypatch, fresh_day, alerts := [])
+    assert rc == 0 and alerts == []
+    row = tmp_db.get_daily_ohlc("AAPL", fresh_day, fresh_day)[0]
+    assert row["source"] == "alpaca"

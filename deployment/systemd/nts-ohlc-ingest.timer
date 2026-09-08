@@ -1,5 +1,5 @@
 [Unit]
-Description=NTS daily Polygon OHLC incremental ingest timer
+Description=NTS daily OHLC incremental ingest timer
 
 [Timer]
 OnCalendar=*-*-* 22:30:00 UTC
