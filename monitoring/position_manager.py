@@ -283,11 +283,10 @@ class PositionManager:
         tickers = [p["ticker"] for p in positions]
         log.info("PM heartbeat: cycle running, %d positions to evaluate: %s",
                  len(positions), tickers)
-        # Broker account snapshot (cash, NetLiq, previous-day equity) for
-        # the read-only portfolio view — also with zero positions, so cash
-        # after the last exit is current.
-        self._snapshot_account()
         if not positions:
+            # Still take the account snapshot (cash after the last exit
+            # must be current) — it is the only work left this cycle.
+            self._snapshot_account()
             log.info("PM heartbeat: _check_all_positions EXIT (no positions)")
             return []
 
@@ -315,6 +314,12 @@ class PositionManager:
             log.info("PM heartbeat: [%s] eval result=%s", ticker, result)
             if result:
                 results.append(result)
+
+        # Broker account snapshot (cash, NetLiq, previous-day equity) for
+        # the read-only portfolio view — AFTER the stop loop: get_account()
+        # goes through the IB loop with a 15 s timeout and must never delay
+        # a stop-loss evaluation.
+        self._snapshot_account()
 
         log.info("PM heartbeat: _check_all_positions EXIT (results=%d)", len(results))
         return results

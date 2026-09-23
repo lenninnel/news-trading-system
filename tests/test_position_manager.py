@@ -813,6 +813,37 @@ class TestMarkProvenanceAndAccountSnapshot:
             (271095.71, 243314.33, 270000.0, "pm"),
         ]
 
+    def test_account_snapshot_runs_after_the_stop_loop(self):
+        """get_account() can block up to 15 s in the IB loop; the snapshot
+        must come AFTER every position was evaluated, and still run when
+        there are no positions."""
+        from storage.database import Database
+        db = Database()
+        with db._connect() as conn:
+            conn.execute("DELETE FROM account_snapshots")
+        calls: list[str] = []
+        trader = _make_trader(portfolio=[{"ticker": "AAPL", "shares": 10, "avg_price": 200.0},
+                                         {"ticker": "NVDA", "shares": 5, "avg_price": 100.0}])
+        trader.get_account.side_effect = lambda: (calls.append("get_account") or {
+            "cash": 1.0, "portfolio_value": 2.0})
+        pm = PositionManager(trader=trader, db=db)
+        with patch.object(pm, "_fetch_current_price",
+                          side_effect=lambda t: (calls.append(f"price:{t}") or 210.0)), \
+             patch.object(pm, "_evaluate_position",
+                          side_effect=lambda pos, px: (calls.append(f"eval:{pos['ticker']}") or None)):
+            pm._check_all_positions()
+        assert calls == ["price:AAPL", "eval:AAPL", "price:NVDA", "eval:NVDA", "get_account"]
+        assert db.get_latest_account_snapshot()["net_liquidation"] == 2.0
+
+        # zero positions: snapshot still taken
+        calls.clear()
+        pm2 = PositionManager(trader=_make_trader(), db=db)
+        pm2._trader.get_account.side_effect = lambda: (calls.append("get_account") or {
+            "cash": 3.0, "portfolio_value": 4.0})
+        assert pm2._check_all_positions() == []
+        assert calls == ["get_account"]
+        assert db.get_latest_account_snapshot()["net_liquidation"] == 4.0
+
     def test_account_snapshot_skips_zero_netliq_and_never_raises(self):
         from storage.database import Database
         db = Database()

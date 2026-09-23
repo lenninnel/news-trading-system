@@ -59,7 +59,8 @@ are kept for the dashboard (`app/portfolio/page.tsx` reads exactly those);
   Written by `DailyScheduler._fetch_session_account_balance` at every
   session (`kind='session'`, `'eod'` for EOD) and by
   `PositionManager._snapshot_account` during RTH at most every 5 min
-  (`kind='pm'`), also with zero positions. `IBKRTrader.get_account` now
+  (`kind='pm'`), after the stop loop so a slow `get_account()` never delays
+  an exit, also with zero positions. `IBKRTrader.get_account` now
   reads `PreviousDayEquityWithLoanValue` and `GrossPositionValue` too.
   The session snapshot is taken after the bar-freshness gate, so a
   session the gate aborts writes none; the PositionManager covers RTH
