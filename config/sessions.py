@@ -29,7 +29,13 @@ SCHEDULE: list[SessionSpec] = [
     {"name": "PEAD_OPEN",      "hour": 13, "minute": 45},
     {"name": "US_OPEN",        "hour": 14, "minute": 30},
     {"name": "MIDDAY",         "hour": 18, "minute": 0},
-    {"name": "EOD",            "hour": 22, "minute": 15},
+    # EOD runs AFTER the nightly daily_ohlc ingest (nts-ohlc-ingest.timer,
+    # 22:30 UTC, ~15 s) so its indicators — and the forward signals it
+    # hands to the next US_OPEN — rest on today's completed bar, not
+    # yesterday's.  22:45 is past the US close in both DST (20:00 UTC)
+    # and winter (21:00 UTC) and past the ingest's same-day cutoff
+    # (22:00 UTC).  Moved from 22:15 on 2026-09-23.
+    {"name": "EOD",            "hour": 22, "minute": 45},
 ]
 
 

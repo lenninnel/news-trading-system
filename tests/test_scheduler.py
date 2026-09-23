@@ -46,15 +46,15 @@ class TestNextRunTime:
         assert nrt.minute == 0
 
     def test_after_midday_returns_eod(self, scheduler):
-        """Monday 20:00 UTC → next run is EOD at 22:15."""
+        """Monday 20:00 UTC → next run is EOD at 22:45 (after the 22:30 ingest)."""
         monday_8pm = datetime(2026, 3, 16, 20, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_8pm)
         assert nrt.hour == 22
-        assert nrt.minute == 15
+        assert nrt.minute == 45
 
     def test_after_last_run_returns_next_day(self, scheduler):
-        """Monday 22:30 UTC → next run is Tuesday XETRA_PRE 06:45."""
-        monday_late = datetime(2026, 3, 16, 22, 30, 0, tzinfo=timezone.utc)
+        """Monday 23:00 UTC → next run is Tuesday XETRA_PRE 06:45."""
+        monday_late = datetime(2026, 3, 16, 23, 0, 0, tzinfo=timezone.utc)
         nrt = scheduler.next_run_time(after=monday_late)
         assert nrt.weekday() == 1  # Tuesday
         assert nrt.hour == 6
@@ -71,7 +71,7 @@ class TestNextRunTime:
             t = t.replace(second=1)
         assert run_hours == [
             (6, 45), (7, 0), (13, 0), (13, 15), (13, 45),
-            (14, 30), (18, 0), (22, 15),
+            (14, 30), (18, 0), (22, 45),
         ]
 
 
@@ -141,11 +141,17 @@ class TestCurrentSession:
         assert self._session_at(scheduler, dt) == "MIDDAY"
 
     def test_eod_session(self, scheduler):
-        dt = datetime(2026, 3, 16, 22, 20, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 3, 16, 22, 50, 0, tzinfo=timezone.utc)
         assert self._session_at(scheduler, dt) == "EOD"
 
-    def test_after_close_is_closed(self, scheduler):
+    def test_between_ingest_and_eod_is_still_midday(self, scheduler):
+        """22:35 UTC: ingest done, EOD not yet fired → the window is open
+        and the last started session is MIDDAY (startup-run semantics)."""
         dt = datetime(2026, 3, 16, 22, 35, 0, tzinfo=timezone.utc)
+        assert self._session_at(scheduler, dt) == "MIDDAY"
+
+    def test_after_close_is_closed(self, scheduler):
+        dt = datetime(2026, 3, 16, 23, 5, 0, tzinfo=timezone.utc)
         assert self._session_at(scheduler, dt) == "CLOSED"
 
     def test_weekend_is_closed(self, scheduler):

@@ -67,6 +67,46 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
+
+def _bar_fields(bars, indicators: dict | None = None) -> dict:
+    """signal_events bar-provenance fields for a daily frame.
+
+    Prefers the ``bar_date``/``bar_close``/``bar_source`` keys TechnicalAgent
+    puts on its indicators; derives them from the frame itself otherwise
+    (strategy rows carry the same frame).  Never raises.
+    """
+    ind = indicators or {}
+    if ind.get("bar_date") or ind.get("bar_close") is not None:
+        return {
+            "indicator_bar_date": ind.get("bar_date"),
+            "indicator_bar_close": ind.get("bar_close"),
+            "indicator_bar_source": ind.get("bar_source"),
+        }
+    try:
+        from agents.technical_agent import bar_provenance
+        prov = bar_provenance(bars)
+    except Exception:
+        prov = {}
+    return {
+        "indicator_bar_date": prov.get("bar_date"),
+        "indicator_bar_close": prov.get("bar_close"),
+        "indicator_bar_source": prov.get("bar_source"),
+    }
+
+
+def _live_fields(market: dict | None) -> dict:
+    """signal_events live-price fields from a MarketData.fetch() result.
+
+    ``live_price`` is the price the sizing / price guard saw; NULL when the
+    fetch failed or was degraded (the coordinator then falls back to the
+    indicator-bar close for analysis and blocks execution).
+    """
+    m = market or {}
+    price = m.get("price")
+    if price and not m.get("degraded"):
+        return {"live_price": float(price), "live_price_source": m.get("source") or "unknown"}
+    return {"live_price": None, "live_price_source": None}
+
 from agents.regime_agent import RegimeAgent
 from agents.regime_detector import RegimeDetector
 from agents.risk_agent import RiskAgent
@@ -415,18 +455,37 @@ class Coordinator:
                 "cluster_direction": gate.get("direction"),
                 "cluster_voters": gate.get("voters"),
                 **self._news_timing(sentiment.get("scored")),
+                **_bar_fields(technical.get("bars"), indicators),
+                **_live_fields(sentiment.get("market")),
             })
         except Exception as exc:
             log.warning("Signal event logging failed (non-fatal): %s", exc)
 
-    def _log_strategy_result(self, ticker: str, strategy_result, *, session: str | None = None, regime: str | None = None) -> None:
+    def _log_strategy_result(
+        self,
+        ticker: str,
+        strategy_result,
+        *,
+        session: str | None = None,
+        regime: str | None = None,
+        bars=None,
+        live_market: dict | None = None,
+    ) -> None:
         """Log an individual strategy result to signal_events. Never raises.
 
         Every strategy result is logged regardless of signal type or
         confidence so the dashboard can show sub-strategy signals.
+        ``bars`` is the daily frame the strategy voted on (bar provenance),
+        ``live_market`` the MarketData.fetch() result of this run (live
+        price at decision time); both optional, NULL when absent.
         """
         try:
             indicators = strategy_result.indicators or {}
+            provenance = _bar_fields(bars, None) if bars is not None else {
+                "indicator_bar_date": None,
+                "indicator_bar_close": None,
+                "indicator_bar_source": None,
+            }
             price = indicators.get("price")
             sma_50 = indicators.get("sma50") or indicators.get("sma_50")
             sma_ratio = (price / sma_50) if (price and sma_50 and sma_50 > 0) else None
@@ -454,6 +513,8 @@ class Coordinator:
                 "news_newest_published_at": indicators.get("news_newest_published_at"),
                 "news_age_minutes": indicators.get("news_age_minutes"),
                 "news_ts_missing": indicators.get("news_ts_missing"),
+                **provenance,
+                **_live_fields(live_market),
             })
         except Exception as exc:
             log.warning("Strategy result logging failed (non-fatal): %s", exc)
@@ -833,6 +894,7 @@ class Coordinator:
         sentiment: dict,
         *,
         session: str | None = None,
+        live_market: dict | None = None,
     ) -> StrategyResult | None:
         """Run NewsCatalystStrategy and log the result. Never raises."""
         try:
@@ -847,7 +909,10 @@ class Coordinator:
                 "[%s] NewsCatalyst → %s (%.0f%%)",
                 ticker, result.signal, result.confidence,
             )
-            self._log_strategy_result(ticker, result, session=session)
+            self._log_strategy_result(
+                ticker, result, session=session,
+                bars=bars, live_market=live_market,
+            )
             return result
         except Exception as exc:
             log.warning("[%s] NewsCatalyst failed (non-fatal): %s", ticker, exc)
@@ -865,10 +930,13 @@ class Coordinator:
         *,
         session: str | None = None,
         regime: str | None = None,
+        live_market: dict | None = None,
     ) -> list[StrategyResult]:
         """Run Momentum, Pullback, and NewsCatalyst and return the successful
         results.  Each vote is logged to signal_events individually.  Never
         raises — a failing strategy is skipped, the others still contribute.
+        ``live_market`` (MarketData.fetch() result) only feeds the logged
+        live_price columns — the strategies themselves vote on ``bars``.
         """
         votes: list[StrategyResult] = []
 
@@ -892,6 +960,7 @@ class Coordinator:
                 )
                 self._log_strategy_result(
                     ticker, result, session=session, regime=regime,
+                    bars=bars, live_market=live_market,
                 )
             except Exception as exc:
                 log.warning("[%s] Strategy %s failed (non-fatal): %s",
@@ -900,7 +969,7 @@ class Coordinator:
         # _run_news_catalyst handles its own logging and returns None on
         # failure or when bars are empty.
         nc_result = self._run_news_catalyst(
-            ticker, bars, sentiment, session=session,
+            ticker, bars, sentiment, session=session, live_market=live_market,
         )
         if nc_result is not None:
             votes.append(nc_result)
@@ -1633,6 +1702,7 @@ class Coordinator:
         strategy_votes = self._gather_strategy_votes(
             ticker, bars, sentiment,
             session=session, regime=_regime_name,
+            live_market=sentiment.get("market"),
         )
         if verbose and strategy_votes:
             summary = ", ".join(
@@ -2064,6 +2134,7 @@ class Coordinator:
             self._gather_strategy_votes,
             ticker, bars, sentiment_for_cluster,
             session=session, regime=_regime_name,
+            live_market=market,
         )
 
         # ── PEAD check (no API calls — pure data) ─────────────────────

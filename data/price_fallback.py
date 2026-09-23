@@ -4,7 +4,7 @@ Multi-source price data with 4-level fallback chain.
 Fallback chain
 --------------
 Level 0 — Alpaca Data API     Primary (latest trade / quote)
-Level 1 — Alpha Vantage       Requires ALPHA_VANTAGE_KEY env var
+Level 1 — Alpha Vantage       Requires ALPHA_VANTAGE_KEY or ALPHA_VANTAGE_API_KEY env var
 Level 2 — Yahoo Finance JSON  Direct Yahoo Finance chart API (no auth)
 Level 3 — Last known price    From ResponseCache or DB; is_estimated=True
 
@@ -17,6 +17,16 @@ For critical operations pass ``require_fresh=True`` to raise
 FallbackCoordinator integration
 --------------------------------
 After each call the source level is registered with FallbackCoordinator.
+
+Wiring status (2026-09-23)
+--------------------------
+This chain is NOT on the live trading path.  ``data/market_data.py``
+(``MarketData.fetch``) — the price source for sizing and the price guard —
+calls Alpaca directly (latest trade, then quote mid) and returns
+``price=None, degraded=True`` when that fails; the coordinator then uses the
+technical bar close for analysis only and blocks execution.  Nothing in the
+daemon, API, dashboard or MCP server instantiates :class:`PriceFallback`.
+The key fix above makes Level 1 *usable*; it does not make it *used*.
 
 Usage
 -----
@@ -46,6 +56,22 @@ _CACHE_SERVICE = "yfinance_price"
 _YF_TIMEOUT    = 10
 _AV_URL        = "https://www.alphavantage.co/query"
 _YF_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+
+
+# Env var names accepted for the Alpha Vantage key.  The production .env
+# carries ALPHA_VANTAGE_API_KEY (the name scripts/earnings_source_eval.py
+# reads); this module historically read only ALPHA_VANTAGE_KEY, which left
+# Level 1 silently inactive.  Both spellings are honoured; the first
+# non-empty one wins.
+_AV_KEY_ENV_VARS = ("ALPHA_VANTAGE_KEY", "ALPHA_VANTAGE_API_KEY")
+
+
+def _alpha_vantage_key_from_env() -> str:
+    for name in _AV_KEY_ENV_VARS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────────
@@ -86,7 +112,8 @@ class PriceFallback:
 
     Args:
         db:            Optional Database for recovery event logging.
-        alpha_key:     Alpha Vantage API key.  Reads ALPHA_VANTAGE_KEY env if None.
+        alpha_key:     Alpha Vantage API key.  Reads ALPHA_VANTAGE_KEY, then
+                       ALPHA_VANTAGE_API_KEY, from the environment if None.
     """
 
     def __init__(
@@ -95,7 +122,7 @@ class PriceFallback:
         alpha_key: "str | None" = None,
     ) -> None:
         self._db        = db
-        self._alpha_key = alpha_key or os.environ.get("ALPHA_VANTAGE_KEY", "")
+        self._alpha_key = alpha_key or _alpha_vantage_key_from_env()
         if db is not None:
             APIRecovery.set_db(db)
 

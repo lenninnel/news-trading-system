@@ -84,9 +84,11 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
 def _add_business_days(ts: datetime, n: int) -> datetime:
     """Return *ts* shifted forward by *n* weekdays (Mon–Fri).
 
-    Holidays are not skipped — outcome_tracker's yfinance ±3-day fetch
-    window absorbs holiday edge cases at fill time. Mirrors the
-    frontend's addTradingDays helper so the two stay aligned.
+    Holidays are not skipped here — the tracker itself resolves each
+    horizon to the last US trading day on or before signal_date + N
+    calendar days (data/market_calendar.py) at fill time, so this is a
+    display estimate only. Mirrors the frontend's addTradingDays helper
+    so the two stay aligned.
     """
     result = ts
     added = 0

@@ -93,6 +93,34 @@ _CLUSTER_GATE_COLUMNS: list[tuple[str, str]] = [
     ("cluster_voters", "TEXT"),
 ]
 
+# Bar provenance (2026-09-23): which daily bar the indicators — and the
+# legacy ``price_at_signal`` column, which IS that bar's close — were computed
+# on, and which live price (Alpaca latest trade / quote mid) the sizing and
+# the price guard saw at decision time.  ``price_at_signal`` keeps its
+# historical meaning (indicator-bar close) so downstream readers stay valid;
+# these columns make that meaning explicit.  NULL on rows written before the
+# migration and on paths that carry no bars (scanner, PEAD, sentinel rows).
+_BAR_PROVENANCE_COLUMNS: list[tuple[str, str]] = [
+    ("indicator_bar_date", "TEXT"),      # YYYY-MM-DD of the last bar used
+    ("indicator_bar_close", "REAL"),     # that bar's raw close (== price_at_signal)
+    ("indicator_bar_source", "TEXT"),    # daily_ohlc | yfinance | eodhd | binance
+    ("live_price", "REAL"),              # broker/feed price at decision time
+    ("live_price_source", "TEXT"),       # alpaca | none (degraded → no live price)
+]
+
+# Outcome bookkeeping (2026-09-23): the tracker now fills price_Nd from the
+# daily_ohlc store only.  outcome_status is NULL while a row is still
+# pending, 'filled' once all horizons are written, 'unevaluable' when the
+# row can never be resolved (ticker not in the store, sentinel row, no entry
+# price) — the reason lands in outcome_note.  Legacy rows filled before the
+# migration keep NULL status.
+_OUTCOME_STATUS_COLUMNS: list[tuple[str, str]] = [
+    ("outcome_status", "TEXT"),
+    ("outcome_note", "TEXT"),
+    ("outcome_source", "TEXT"),
+    ("outcome_updated_at", "TEXT"),
+]
+
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,7 +206,10 @@ class SignalLogger:
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
-                for col, typedef in _NEWS_AGE_COLUMNS + _CLUSTER_GATE_COLUMNS:
+                for col, typedef in (
+                    _NEWS_AGE_COLUMNS + _CLUSTER_GATE_COLUMNS
+                    + _BAR_PROVENANCE_COLUMNS + _OUTCOME_STATUS_COLUMNS
+                ):
                     try:
                         conn.execute(
                             f"ALTER TABLE signal_events "
@@ -210,10 +241,13 @@ class SignalLogger:
                          news_newest_published_at, news_age_minutes,
                          news_ts_missing,
                          cluster_gate, cluster_votes, cluster_direction,
-                         cluster_voters)
+                         cluster_voters,
+                         indicator_bar_date, indicator_bar_close,
+                         indicator_bar_source, live_price, live_price_source)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             ?, ?, ?,
-                            ?, ?, ?, ?)
+                            ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -244,6 +278,11 @@ class SignalLogger:
                         signal_data.get("cluster_votes"),
                         signal_data.get("cluster_direction"),
                         signal_data.get("cluster_voters"),
+                        signal_data.get("indicator_bar_date"),
+                        signal_data.get("indicator_bar_close"),
+                        signal_data.get("indicator_bar_source"),
+                        signal_data.get("live_price"),
+                        signal_data.get("live_price_source"),
                     ),
                 )
         except Exception as exc:

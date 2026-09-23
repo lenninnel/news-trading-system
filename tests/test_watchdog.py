@@ -253,7 +253,8 @@ class TestSessions:
         assert "OK   session XETRA_OPEN recovered" in h.sent[-1]
 
     def test_per_day_keys_expire_silently_at_midnight(self, tmp_path):
-        h = Harness(tmp_path, now=datetime(2026, 9, 1, 23, 0, tzinfo=timezone.utc), sessions=[])
+        # 23:15: every session incl. EOD (22:45 + 20 min grace) is due
+        h = Harness(tmp_path, now=datetime(2026, 9, 1, 23, 15, tzinfo=timezone.utc), sessions=[])
         h.run()  # heartbeat + 8 missing sessions
         assert sum(1 for k in h.state()["failing"] if k.startswith("session:")) == 8
         h.now = datetime(2026, 9, 2, 0, 5, tzinfo=timezone.utc)

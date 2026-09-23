@@ -12,13 +12,19 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from analytics.signal_logger import SignalLogger
-from analytics.outcome_tracker import run_outcome_tracker, _is_directional
+from analytics.outcome_tracker import (
+    _is_directional,
+    entry_bar_date,
+    horizon_bar_date,
+    run_outcome_tracker,
+)
+from data.market_calendar import is_us_trading_day
 from analytics.report import generate_report
 from storage.database import Database
 
@@ -189,6 +195,21 @@ class TestGetSignals:
 
 # ── Outcome tracker tests ────────────────────────────────────────────────
 
+def _seed_store(db, ticker: str, start: date, days: int, base: float = 100.0) -> None:
+    """Write `days` consecutive US-trading-day bars for `ticker` from `start`."""
+    rows, d, i = [], start, 0
+    while len(rows) < days:
+        if is_us_trading_day(d):
+            rows.append({
+                "ticker": ticker, "date": d.isoformat(),
+                "open": base + i, "high": base + i + 1, "low": base + i - 1,
+                "close": base + i, "volume": 1_000, "source": "test",
+            })
+            i += 1
+        d += timedelta(days=1)
+    db.upsert_daily_ohlc(rows)
+
+
 class TestOutcomeTracker:
     def test_is_directional(self):
         assert _is_directional("STRONG BUY") == 1
@@ -199,37 +220,121 @@ class TestOutcomeTracker:
         assert _is_directional("CONFLICTING") == 0
         assert _is_directional(None) == 0
 
+    def test_horizon_dates_follow_the_us_calendar(self):
+        # Friday 2026-09-04 → +3 calendar days = Mon 09-07 (Labor Day) → Fri 09-04
+        ts = datetime(2026, 9, 4, 22, 50, tzinfo=timezone.utc)
+        assert horizon_bar_date(ts, 3) == date(2026, 9, 4)
+        assert horizon_bar_date(ts, 5) == date(2026, 9, 9)
+        # entry bar: after 22:00 UTC today's bar is complete, before it T-1
+        assert entry_bar_date(ts) == date(2026, 9, 4)
+        assert entry_bar_date(datetime(2026, 9, 8, 13, 0, tzinfo=timezone.utc)) == date(2026, 9, 4)
+
     def test_backfill_skips_recent_signals(self, signal_db):
-        """Signals less than 3 days old should not be backfilled."""
+        """Signals less than 3 days old are not touched."""
         lgr = SignalLogger(db=signal_db)
         lgr.log(_make_signal())
 
         result = run_outcome_tracker(db=signal_db)
-        # All counts should be 0 — signal is too recent
-        assert sum(result.values()) == 0
+        assert result.total_filled == 0
+        assert result.rows_considered == 0
+        assert "source=daily_ohlc" in result.summary()
 
-    def test_backfill_updates_old_signals(self, signal_db):
-        """Signals >3 days old should be backfilled when price is available."""
+    def test_backfill_fills_from_store_only(self, signal_db):
+        """A store ticker resolves against daily_ohlc closes; the price is
+        the close of the last trading day <= signal_date + N."""
         lgr = SignalLogger(db=signal_db)
+        signal_ts = datetime(2026, 9, 1, 13, 20, tzinfo=timezone.utc)   # Tue, intraday
+        _seed_store(signal_db, "AAPL", date(2026, 8, 20), 25, base=100.0)
+        lgr.log(_make_signal(timestamp=signal_ts.isoformat(), ticker="AAPL",
+                             price_at_signal=100.0, signal="STRONG BUY"))
 
-        # Insert a signal from 5 days ago
-        old_ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
-        lgr.log(_make_signal(timestamp=old_ts, ticker="AAPL"))
+        now = datetime(2026, 9, 15, 22, 50, tzinfo=timezone.utc)
+        result = run_outcome_tracker(db=signal_db, now=now)
+        assert result.filled == {"price_3d": 1, "price_5d": 1, "price_10d": 1}
 
-        # Mock the price fetch to return a higher price (BUY was correct)
-        with patch("analytics.outcome_tracker._fetch_price", return_value=200.0):
-            result = run_outcome_tracker(db=signal_db)
-
-        # price_3d should have been updated (signal is >3 days old)
-        assert result.get("price_3d", 0) == 1
-
-        rows = lgr.get_signals("AAPL", days=30)
-        assert len(rows) == 1
-        row = rows[0]
-        assert row["price_3d"] == pytest.approx(200.0)
-        assert row["outcome_3d_pct"] is not None
-        # BUY signal + price went up → correct
+        row = lgr.get_signals("AAPL", days=60)[0]
+        closes = {r["date"]: r["close"] for r in signal_db.get_daily_ohlc("AAPL", "2026-08-01", "2026-09-30")}
+        assert row["price_3d"] == pytest.approx(closes["2026-09-04"])   # +3d = Fri
+        assert row["price_5d"] == pytest.approx(closes["2026-09-04"])   # +5d = Sun → Fri
+        assert row["price_10d"] == pytest.approx(closes["2026-09-11"])  # +10d = Fri
+        assert row["outcome_3d_pct"] == pytest.approx((closes["2026-09-04"] - 100) / 100 * 100)
         assert row["outcome_correct"] == 1
+        assert row["outcome_status"] == "filled"
+        assert row["outcome_source"] == "daily_ohlc"
+        assert row["outcome_note"] is None
+
+    def test_pending_until_store_has_the_bar(self, signal_db):
+        """No fill while the store stops before the horizon bar — the row
+        stays pending (status NULL), not filled with a stale close."""
+        lgr = SignalLogger(db=signal_db)
+        signal_ts = datetime(2026, 9, 1, 13, 20, tzinfo=timezone.utc)
+        _seed_store(signal_db, "AAPL", date(2026, 8, 20), 10, base=100.0)  # ends 09-02
+        lgr.log(_make_signal(timestamp=signal_ts.isoformat(), ticker="AAPL",
+                             price_at_signal=100.0))
+
+        result = run_outcome_tracker(db=signal_db, now=datetime(2026, 9, 15, tzinfo=timezone.utc))
+        assert result.total_filled == 0
+        assert result.pending == 1
+        row = lgr.get_signals("AAPL", days=60)[0]
+        assert row["price_3d"] is None
+        assert row["outcome_status"] is None
+
+    def test_ticker_without_store_bars_is_marked_unevaluable(self, signal_db):
+        lgr = SignalLogger(db=signal_db)
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=12)).isoformat()
+        lgr.log(_make_signal(timestamp=old_ts, ticker="VNA.DE", price_at_signal=30.0))
+
+        result = run_outcome_tracker(db=signal_db)
+        assert result.unevaluable == {"no_store_bars": 1}
+        row = lgr.get_signals("VNA.DE", days=60)[0]
+        assert row["outcome_status"] == "unevaluable"
+        assert row["outcome_note"] == "no_store_bars"
+        assert row["price_3d"] is None   # never a fake 0.0
+
+        # idempotent: second run does not touch it again
+        again = run_outcome_tracker(db=signal_db)
+        assert again.rows_considered == 0
+        assert again.total_unevaluable == 0
+
+    def test_sentinel_rows_are_marked_not_priced(self, signal_db):
+        lgr = SignalLogger(db=signal_db)
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=12)).isoformat()
+        lgr.log({"ticker": "SESSION", "strategy": "PostSessionReviewer",
+                 "signal": "REVIEW", "timestamp": old_ts})
+
+        result = run_outcome_tracker(db=signal_db)
+        assert result.unevaluable == {"sentinel": 1}
+        row = lgr.get_signals("SESSION", days=60)[0]
+        assert row["outcome_status"] == "unevaluable"
+        assert row["outcome_note"] == "sentinel"
+        assert row["price_5d"] is None
+
+    def test_missing_entry_price_is_backfilled_from_store(self, signal_db):
+        """PreMarketScanner rows carry no price; the entry becomes the close
+        of the last completed bar at signal time (T-1 before 22:00 UTC)."""
+        lgr = SignalLogger(db=signal_db)
+        signal_ts = datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc)
+        _seed_store(signal_db, "AAPL", date(2026, 8, 20), 25, base=100.0)
+        lgr.log(_make_signal(timestamp=signal_ts.isoformat(), ticker="AAPL",
+                             price_at_signal=None, signal="WATCH",
+                             strategy="PreMarketScanner"))
+
+        result = run_outcome_tracker(db=signal_db, now=datetime(2026, 9, 15, 23, tzinfo=timezone.utc))
+        assert result.entry_backfilled == 1
+        row = lgr.get_signals("AAPL", days=60)[0]
+        closes = {r["date"]: r["close"] for r in signal_db.get_daily_ohlc("AAPL", "2026-08-01", "2026-09-30")}
+        assert row["price_at_signal"] == pytest.approx(closes["2026-08-31"])
+        assert row["outcome_note"] == "entry_backfilled_from_store"
+        assert row["outcome_correct"] is None   # WATCH is not directional
+        assert row["outcome_3d_pct"] is not None
+
+    def test_dry_run_writes_nothing(self, signal_db):
+        lgr = SignalLogger(db=signal_db)
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=12)).isoformat()
+        lgr.log(_make_signal(timestamp=old_ts, ticker="VNA.DE", price_at_signal=30.0))
+        result = run_outcome_tracker(db=signal_db, dry_run=True)
+        assert result.unevaluable == {"no_store_bars": 1}
+        assert lgr.get_signals("VNA.DE", days=60)[0]["outcome_status"] is None
 
 
 # ── Report tests ─────────────────────────────────────────────────────────

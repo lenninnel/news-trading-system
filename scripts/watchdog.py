@@ -13,7 +13,9 @@ Checks (kind → behaviour)
 -------------------------
 state  daemon         nts-trading.service is active
 state  session:D:NAME every scheduled session has claimed its session_runs
-                      slot for today once its time + grace has passed
+                      slot for today once its time + grace has passed (and,
+                      since 2026-09-23, was not ABORTED by the bar-freshness
+                      gate — session_runs.note)
 state  ohlc           daily_ohlc holds the last completed US trading day
                       (ingest runs 22:30 UTC, expected from 23:00 UTC on)
 state  timer:*        nts-ohlc-ingest.timer / nts-backup.timer are active
@@ -84,7 +86,7 @@ except Exception:  # pragma: no cover
         {"name": "PEAD_OPEN", "hour": 13, "minute": 45},
         {"name": "US_OPEN", "hour": 14, "minute": 30},
         {"name": "MIDDAY", "hour": 18, "minute": 0},
-        {"name": "EOD", "hour": 22, "minute": 15},
+        {"name": "EOD", "hour": 22, "minute": 45},
     ]
 
 try:  # pragma: no cover
@@ -390,11 +392,20 @@ def check_sessions(cfg: Config, conn: sqlite3.Connection, probes: Probes) -> lis
     if not due:
         return []
     try:
+        # `note` (additive column, 2026-09-23) carries the bar-freshness
+        # verdict: "ABORTED: …" when the session refused to run on a stale
+        # daily bar, "SKIPPED n ticker(s): …" for a partial skip.  Older
+        # DBs have no such column — read it only when present.
+        has_note = any(
+            r[1] == "note"
+            for r in conn.execute("PRAGMA table_info(session_runs)").fetchall()
+        )
+        cols = "session, started_at" + (", note" if has_note else ", NULL")
         rows = conn.execute(
-            "SELECT session, started_at FROM session_runs WHERE run_date = ?",
+            f"SELECT {cols} FROM session_runs WHERE run_date = ?",
             (today,),
         ).fetchall()
-        ran = {r[0]: r[1] for r in rows}
+        ran = {r[0]: (r[1], r[2]) for r in rows}
         table_missing = None
     except sqlite3.Error as exc:
         ran = {}
@@ -404,8 +415,15 @@ def check_sessions(cfg: Config, conn: sqlite3.Connection, probes: Probes) -> lis
     for name, at in due:
         key = f"session:{today}:{name}"
         if name in ran:
-            checks.append(Check(key, f"session {name}", "state", True,
-                                f"ran (claimed {ran[name][:16]})"))
+            started, note = ran[name]
+            if note and str(note).upper().startswith("ABORTED"):
+                checks.append(Check(key, f"session {name}", "state", False,
+                                    f"claimed {started[:16]} but {note}"))
+            else:
+                detail = f"ran (claimed {started[:16]})"
+                if note:
+                    detail += f" — {note}"
+                checks.append(Check(key, f"session {name}", "state", True, detail))
         else:
             why = f"session_runs unreadable: {table_missing}" if table_missing else (
                 f"no session_runs row by {now.strftime('%H:%M')} UTC "

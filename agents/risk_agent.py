@@ -276,6 +276,16 @@ class RiskAgent(BaseAgent):
 
         # -- 1b. Earnings event risk check ---------------------------------
         days_to_earn = get_days_to_earnings(ticker)
+        if days_to_earn is None:
+            # The calendar lookup returned nothing (no date, provider
+            # failure, or a date already in the past).  The filter below
+            # cannot fire without a date, so the earnings gate is OPEN for
+            # this ticker — make that visible instead of silently sizing.
+            log.info(
+                "[%s] earnings date unknown (calendar returned None) — "
+                "earnings filter open, event_risk_flag=none",
+                ticker,
+            )
         if days_to_earn is not None and days_to_earn <= 2:
             event_risk_flag = "earnings_imminent"
         elif days_to_earn is not None and days_to_earn <= 5:
@@ -291,12 +301,18 @@ class RiskAgent(BaseAgent):
             )
 
         if skip_reason:
-            result = self._no_position(ticker, signal, confidence, current_price,
-                                       account_balance, skip_reason)
-            result["event_risk_flag"] = event_risk_flag
-            result["days_to_earnings"] = days_to_earn
-            result["regime"] = regime
-            return result
+            # Pass the earnings context THROUGH to the persisted row.  Until
+            # 2026-09-23 the skip path called _no_position() without it, so
+            # every skipped row — including the real earnings-imminent skips
+            # — landed as event_risk_flag='none', days_to_earnings=NULL and
+            # the DB understated the filter (3,089 such rows on prod).
+            return self._no_position(
+                ticker, signal, confidence, current_price, account_balance,
+                skip_reason,
+                event_risk_flag=event_risk_flag,
+                days_to_earnings=days_to_earn,
+                regime=regime,
+            )
 
         # -- 2. ATR-based or fixed stops ------------------------------------
         atr_result = None
@@ -374,12 +390,13 @@ class RiskAgent(BaseAgent):
             skip_reason = (
                 f"Price ${current_price:.2f} exceeds affordable position"
             )
-            result = self._no_position(ticker, signal, confidence, current_price,
-                                       account_balance, skip_reason)
-            result["event_risk_flag"] = event_risk_flag
-            result["days_to_earnings"] = days_to_earn
-            result["regime"] = regime
-            return result
+            return self._no_position(
+                ticker, signal, confidence, current_price, account_balance,
+                skip_reason,
+                event_risk_flag=event_risk_flag,
+                days_to_earnings=days_to_earn,
+                regime=regime,
+            )
 
         result = {
             "ticker":           ticker,

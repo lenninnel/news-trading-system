@@ -53,9 +53,13 @@ ssh trading-vps 'journalctl --user -u nts-ohlc-ingest -n 30 --no-pager'
 - nts-mcp.service
 - nts-dashboard.service
 - nts-backup.timer (daily 00:30 UTC)
-- nts-ohlc-ingest.timer (daily 22:30 UTC — Polygon daily-bar incremental ingest into `daily_ohlc`.
+- nts-ohlc-ingest.timer (daily 22:30 UTC — Alpaca (default since 2026-09-08; Polygon = rollback)
+  daily-bar incremental ingest into `daily_ohlc`, ~15 s.
   22:30 UTC is after the US close in both DST and winter, and the ingest window includes
   *today* past 22:00 UTC, so after a run on trading day T the store's MAX(date) must be T.
+  The daemon's EOD session runs at 22:45 UTC (since 2026-09-23, `config/sessions.py`) so it
+  evaluates bar T; its bar-freshness gate waits up to 10 min for a late ingest and aborts
+  with a Telegram alert + `session_runs.note` otherwise (`docs/DATA_PATHS_2026-09-23.md`).
   A freshness gate enforces that per ticker against the US trading calendar
   (`data/market_calendar.py`); a stale store exits 1 and sends a Telegram alert via the
   app credentials — a silent "ok" on zero new rows is not possible.)
@@ -66,6 +70,8 @@ ssh trading-vps 'journalctl --user -u nts-ohlc-ingest -n 30 --no-pager'
   block as its own liveness signal. Its failure routes through nts-alert@.)
 - nts-alert@.service (template; `OnFailure=nts-alert@%n.service` on every unit above and, via the
   drop-in `nts-trading.service.d/10-alerting.conf`, on the daemon. Posts unit result + journal tail.)
+- crontab (user `trading`, not a unit): `0 23 * * * … scripts/update_outcomes.py --backfill --quiet`
+  — the outcome tracker's safety net after EOD (same tracker, `daily_ohlc` only, idempotent).
 - nts-preann-estimates.timer (daily 11:00 UTC — Q-013 recorded-only Benzinga T-1 pre-announcement estimate snapshot into `benzinga_estimate_preann_snapshot`; standalone, off the trading path)
 
 The unit files for the four existing nts-* services are NOT

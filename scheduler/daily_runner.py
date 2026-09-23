@@ -304,7 +304,7 @@ WEEKLY_JOBS: list[dict] = [
 
 # Trading window (UTC)
 _WINDOW_START = (6, 45)   # 06:45 (XETRA_PRE)
-_WINDOW_END   = (22, 30)  # 22:30
+_WINDOW_END   = (23, 0)   # 23:00 (EOD at 22:45 must still count as open)
 
 
 def _runner_id() -> str:
@@ -353,7 +353,8 @@ class DailyScheduler:
     Daemon that sleeps between 7 daily trading runs (weekdays, UTC).
 
     Runs: XETRA_PRE (06:45), XETRA_OPEN (07:00), US_PRE (13:15),
-          PEAD_OPEN (13:45), US_OPEN (14:30), MIDDAY (18:00), EOD (22:15).
+          PEAD_OPEN (13:45), US_OPEN (14:30), MIDDAY (18:00), EOD (22:45,
+          after the 22:30 daily_ohlc ingest).
     """
 
     def __init__(self, full_watchlist: list[str] | None = None) -> None:
@@ -677,6 +678,119 @@ class DailyScheduler:
         return None
 
     # ── Helper methods ────────────────────────────────────────────────
+
+    @staticmethod
+    def _annotate_session_slot(session_name: str, note: str) -> None:
+        """Write a free-text note onto today's ``session_runs`` row.
+
+        Used by the bar-freshness gate ("ABORTED: …" / "SKIPPED …") so the
+        watchdog can tell an aborted session from one that ran.  The
+        column is added on first use (additive, idempotent); any failure
+        is logged and swallowed — the Telegram alert is the primary path.
+        """
+        try:
+            from storage.database import _resolve_db_path
+            db_path = _resolve_db_path()
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                try:
+                    conn.execute("ALTER TABLE session_runs ADD COLUMN note TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                conn.execute(
+                    "UPDATE session_runs SET note = ? WHERE session = ? AND run_date = ?",
+                    (note[:500], session_name, today),
+                )
+                conn.commit()
+        except Exception as exc:
+            log.warning("[%s] session_runs note failed (non-fatal): %s",
+                        session_name, exc)
+
+    def _apply_bar_freshness_gate(
+        self, run_name: str, session_type: str, tickers: list[str],
+    ) -> list[str] | None:
+        """Refuse to compute signals on a stale daily bar.
+
+        Returns the (possibly reduced) ticker list to run, or ``None`` when
+        the session must not run at all.  See scheduler/bar_freshness.py
+        for the rules.  Fails OPEN on unexpected errors: a broken check is
+        logged loudly but never blocks a session by itself.
+        """
+        from config.settings import (
+            BAR_FRESHNESS_EOD_WAIT_S,
+            BAR_FRESHNESS_GATE_ENABLED,
+            BAR_FRESHNESS_POLL_S,
+        )
+        from scheduler.bar_freshness import (
+            GATED_SESSION_TYPES,
+            POST_INGEST_SESSIONS,
+            check_bar_freshness,
+        )
+
+        if not BAR_FRESHNESS_GATE_ENABLED or session_type not in GATED_SESSION_TYPES:
+            return tickers
+        try:
+            from storage.database import Database
+            db = Database()
+            result = check_bar_freshness(db, run_name, tickers)
+
+            # EOD starts 15 min after the ingest timer; give a late ingest
+            # a bounded chance to land before judging.
+            if result.verdict != "ok" and run_name in POST_INGEST_SESSIONS:
+                deadline = time.monotonic() + max(0, BAR_FRESHNESS_EOD_WAIT_S)
+                while result.verdict != "ok" and time.monotonic() < deadline:
+                    log.warning(
+                        "[%s] store not fresh yet (%s) — waiting %ds for the ingest",
+                        run_name, result.summary(), BAR_FRESHNESS_POLL_S,
+                    )
+                    time.sleep(max(1, BAR_FRESHNESS_POLL_S))
+                    result = check_bar_freshness(db, run_name, tickers)
+        except Exception as exc:
+            log.error("[%s] bar freshness gate crashed — failing OPEN: %s",
+                      run_name, exc, exc_info=True)
+            return tickers
+
+        if result.verdict == "ok":
+            log.info("[%s] %s", run_name, result.summary())
+            return tickers
+
+        summary = result.summary()
+        log.error("[%s] %s", run_name, summary)
+        print(f"[scheduler] {run_name}: {summary}", flush=True)
+        if result.verdict == "abort":
+            note = f"ABORTED: stale daily bars ({summary})"
+            self._annotate_session_slot(run_name, note)
+            if self._tg:
+                try:
+                    self._tg._send(
+                        f"\U0001f6d1 *{run_name} ABORTED — stale daily bars*\n"
+                        f"Expected MAX(date)={result.expected.isoformat()}, all "
+                        f"{len(result.checked)} store tickers behind. "
+                        f"No signals were computed. Check nts-ohlc-ingest."
+                    )
+                except Exception as tg_exc:
+                    log.warning("Telegram stale-bar alert failed: %s", tg_exc)
+            return None
+
+        kept = [t for t in tickers if t not in result.stale]
+        note = (
+            f"SKIPPED {len(result.stale)} ticker(s) on stale bars: "
+            + ", ".join(sorted(result.stale))
+        )
+        self._annotate_session_slot(run_name, note)
+        if self._tg:
+            try:
+                self._tg._send(
+                    f"\u26a0\ufe0f *{run_name}: {len(result.stale)} ticker(s) skipped — "
+                    f"stale daily bars*\n"
+                    f"Expected MAX(date)={result.expected.isoformat()}: "
+                    + ", ".join(f"{t}={d}" for t, d in sorted(result.stale.items()))
+                    + f"\nRunning the remaining {len(kept)}."
+                )
+            except Exception as tg_exc:
+                log.warning("Telegram stale-bar alert failed: %s", tg_exc)
+        return kept
 
     def next_run_time(self, after: datetime | None = None) -> datetime:
         """Return the next scheduled run time (UTC) strictly after *after*.
@@ -1055,6 +1169,13 @@ class DailyScheduler:
         else:
             scanner_candidates = self._load_scanner_candidate_tickers()
 
+        # Bar-freshness gate: no strategy evaluation on a daily bar the
+        # store should have replaced by now (scheduler/bar_freshness.py).
+        gated = self._apply_bar_freshness_gate(run_name, session_type, tickers)
+        if gated is None:
+            return
+        tickers = gated
+
         workers = run["workers"]
         now_str = datetime.now(timezone.utc).strftime("%H:%M")
         runner_id = _runner_id()
@@ -1189,16 +1310,25 @@ class DailyScheduler:
                 except Exception as exc:
                     log.warning("EOD summary failed: %s", exc)
 
-                # Backfill signal outcomes (3d/5d/10d price changes)
+                # Backfill signal outcomes (3d/5d/10d) from the daily_ohlc
+                # store — runs AFTER the ingest now that EOD is at 22:45.
+                # The tracker logs its own per-run summary (always, even
+                # for zero rows); a crash here is an ERROR with traceback
+                # plus a Telegram line, never a silent WARNING.
                 try:
                     from analytics.outcome_tracker import run_outcome_tracker
                     outcome_result = run_outcome_tracker()
-                    total_updated = sum(outcome_result.values())
-                    if total_updated:
-                        log.info("EOD outcome backfill: %d rows updated %s",
-                                 total_updated, outcome_result)
+                    log.info("EOD outcome tracker: %s", outcome_result.summary())
                 except Exception as exc:
-                    log.warning("EOD outcome tracker failed (non-fatal): %s", exc)
+                    log.error("EOD outcome tracker FAILED: %s", exc, exc_info=True)
+                    print(f"[scheduler] EOD outcome tracker FAILED: {exc}", flush=True)
+                    if self._tg:
+                        try:
+                            self._tg._send(
+                                f"\u26a0\ufe0f *EOD outcome tracker failed*\n{str(exc)[:300]}"
+                            )
+                        except Exception:
+                            pass
 
                 # Nightly per-strategy performance tracker
                 try:

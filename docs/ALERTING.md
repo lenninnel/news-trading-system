@@ -41,7 +41,8 @@ use it — before, they called a non-existent `send_message` on a notifier that
 | Daemon started | yes | daemon | "🟢 News Trading Daemon started" |
 | Daemon dead / unit failed | **yes** | watchdog (`daemon`) + `nts-alert@` drop-in | watchdog: within 15 min, reminder every 6 h, recovery line. nts-alert@: when systemd gives up restarting |
 | Daemon restart loop | **yes** | watchdog (`restarts` event) | NRestarts delta since last check, reported every time |
-| Scheduled session missing | **yes** | watchdog (`session:<date>:<NAME>`) | session time + 20 min grace without a `session_runs` row; per-day keys expire silently at midnight |
+| Scheduled session missing | **yes** | watchdog (`session:<date>:<NAME>`) | session time + 20 min grace without a `session_runs` row; per-day keys expire silently at midnight. EOD is at 22:45 UTC (due 23:05) since 2026-09-23 |
+| Session refused to run on a stale daily bar | **yes** | daemon (🛑/⚠️ "stale daily bars") + watchdog (same `session:` key, `session_runs.note` starts with `ABORTED`) | bar-freshness gate, `scheduler/bar_freshness.py`; partial skips are ok with detail |
 | Session started / completed | yes | daemon | not for MIDDAY (monitor) |
 | Session crashed | yes | daemon | "🚨 Scheduler error in …" |
 | Scheduler loop crashed | yes | daemon | restarts in 60 s |

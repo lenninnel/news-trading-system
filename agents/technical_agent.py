@@ -53,6 +53,46 @@ from utils import safe_column
 logger = logging.getLogger(__name__)
 
 
+# Key under which the daily frame carries its origin ("daily_ohlc",
+# "yfinance", "eodhd", "binance").  pandas keeps ``DataFrame.attrs`` across
+# the column renames / slices the indicator pipeline performs.
+BAR_SOURCE_ATTR = "bar_source"
+
+
+def _tag_bar_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    try:
+        df.attrs[BAR_SOURCE_ATTR] = source
+    except Exception:  # pragma: no cover - attrs is best-effort
+        pass
+    return df
+
+
+def bar_provenance(df) -> dict:
+    """Describe the LAST bar of a daily OHLCV frame.
+
+    Returns ``{"bar_date": "YYYY-MM-DD" | None, "bar_close": float | None,
+    "bar_source": str | None}``.  Never raises — a frame without a
+    datetime index or Close column yields Nones, which land as NULL.
+    """
+    out: dict = {"bar_date": None, "bar_close": None, "bar_source": None}
+    try:
+        if df is None or getattr(df, "empty", True):
+            return out
+        out["bar_source"] = (getattr(df, "attrs", {}) or {}).get(BAR_SOURCE_ATTR)
+        last_idx = df.index[-1]
+        try:
+            out["bar_date"] = pd.Timestamp(last_idx).strftime("%Y-%m-%d")
+        except Exception:
+            out["bar_date"] = None
+        if "Close" in df.columns:
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if not close.empty:
+                out["bar_close"] = float(close.iloc[-1])
+    except Exception:
+        pass
+    return out
+
+
 class TechnicalAgent(BaseAgent):
     """
     Computes technical indicators and derives a trading signal.
@@ -146,6 +186,12 @@ class TechnicalAgent(BaseAgent):
 
         # -- 2. Calculate indicators ----------------------------------------
         indicators = self._calculate_indicators(df)
+        # Provenance of the bar the indicators (and the "price" field) were
+        # computed on: its date, its close and where it came from.  Logged
+        # to signal_events so every row says which bar it rests on — the
+        # D3 design (indicators on the last COMPLETED daily bar, live price
+        # only for sizing) is deliberate but was invisible in the data.
+        indicators.update(bar_provenance(df))
 
         # -- 3. Apply signal rules ------------------------------------------
         signal, reasoning = self._apply_signal_rules(indicators)
@@ -241,7 +287,7 @@ class TechnicalAgent(BaseAgent):
         if ticker.upper() in CRYPTO_TICKERS:
             df = self._binance.get_ohlcv(ticker)
             if df is not None and not df.empty:
-                return df
+                return _tag_bar_source(df, "binance")
             raise ValueError(f"No Binance data returned for crypto ticker '{ticker}'")
 
         if is_german_ticker(ticker):
@@ -256,7 +302,7 @@ class TechnicalAgent(BaseAgent):
             logger.debug(
                 "daily_ohlc returned %d clean bars for %s", len(clean_df), ticker,
             )
-            return clean_df
+            return _tag_bar_source(clean_df, "daily_ohlc")
 
         # Fall back to yfinance — log LOUDLY so a silent regression is visible.
         clean_n = 0 if clean_df is None else len(clean_df)
@@ -270,7 +316,7 @@ class TechnicalAgent(BaseAgent):
             df = self._yf.get_bars(ticker, "1Day", limit=252)
             if not df.empty:
                 logger.debug("yfinance returned %d bars for %s", len(df), ticker)
-                return df
+                return _tag_bar_source(df, "yfinance")
         except Exception as exc:
             logger.warning("yfinance bars failed for %s: %s", ticker, exc)
 
@@ -341,7 +387,7 @@ class TechnicalAgent(BaseAgent):
             df = self._eodhd.get_ohlcv_daily(ticker)
             if df is not None and not df.empty:
                 logger.info("Using EODHD daily data for %s (%d bars)", ticker, len(df))
-                return df
+                return _tag_bar_source(df, "eodhd")
             logger.warning("EODHD returned no data for %s — falling back to yfinance", ticker)
 
         # Fallback: convert .XETRA -> .DE for yfinance

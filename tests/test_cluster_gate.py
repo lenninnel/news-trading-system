@@ -276,9 +276,10 @@ def _integration_coord(monkeypatch, db, votes):
     coord._has_alpaca_position = MagicMock(return_value=False)
 
     # strategy rows are logged by the (real) _log_strategy_result
-    def _gather(ticker, bars, sentiment, *, session=None, regime=None):
+    def _gather(ticker, bars, sentiment, *, session=None, regime=None, live_market=None):
         for v in votes:
-            coord._log_strategy_result(ticker, v, session=session, regime=regime)
+            coord._log_strategy_result(ticker, v, session=session, regime=regime,
+                                       bars=bars, live_market=live_market)
         return list(votes)
     coord._gather_strategy_votes = _gather
     return coord

@@ -285,6 +285,21 @@ REENTRY_LOCK_SESSIONS: int = 5
 # equally poor (N=47, −1.00 % per trade) — that is reported, not folded in.
 REENTRY_LOCK_INCLUDE_TRAILING: bool = True
 
+# Bar-freshness gate (2026-09-23, scheduler/bar_freshness.py): before a
+# signal/execution session evaluates strategies, the newest daily_ohlc bar
+# must be the one the session expects (T-1 intraday, T for EOD after the
+# ingest).  Stale tickers are skipped, a fully stale store aborts the
+# session; both alert via Telegram + session_runs.note.  Env override is a
+# deployment escape hatch only (e.g. a known unscheduled market closure).
+BAR_FRESHNESS_GATE_ENABLED: bool = os.environ.get(
+    "BAR_FRESHNESS_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+# EOD runs 15 min after the ingest timer; if the store is still behind at
+# session start the gate waits (polling) this long for the ingest to land
+# before it decides.  The ingest itself takes ~15 s on Alpaca.
+BAR_FRESHNESS_EOD_WAIT_S: int = int(os.environ.get("BAR_FRESHNESS_EOD_WAIT_S", "600"))
+BAR_FRESHNESS_POLL_S: int = int(os.environ.get("BAR_FRESHNESS_POLL_S", "30"))
+
 PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
     "PEAD_EARNINGS_CACHE_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "walk-forward-backtest" / "data" / "ibkr_earnings_cache.json"),
