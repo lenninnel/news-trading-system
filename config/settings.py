@@ -283,7 +283,7 @@ REENTRY_LOCK_SESSIONS: int = 5
 # also arms the lock. Off: the lock covers stop-LOSS exits only, which is
 # what the rule says. The audit found re-entries after trailing exits
 # equally poor (N=47, −1.00 % per trade) — that is reported, not folded in.
-REENTRY_LOCK_INCLUDE_TRAILING: bool = False
+REENTRY_LOCK_INCLUDE_TRAILING: bool = True
 
 PEAD_EARNINGS_CACHE_PATH: str = os.environ.get(
     "PEAD_EARNINGS_CACHE_PATH",
