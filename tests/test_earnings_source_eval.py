@@ -23,7 +23,7 @@ Standalone, capture-only, NON-LIVE job — these tests pin its contract:
   the free-tier daily budget (shortfall WARNING + run_log.error_text);
   HTTP-200 JSON-note rate limiting treated as retriable; eps_method
   'unknown'; reportTime → eps_capture.time_of_day persisted (Amendment
-  A4, Finnhub/FMP rows carry NULL); fail-soft vs the other two providers.
+  A4, Finnhub rows carry NULL); fail-soft vs the other two providers.
 * NEWS_SENTIMENT probe — stdout only, summary fields present, no DB
   write, exit 1 on failure.
 * yfinance (fourth provider, R spec 2026-08-26) — helper-payload cal/eps
@@ -79,22 +79,6 @@ FINNHUB_CAL_ROWS = [
      "revenueEstimate": 1, "symbol": "ZZZQ", "year": 2026},
 ]
 
-# FMP GET /api/v3/earning_calendar → bare list
-FMP_CAL_ROWS = [
-    {"date": "2026-09-03", "symbol": "AAPL", "eps": None,
-     "epsEstimated": 2.08, "time": "amc", "revenue": None,
-     "revenueEstimated": 89500000000, "fiscalDateEnding": "2026-08-31",
-     "updatedFromDate": "2026-08-20"},
-    {"date": "2026-09-08", "symbol": "CASY", "eps": None,
-     "epsEstimated": 4.60, "time": "--", "revenue": None,
-     "revenueEstimated": 4150000000, "fiscalDateEnding": "2026-07-31",
-     "updatedFromDate": "2026-08-20"},
-    {"date": "2026-09-05", "symbol": "ZZZQ", "eps": None,
-     "epsEstimated": 1.0, "time": "bmo", "revenue": None,
-     "revenueEstimated": 1, "fiscalDateEnding": "2026-08-31",
-     "updatedFromDate": "2026-08-20"},
-]
-
 FINNHUB_EPS_ROWS = [
     # Reported today (capture day) — available_same_day = 1.
     {"date": "2026-08-24", "epsActual": 2.35, "epsEstimate": 2.10,
@@ -105,13 +89,6 @@ FINNHUB_EPS_ROWS = [
     # Actual still missing — available_same_day / first_seen_ts NULL.
     {"date": "2026-08-24", "epsActual": None, "epsEstimate": 1.50,
      "hour": "amc", "quarter": 3, "symbol": "TSLA", "year": 2026},
-]
-
-FMP_EPS_ROWS = [
-    {"date": "2026-08-24", "symbol": "AAPL", "eps": 2.34,
-     "epsEstimated": 2.08, "time": "bmo", "revenue": 91000000000,
-     "revenueEstimated": 89500000000, "fiscalDateEnding": "2026-08-31",
-     "updatedFromDate": "2026-08-24"},
 ]
 
 
@@ -129,7 +106,7 @@ def _av_eps_fetcher(payloads, status=200, headers=None, calls=None):
 
 
 # Empty stand-ins so tests focused on one provider still satisfy the
-# four-provider loop.
+# three-provider loop.
 _AV_NONE_CAL = _fetcher([])
 _AV_NONE_EPS = lambda ticker: ({"symbol": ticker, "quarterlyEarnings": []}, 200, {})  # noqa: E731
 _YF_NONE = lambda tickers: {"version": "0.2.99-test", "rows": [], "errors": []}  # noqa: E731
@@ -178,21 +155,20 @@ def test_schema_creates_exact_rspec_tables(conn):
 
 # ── cal mode: field mapping, days_ahead, universe filter ─────────────
 
-def test_cal_capture_field_mapping_both_providers(conn):
+def test_cal_capture_field_mapping_finnhub(conn):
     fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
-                "fmp": _fetcher(FMP_CAL_ROWS),
                 "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["finnhub"]["ok"]
-    assert summary["providers"]["fmp"]["ok"]
+    assert "fmp" not in summary["providers"]       # removed 2026-09-23
 
     rows = conn.execute(
         "SELECT provider, ticker, report_date, time_of_day, date_status,"
         " days_ahead, raw_payload_hash, provider_status_raw"
         " FROM cal_capture ORDER BY provider, ticker").fetchall()
-    # ZZZQ filtered out for both providers → 2 rows each.
-    assert len(rows) == 4
+    # ZZZQ filtered out → 2 finnhub rows.
+    assert len(rows) == 2
     by_key = {(r[0], r[1]): r for r in rows}
 
     fh_aapl = by_key[("finnhub", "AAPL")]
@@ -208,14 +184,10 @@ def test_cal_capture_field_mapping_both_providers(conn):
     assert fh_casy[4] == "tentative"          # no session → tentative
     assert fh_casy[7] == ""                   # raw field preserved
 
-    fmp_casy = by_key[("fmp", "CASY")]
-    assert fmp_casy[3] == "unknown"           # "--" → unknown
-    assert fmp_casy[4] == "tentative"
-    assert fmp_casy[7] == "--"
-    assert fmp_casy[5] == 15
+    assert fh_casy[5] == 15                   # days_ahead from 2026-08-24
 
     # Distinct raw payloads → distinct hashes.
-    assert fh_aapl[6] != by_key[("fmp", "AAPL")][6]
+    assert fh_aapl[6] != fh_casy[6]
 
 
 def test_cal_run_log_rows_and_no_query_params(conn):
@@ -223,14 +195,14 @@ def test_cal_run_log_rows_and_no_query_params(conn):
                                     headers={"X-RateLimit-Remaining": "29",
                                              "X-RateLimit-Limit": "30",
                                              "Content-Type": "application/json"}),
-                "fmp": _fetcher(FMP_CAL_ROWS),
                 "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     logs = conn.execute(
         "SELECT provider, endpoint, http_status, rows_returned,"
         " rate_limit_headers, error_text FROM run_log ORDER BY provider").fetchall()
-    assert len(logs) == 4
+    assert len(logs) == 3
+    assert {l[0] for l in logs} == {"finnhub", "alphavantage", "yfinance"}
     fh = [l for l in logs if l[0] == "finnhub"][0]
     assert "?" not in fh[1] and "apikey" not in fh[1] and "token" not in fh[1]
     assert fh[2] == 200
@@ -242,9 +214,8 @@ def test_cal_run_log_rows_and_no_query_params(conn):
 
 # ── eps mode: field mapping incl. eps_method / available_same_day ────
 
-def test_eps_capture_field_mapping_both_providers(conn):
+def test_eps_capture_field_mapping_finnhub(conn):
     fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS),
-                "fmp": _fetcher(FMP_EPS_ROWS),
                 "alphavantage": _AV_NONE_EPS, "yfinance": _YF_NONE}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -253,7 +224,7 @@ def test_eps_capture_field_mapping_both_providers(conn):
         " surprise_pct, eps_method, available_same_day, first_seen_ts,"
         " time_of_day"
         " FROM eps_capture ORDER BY provider, ticker").fetchall()
-    assert len(rows) == 4
+    assert len(rows) == 3
     by_key = {(r[0], r[1]): r for r in rows}
 
     fh_aapl = by_key[("finnhub", "AAPL")]
@@ -270,17 +241,13 @@ def test_eps_capture_field_mapping_both_providers(conn):
     assert fh_tsla[4] is None                 # no actual yet
     assert fh_tsla[5] is None and fh_tsla[7] is None and fh_tsla[8] is None
 
-    fmp_aapl = by_key[("fmp", "AAPL")]
-    assert fmp_aapl[3] == 2.08 and fmp_aapl[4] == 2.34
-    assert fmp_aapl[6] == "fmp_calendar:eps/epsEstimated"
-
-    # Neither Finnhub nor FMP provides a session in the eps payload —
-    # time_of_day is NULL on every one of their rows (A4).
+    # Finnhub provides no session in the eps payload — time_of_day is
+    # NULL on every one of its rows (A4).
     assert all(r[9] is None for r in rows)
 
 
 def test_first_seen_ts_set_once_and_carried_forward(conn):
-    fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS), "fmp": _fetcher([]),
+    fetchers = {"finnhub": _fetcher(FINNHUB_EPS_ROWS),
                 "alphavantage": _AV_NONE_EPS, "yfinance": _YF_NONE}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -306,16 +273,16 @@ def test_fail_soft_one_provider_raising_never_stops_the_other(conn):
     def _boom(frm, to):
         raise RuntimeError("finnhub down")
 
-    fetchers = {"finnhub": _boom, "fmp": _fetcher(FMP_CAL_ROWS),
-                "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _boom, "alphavantage": _fetcher(AV_CAL_ROWS),
+                "yfinance": _YF_NONE}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["finnhub"]["ok"] is False
-    assert summary["providers"]["fmp"]["ok"] is True
+    assert summary["providers"]["alphavantage"]["ok"] is True
 
-    # FMP rows still written.
+    # Alpha Vantage rows still written (CASY + AAPL-absent; ZZZQ filtered).
     assert conn.execute(
-        "SELECT COUNT(*) FROM cal_capture WHERE provider='fmp'"
+        "SELECT COUNT(*) FROM cal_capture WHERE provider='alphavantage'"
     ).fetchone()[0] == 2
     assert conn.execute(
         "SELECT COUNT(*) FROM cal_capture WHERE provider='finnhub'"
@@ -323,9 +290,11 @@ def test_fail_soft_one_provider_raising_never_stops_the_other(conn):
     # BOTH outcomes land in run_log.
     logs = {r[0]: r for r in conn.execute(
         "SELECT provider, error_text, rows_returned FROM run_log")}
-    assert len(logs) == 4
+    assert len(logs) == 3
     assert "finnhub down" in logs["finnhub"][1]
-    assert logs["fmp"][1] is None and logs["fmp"][2] == 3
+    # AV success row carries only the forward-only window note.
+    assert "forward-only" in logs["alphavantage"][1]
+    assert logs["alphavantage"][2] == 3
 
 
 def test_retry_cap_initial_plus_two_retries_then_stop(conn):
@@ -336,8 +305,7 @@ def test_retry_cap_initial_plus_two_retries_then_stop(conn):
         calls.append(1)
         raise RuntimeError("still down")
 
-    fetchers = {"finnhub": _always_fails, "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _always_fails, "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=sleeps.append)
     # Max 2 retries after the initial attempt → exactly 3 calls, 2 backoff
@@ -356,16 +324,16 @@ def test_retry_recovers_without_run_log_error(conn):
         attempts.append(1)
         if len(attempts) < 2:
             raise RuntimeError("blip")
-        return FMP_CAL_ROWS, 200, {}
+        return FINNHUB_CAL_ROWS, 200, {}
 
-    fetchers = {"finnhub": _fetcher([]), "fmp": _flaky,
+    fetchers = {"finnhub": _flaky,
                 "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert len(attempts) == 2
-    assert summary["providers"]["fmp"]["ok"] is True
+    assert summary["providers"]["finnhub"]["ok"] is True
     assert conn.execute(
-        "SELECT error_text FROM run_log WHERE provider='fmp'"
+        "SELECT error_text FROM run_log WHERE provider='finnhub'"
     ).fetchone()[0] is None
 
 
@@ -400,12 +368,6 @@ def test_fetch_finnhub_key_in_header_not_url(monkeypatch):
     assert "SECRET" not in captured["url"]
     assert "SECRET" not in json.dumps(captured["params"])
 
-
-def test_fetch_fmp_parses_bare_list(monkeypatch):
-    monkeypatch.setattr(ev.requests, "get",
-                        lambda *a, **kw: _FakeResp(FMP_CAL_ROWS))
-    rows, status, _ = ev.fetch_fmp("SECRET", "2026-08-24", "2026-09-23")
-    assert rows == FMP_CAL_ROWS and status == 200
 
 
 def test_sanitize_error_strips_keys_and_query_strings():
@@ -500,8 +462,8 @@ AV_NEWS_FIXTURE = {
 # ── Alpha Vantage: cal normalization ─────────────────────────────────
 
 def test_av_cal_normalization_universe_filter_and_date_status(conn):
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _fetcher(AV_CAL_ROWS), "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _fetcher(AV_CAL_ROWS),
+                "yfinance": _YF_NONE}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["alphavantage"]["ok"]
@@ -562,8 +524,7 @@ def test_normalize_av_report_time():
 
 def test_av_eps_normalization_window_method_first_seen(conn):
     calls = []
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _av_eps_fetcher({"AAPL": AV_EPS_AAPL},
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _av_eps_fetcher({"AAPL": AV_EPS_AAPL},
                                                 calls=calls),
                 "yfinance": _YF_NONE}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
@@ -608,8 +569,7 @@ def test_av_eps_normalization_window_method_first_seen(conn):
 def test_av_budget_shortfall_warning_and_error_text(conn, caplog):
     calls = []
     fetchers = {
-        "finnhub": _fetcher([]), "fmp": _fetcher([]),
-        "alphavantage": _av_eps_fetcher(
+        "finnhub": _fetcher([]), "alphavantage": _av_eps_fetcher(
             {"CASY": {"symbol": "CASY", "quarterlyEarnings": []},
              "TSLA": {"symbol": "TSLA", "quarterlyEarnings": []}},
             calls=calls),
@@ -646,8 +606,7 @@ def test_av_budget_shortfall_names_all_skipped_tickers(conn, caplog):
     whether the same tickers are systematically excluded."""
     calls = []
     fetchers = {
-        "finnhub": _fetcher([]), "fmp": _fetcher([]),
-        "alphavantage": _av_eps_fetcher(
+        "finnhub": _fetcher([]), "alphavantage": _av_eps_fetcher(
             {"CASY": {"symbol": "CASY", "quarterlyEarnings": []}},
             calls=calls),
         "yfinance": _YF_NONE,
@@ -679,8 +638,7 @@ def test_av_note_rate_limit_is_retriable_and_recorded(conn):
         calls.append(ticker)
         return AV_RATE_LIMIT_NOTE, 200, {}
 
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _rate_limited, "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _rate_limited, "yfinance": _YF_NONE}
     summary = ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                              universe={"AAPL"}, av_priority=["AAPL"],
                              sleep_fn=_NO_SLEEP)
@@ -700,18 +658,16 @@ def test_av_fail_soft_other_providers_unaffected(conn):
     def _boom(frm, to):
         raise RuntimeError("av boom")
 
-    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
-                "fmp": _fetcher(FMP_CAL_ROWS), "alphavantage": _boom,
+    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "alphavantage": _boom,
                 "yfinance": _YF_NONE}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     assert summary["providers"]["alphavantage"]["ok"] is False
     assert summary["providers"]["finnhub"]["ok"] is True
-    assert summary["providers"]["fmp"]["ok"] is True
     assert conn.execute(
-        "SELECT COUNT(*) FROM cal_capture WHERE provider IN ('finnhub','fmp')"
-    ).fetchone()[0] == 4
-    assert conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0] == 4
+        "SELECT COUNT(*) FROM cal_capture WHERE provider='finnhub'"
+    ).fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM run_log").fetchone()[0] == 3
     assert "av boom" in conn.execute(
         "SELECT error_text FROM run_log WHERE provider='alphavantage'"
     ).fetchone()[0]
@@ -805,8 +761,7 @@ YF_EPS_PAYLOAD = {
 
 def test_yf_cal_normalization_filter_note_and_errors(conn):
     calls = []
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL,
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _AV_NONE_CAL,
                 "yfinance": _yf_fetcher(YF_CAL_PAYLOAD, calls=calls)}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -848,8 +803,7 @@ def test_yf_cal_normalization_filter_note_and_errors(conn):
 # ── yfinance: eps normalization, window filter, first_seen_ts ────────
 
 def test_yf_eps_normalization_window_and_time_of_day(conn):
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_EPS,
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _AV_NONE_EPS,
                 "yfinance": _yf_fetcher(YF_EPS_PAYLOAD)}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -883,8 +837,7 @@ def test_yf_eps_normalization_window_and_time_of_day(conn):
 
 
 def test_yf_first_seen_ts_set_once_and_carried_forward(conn):
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_EPS,
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _AV_NONE_EPS,
                 "yfinance": _yf_fetcher(YF_EPS_PAYLOAD)}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -927,8 +880,7 @@ def _assert_yf_failed_others_committed(conn, summary, needle):
 
 def test_yf_missing_interpreter_fail_soft(conn, monkeypatch, tmp_path):
     monkeypatch.setenv("YF_EVAL_PYTHON", str(tmp_path / "no-venv" / "python3"))
-    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL,
+    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "alphavantage": _AV_NONE_CAL,
                 "yfinance": _yf_real_fetcher("cal")}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -944,8 +896,7 @@ def test_yf_subprocess_timeout_fail_soft(conn, monkeypatch, tmp_path):
         raise subprocess.TimeoutExpired(cmd=args[0], timeout=120)
 
     monkeypatch.setattr(ev.subprocess, "run", _timeout)
-    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL,
+    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "alphavantage": _AV_NONE_CAL,
                 "yfinance": _yf_real_fetcher("cal")}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -963,8 +914,7 @@ def test_yf_malformed_stdout_and_nonzero_exit_fail_soft(
         lambda *a, **kw: SimpleNamespace(returncode=0,
                                          stdout="Traceback (not json)",
                                          stderr=""))
-    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL,
+    fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS), "alphavantage": _AV_NONE_CAL,
                 "yfinance": _yf_real_fetcher("cal")}
     summary = ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                              universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
@@ -996,8 +946,7 @@ def test_window_widening_finnhub_gets_t_minus_2_and_negative_days_ahead(conn):
                   "epsEstimate": 2.1, "hour": "bmo", "quarter": 3,
                   "symbol": "AAPL", "year": 2026}], 200, {})
 
-    fetchers = {"finnhub": _fh_cal, "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _fh_cal, "alphavantage": _AV_NONE_CAL, "yfinance": _YF_NONE}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     # cal window is [T-2, T+30].
@@ -1012,8 +961,7 @@ def test_window_widening_finnhub_gets_t_minus_2_and_negative_days_ahead(conn):
         windows["eps"] = (frm, to)
         return ([], 200, {})
 
-    fetchers = {"finnhub": _fh_eps, "fmp": _fetcher([]),
-                "alphavantage": _AV_NONE_EPS, "yfinance": _YF_NONE}
+    fetchers = {"finnhub": _fh_eps, "alphavantage": _AV_NONE_EPS, "yfinance": _YF_NONE}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, sleep_fn=_NO_SLEEP)
     # eps window is [T-2, T] (was [T-1, T]).
@@ -1022,7 +970,6 @@ def test_window_widening_finnhub_gets_t_minus_2_and_negative_days_ahead(conn):
 
 def test_forward_only_note_recorded_for_av_and_yfinance_not_finnhub(conn):
     fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
-                "fmp": _fetcher(FMP_CAL_ROWS),
                 "alphavantage": _fetcher(AV_CAL_ROWS),
                 "yfinance": _yf_fetcher(YF_CAL_PAYLOAD)}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
@@ -1034,8 +981,8 @@ def test_forward_only_note_recorded_for_av_and_yfinance_not_finnhub(conn):
     assert "forward-only" in notes["alphavantage"]
     assert "EARNINGS endpoint" in notes["alphavantage"]
     assert "forward-only" in notes["yfinance"]
-    # finnhub/fmp have full range coverage — no note.
-    assert notes["finnhub"] is None and notes["fmp"] is None
+    # finnhub has full range coverage — no note.
+    assert notes["finnhub"] is None
 
 
 def test_av_eps_window_widened_to_t_minus_2(conn):
@@ -1044,8 +991,7 @@ def test_av_eps_window_widened_to_t_minus_2(conn):
         {"fiscalDateEnding": "2026-07-31", "reportedDate": "2026-08-22",
          "reportedEPS": "4.95", "estimatedEPS": "4.50",
          "surprisePercentage": "10.0", "reportTime": "pre-market"}]}
-    fetchers = {"finnhub": _fetcher([]), "fmp": _fetcher([]),
-                "alphavantage": _av_eps_fetcher({"CASY": payload}),
+    fetchers = {"finnhub": _fetcher([]), "alphavantage": _av_eps_fetcher({"CASY": payload}),
                 "yfinance": _YF_NONE}
     ev.run_capture("eps", conn, now=_NOW_EPS, fetchers=fetchers,
                    universe=_UNIVERSE, av_priority=["CASY"],
@@ -1064,7 +1010,6 @@ def test_client_version_column_idempotent_and_populated(conn):
     assert _columns(conn, "run_log")[-1] == "client_version"
 
     fetchers = {"finnhub": _fetcher(FINNHUB_CAL_ROWS),
-                "fmp": _fetcher(FMP_CAL_ROWS),
                 "alphavantage": _fetcher(AV_CAL_ROWS),
                 "yfinance": _yf_fetcher(YF_CAL_PAYLOAD)}
     ev.run_capture("cal", conn, now=_NOW, fetchers=fetchers,
@@ -1075,7 +1020,6 @@ def test_client_version_column_idempotent_and_populated(conn):
     # isolated helper's own version.
     expected_http = f"requests {requests.__version__}"
     assert versions["finnhub"] == expected_http
-    assert versions["fmp"] == expected_http
     assert versions["alphavantage"] == expected_http
     assert versions["yfinance"] == "yfinance 0.2.99-test"
 

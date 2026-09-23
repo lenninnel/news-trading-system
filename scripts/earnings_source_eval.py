@@ -2,9 +2,14 @@
 """Q2 earnings source evaluation — capture-only (R-spec 2026-08-24).
 
 Standalone, NON-LIVE evaluation stack that captures earnings-calendar and
-EPS-actuals data from four free providers (Finnhub + FMP + Alpha Vantage
-+ yfinance) into its OWN SQLite database, so the sources can later be
+EPS-actuals data from three free providers (Finnhub + Alpha Vantage +
+yfinance) into its OWN SQLite database, so the sources can later be
 compared for calendar accuracy and actuals latency.
+
+FMP was removed 2026-09-23: 60/60 runs since 2026-08-24 answered HTTP 403
+on the legacy ``/api/v3/earning_calendar`` path and never produced a row
+(docs/Q2_EARNINGS_SOURCE_VERDICT_2026-09-23.md).  Its historical run_log
+rows stay in the DB untouched; only the live capture stops calling it.
 
 Isolation contract (non-negotiable)
 -----------------------------------
@@ -41,10 +46,10 @@ Rows whose symbol is not an exact match against the union are dropped.
 
 Secrets discipline
 ------------------
-API keys are read from env (``FINNHUB_API_KEY`` / ``FMP_API_KEY`` /
+API keys are read from env (``FINNHUB_API_KEY`` /
 ``ALPHA_VANTAGE_API_KEY``).  The Finnhub key travels in the
-``X-Finnhub-Token`` header (never in the URL).  FMP and Alpha Vantage
-require the key as a query param, so NO full URL is ever logged and
+``X-Finnhub-Token`` header (never in the URL).  Alpha Vantage
+requires the key as a query param, so NO full URL is ever logged and
 every error string is passed through ``_sanitize_error`` (strips query
 strings and masks ``apikey=``/``token=`` values) before logging or storage.
 
@@ -65,7 +70,6 @@ Window coverage per provider (R spec 2026-08-26, [T-2, T+30])
   it cannot return past dates; the limitation is recorded as a note in
   run_log.error_text on every cal run (T-2 coverage comes from the
   per-ticker EARNINGS endpoint in eps mode, filtered to [T-2, T]).
-* fmp: 403 on the free tier, unchanged.
 * yfinance: ``Ticker.calendar`` is forward-only (next report only) —
   same run_log note as AV; eps history filtered to [T-2, T].
 days_ahead is stored as computed — negative values (report in the past)
@@ -146,9 +150,8 @@ _BACKOFF_BASE_S = 2.0    # 2s, then 4s
 _HTTP_TIMEOUT_S = 20.0
 
 # Endpoint identifiers stored in run_log — path only, NEVER a full URL
-# with query params (the FMP / Alpha Vantage keys ride in the query string).
+# with query params (the Alpha Vantage key rides in the query string).
 _FINNHUB_ENDPOINT = "finnhub.io/api/v1/calendar/earnings"
-_FMP_ENDPOINT = "financialmodelingprep.com/api/v3/earning_calendar"
 _AV_CAL_ENDPOINT = "alphavantage.co/query#EARNINGS_CALENDAR"
 _AV_EPS_ENDPOINT = "alphavantage.co/query#EARNINGS"
 _AV_NEWS_ENDPOINT = "alphavantage.co/query#NEWS_SENTIMENT"
@@ -156,10 +159,9 @@ _YF_CAL_ENDPOINT = "yfinance#Ticker.calendar"
 _YF_EPS_ENDPOINT = "yfinance#Ticker.get_earnings_dates"
 
 _FINNHUB_URL = "https://finnhub.io/api/v1/calendar/earnings"
-_FMP_URL = "https://financialmodelingprep.com/api/v3/earning_calendar"
 _AV_URL = "https://www.alphavantage.co/query"
 
-_PROVIDERS = ("finnhub", "fmp", "alphavantage", "yfinance")
+_PROVIDERS = ("finnhub", "alphavantage", "yfinance")
 
 # run_log.client_version for the HTTP providers — they all speak
 # through the requests library.  yfinance rows carry the version the
@@ -368,23 +370,6 @@ def fetch_finnhub(api_key: str, frm: str, to: str) -> tuple[list, int, dict]:
     return rows, resp.status_code, dict(resp.headers)
 
 
-def fetch_fmp(api_key: str, frm: str, to: str) -> tuple[list, int, dict]:
-    """One RANGE call to FMP's earning_calendar (v3).
-
-    FMP only accepts the key as a query param — callers must never log
-    the URL (see _sanitize_error).
-    """
-    resp = requests.get(
-        _FMP_URL,
-        params={"from": frm, "to": to, "apikey": api_key},
-        timeout=_HTTP_TIMEOUT_S,
-    )
-    resp.raise_for_status()
-    rows = resp.json()
-    if not isinstance(rows, list):
-        raise ValueError(f"unexpected FMP payload type: {type(rows).__name__}")
-    return rows, resp.status_code, dict(resp.headers)
-
 
 def fetch_alphavantage_calendar(api_key: str) -> tuple[list, int, dict]:
     """One call to AV's EARNINGS_CALENDAR (horizon=3month, ALL tickers).
@@ -482,7 +467,7 @@ def _default_fetchers(mode: str) -> dict:
 
     A missing key raises inside the provider's callable so it lands in
     run_log as that provider's failure without touching the others.
-    Signatures per provider: finnhub/fmp take (frm, to); alphavantage
+    Signatures per provider: finnhub takes (frm, to); alphavantage
     takes (frm, to) in cal mode (AV's horizon is fixed, the range is
     ignored) but (ticker) in eps mode — its actuals endpoint is
     per-ticker.  yfinance takes (tickers) — one subprocess covers the
@@ -495,12 +480,6 @@ def _default_fetchers(mode: str) -> dict:
             raise RuntimeError("FINNHUB_API_KEY missing")
         return fetch_finnhub(key, frm, to)
 
-    def _fmp(frm: str, to: str):
-        key = os.environ.get("FMP_API_KEY", "")
-        if not key:
-            raise RuntimeError("FMP_API_KEY missing")
-        return fetch_fmp(key, frm, to)
-
     if mode == "cal":
         def _av(frm: str, to: str):
             return fetch_alphavantage_calendar(_av_api_key())
@@ -511,8 +490,7 @@ def _default_fetchers(mode: str) -> dict:
     def _yf(tickers: "list[str]"):
         return fetch_yfinance(mode, tickers)
 
-    return {"finnhub": _finnhub, "fmp": _fmp, "alphavantage": _av,
-            "yfinance": _yf}
+    return {"finnhub": _finnhub, "alphavantage": _av, "yfinance": _yf}
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────
@@ -558,9 +536,9 @@ def normalize_cal_row(provider: str, row: dict, today: date) -> "dict | None":
     """Map one raw calendar row to cal_capture fields.
 
     date_status: 'scheduled' when the provider commits to a session
-    (bmo/amc/dmh), 'tentative' otherwise — neither Finnhub's nor FMP's
-    free tier exposes an explicit confirmed/estimated flag, so session
-    presence is the best available proxy.  provider_status_raw preserves
+    (bmo/amc/dmh), 'tentative' otherwise — Finnhub's free tier exposes
+    no explicit confirmed/estimated flag, so session presence is the
+    best available proxy.  provider_status_raw preserves
     the provider's raw timing/status field verbatim for later audit.
 
     Alpha Vantage: no session field at all → time_of_day 'unknown';
@@ -589,12 +567,10 @@ def normalize_cal_row(provider: str, row: dict, today: date) -> "dict | None":
             "raw_payload_hash": _payload_hash(row),
             "provider_status_raw": json.dumps(row, sort_keys=True),
         }
-    if provider == "finnhub":
-        ticker, report_date, status_raw = (
-            row.get("symbol"), row.get("date"), row.get("hour"))
-    else:  # fmp
-        ticker, report_date, status_raw = (
-            row.get("symbol"), row.get("date"), row.get("time"))
+    if provider != "finnhub":
+        raise ValueError(f"normalize_cal_row: unknown provider {provider!r}")
+    ticker, report_date, status_raw = (
+        row.get("symbol"), row.get("date"), row.get("hour"))
     if not ticker or not report_date:
         return None
     time_of_day = _norm_time_of_day(status_raw)
@@ -621,17 +597,14 @@ def normalize_eps_row(provider: str, row: dict, capture_day: date) -> "dict | No
     available_same_day: 1 if the actual was already non-null when captured
     ON the report date itself, 0 if it only showed up on a later capture
     day, NULL while the actual is still missing.
-    time_of_day is always None here — neither Finnhub's nor FMP's eps
-    payload provides a session; only Alpha Vantage does (reportTime).
+    time_of_day is always None here — Finnhub's eps payload provides no
+    session; only Alpha Vantage does (reportTime).
     """
-    if provider == "finnhub":
-        ticker, report_date = row.get("symbol"), row.get("date")
-        estimate, actual = row.get("epsEstimate"), row.get("epsActual")
-        method = "finnhub_calendar:epsActual/epsEstimate"
-    else:  # fmp
-        ticker, report_date = row.get("symbol"), row.get("date")
-        estimate, actual = row.get("epsEstimated"), row.get("eps")
-        method = "fmp_calendar:eps/epsEstimated"
+    if provider != "finnhub":
+        raise ValueError(f"normalize_eps_row: unknown provider {provider!r}")
+    ticker, report_date = row.get("symbol"), row.get("date")
+    estimate, actual = row.get("epsEstimate"), row.get("epsActual")
+    method = "finnhub_calendar:epsActual/epsEstimate"
     if not ticker or not report_date:
         return None
     report_date = report_date[:10]
@@ -1088,7 +1061,6 @@ def run_capture(
     universe = universe if universe is not None else load_universe()
     endpoints = {
         "finnhub": _FINNHUB_ENDPOINT,
-        "fmp": _FMP_ENDPOINT,
         "alphavantage": _AV_CAL_ENDPOINT if mode == "cal" else _AV_EPS_ENDPOINT,
         "yfinance": _YF_CAL_ENDPOINT if mode == "cal" else _YF_EPS_ENDPOINT,
     }
