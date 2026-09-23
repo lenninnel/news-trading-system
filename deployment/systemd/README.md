@@ -64,7 +64,8 @@ ssh trading-vps 'journalctl --user -u nts-ohlc-ingest -n 30 --no-pager'
   (`data/market_calendar.py`); a stale store exits 1 and sends a Telegram alert via the
   app credentials — a silent "ok" on zero new rows is not possible.)
 - nts-watchdog.timer (every 15 min — `scripts/watchdog.py`, stdlib-only, /usr/bin/python3. Checks
-  daemon active + auto-restarts, every scheduled session claimed its `session_runs` slot, `daily_ohlc`
+  daemon active + auto-restarts, every session that exists on today's calendar (`config/sessions.py`:
+  no US sessions on NYSE holidays, no MIDDAY on early-close days) claimed its `session_runs` slot, `daily_ohlc`
   holds the last completed US trading day, ingest/backup timers active, backup < 26 h, IB Gateway port,
   disk, DB readable. One message per run, re-alert every 6 h, recovery message, daily 06:00 UTC status
   block as its own liveness signal. Its failure routes through nts-alert@.)

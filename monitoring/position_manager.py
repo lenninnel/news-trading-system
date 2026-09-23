@@ -36,9 +36,13 @@ log = logging.getLogger(__name__)
 # the NYSE opens at 13:30 UTC, so the monitor was skipping the first
 # hour of every summer trading day.
 _NY_TZ = ZoneInfo("America/New_York")
-from data.market_calendar import is_us_trading_day  # noqa: E402
+from data.market_calendar import is_us_trading_day, us_rth_close  # noqa: E402
 _MARKET_OPEN_LOCAL = (9, 30)    # 9:30 AM ET
-_MARKET_CLOSE_LOCAL = (16, 0)   # 4:00 PM ET
+# Close comes from the calendar per day: 16:00 ET, or 13:00 ET on a NYSE
+# early-close day (data.market_calendar.us_rth_close, 2026-09-23).  Before
+# that the monitor treated the Friday after Thanksgiving / Dec 24 as a
+# full session and would have escalated "stale feed" alerts for three
+# hours on a closed market.
 
 # Trailing-stop parameters
 _TRAILING_ACTIVATION_PCT = 2.0   # position must be up >2% to activate
@@ -247,14 +251,16 @@ class PositionManager:
     def _is_market_hours() -> bool:
         """True during the US regular session: a trading day (weekday that
         is not a full-day NYSE holiday, per data.market_calendar) between
-        9:30 and 16:00 America/New_York."""
+        9:30 and that day's close (16:00, or 13:00 on an early-close day)
+        America/New_York."""
         now = datetime.now(_NY_TZ)
         if now.weekday() >= 5 or not is_us_trading_day(now.date()):
             return False
 
         now_minutes = now.hour * 60 + now.minute
         open_minutes = _MARKET_OPEN_LOCAL[0] * 60 + _MARKET_OPEN_LOCAL[1]
-        close_minutes = _MARKET_CLOSE_LOCAL[0] * 60 + _MARKET_CLOSE_LOCAL[1]
+        close = us_rth_close(now.date())
+        close_minutes = close.hour * 60 + close.minute
         return open_minutes <= now_minutes < close_minutes
 
     # ------------------------------------------------------------------

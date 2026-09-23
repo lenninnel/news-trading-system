@@ -116,6 +116,7 @@ class TestSchedulerHook:
              patch.object(DailyScheduler, "_load_us_tickers", return_value=list(tickers)), \
              patch.object(DailyScheduler, "_load_scanner_candidate_tickers", return_value=set()), \
              patch.object(DailyScheduler, "_claim_session_slot", return_value=True), \
+             patch.object(DailyScheduler, "_session_allowed_today", return_value=(True, None)), \
              patch.object(DailyScheduler, "_annotate_session_slot") as annotate, \
              patch.object(DailyScheduler, "_fetch_macro_context", return_value=""), \
              patch.object(DailyScheduler, "_fetch_session_account_balance", return_value=10_000.0), \

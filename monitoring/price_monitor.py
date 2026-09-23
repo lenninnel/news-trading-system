@@ -62,7 +62,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import DB_PATH                           # noqa: E402
-from data.market_calendar import is_us_trading_day, next_us_rth_open  # noqa: E402
+from data.market_calendar import is_us_trading_day, next_us_rth_open, us_rth_close  # noqa: E402
 from execution.paper_trader import PaperTrader                # noqa: E402
 from storage.database import Database                         # noqa: E402
 
@@ -505,8 +505,9 @@ class PriceMonitor:
         """Return True if US NYSE or EU XETRA is currently open.
 
         US: trading day per data.market_calendar (weekday, not a full-day
-        NYSE holiday) and 09:30–16:00 ET. EU: weekday and 09:00–17:30 CET
-        (no EU holiday calendar available).
+        NYSE holiday) and 09:30 ET to the day's close (16:00, 13:00 on an
+        early-close day). EU: weekday and 09:00–17:30 CET (no EU holiday
+        calendar available).
         """
         now_et  = datetime.now(_TZ_ET)
         now_cet = datetime.now(_TZ_CET)
@@ -515,9 +516,12 @@ class PriceMonitor:
         if weekday >= 5:             # Weekend — both markets closed
             return False
 
-        # US NYSE: 09:30–16:00 ET on a trading day
+        # US NYSE: 09:30 ET to the day's close (16:00, or 13:00 on an
+        # early-close day) on a trading day
+        close = us_rth_close(now_et.date())
         us_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-        us_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+        us_close = now_et.replace(hour=close.hour, minute=close.minute,
+                                  second=0, microsecond=0)
         if is_us_trading_day(now_et.date()) and us_open <= now_et <= us_close:
             return True
 
@@ -538,8 +542,10 @@ class PriceMonitor:
         if weekday >= 5:
             return "weekend"
 
+        close = us_rth_close(now_et.date())
         us_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-        us_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+        us_close = now_et.replace(hour=close.hour, minute=close.minute,
+                                  second=0, microsecond=0)
         eu_open  = now_cet.replace(hour=9,  minute=0,  second=0, microsecond=0)
         eu_close = now_cet.replace(hour=17, minute=30, second=0, microsecond=0)
 

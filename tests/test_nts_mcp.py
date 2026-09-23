@@ -784,3 +784,44 @@ def test_fetch_functions_respect_current_mode(fixture_db, monkeypatch):
     http_out = asyncio.run(nts_mcp.get_portfolio())
     assert "REMOTE" in http_out
     assert "AAPL" not in http_out
+
+
+# ── get_status: next session is calendar-aware (config/sessions.py) ────────
+
+
+def _status_at(fixture_db, when):
+    """Run _sql_status with the module clock frozen at `when` (aware UTC)."""
+    from unittest.mock import patch as _patch
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when.astimezone(tz) if tz else when.replace(tzinfo=None)
+
+    with _patch.object(nts_mcp, "datetime", _Frozen):
+        return nts_mcp._sql_status()
+
+
+def test_get_status_next_session_on_saturday_is_monday(fixture_db):
+    data = _status_at(fixture_db, datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc))
+    assert data["next_session"] == "XETRA_PRE"
+    assert data["next_run_at"].startswith("2026-09-07T06:45")
+
+
+def test_get_status_next_session_on_labor_day_skips_us_sessions(fixture_db):
+    # Labor Day 2026, 12:00 UTC: XETRA sessions are past, no US session
+    # exists today → next is Tuesday's XETRA_PRE (the first session that
+    # fires), not today's 13:00 PREMARKET_SCAN.
+    data = _status_at(fixture_db, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc))
+    assert data["next_session"] == "XETRA_PRE"
+    assert data["next_run_at"].startswith("2026-09-08T06:45")
+    assert data["calendar_note"] == "US market holiday"
+    assert "Next session:  XETRA_PRE (2026-09-08T06:45 UTC)" in nts_mcp._format_status(data)
+    assert "Today:         US market holiday" in nts_mcp._format_status(data)
+
+
+def test_get_status_next_session_uses_real_eod_time(fixture_db):
+    # The old private schedule copy said EOD 22:15; the shared one says 22:45.
+    data = _status_at(fixture_db, datetime(2026, 9, 23, 20, 0, tzinfo=timezone.utc))
+    assert data["next_session"] == "EOD"
+    assert data["next_run_at"].startswith("2026-09-23T22:45")

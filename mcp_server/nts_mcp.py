@@ -78,19 +78,17 @@ DEFAULT_SSE_PORT = 8003
 # all read-only SQLite queries so they return in sub-second under load.
 HTTP_TIMEOUT = 15
 
-# Session schedule mirrored from scheduler/daily_runner.py. Used by
-# get_status in SQLite mode to compute next_run_at. HTTP mode gets this
-# from the API response. Updated 2026-04-11 to include D9 PREMARKET_SCAN.
-_SCHEDULE = [
-    {"name": "XETRA_PRE",      "hour": 6,  "minute": 45},
-    {"name": "XETRA_OPEN",     "hour": 7,  "minute": 0},
-    {"name": "PREMARKET_SCAN", "hour": 13, "minute": 0},
-    {"name": "US_PRE",         "hour": 13, "minute": 15},
-    {"name": "PEAD_OPEN",      "hour": 13, "minute": 45},
-    {"name": "US_OPEN",        "hour": 14, "minute": 30},
-    {"name": "MIDDAY",         "hour": 18, "minute": 0},
-    {"name": "EOD",            "hour": 22, "minute": 15},
-]
+# Session schedule + calendar: the shared config/sessions.py (single
+# source of truth with scheduler/daily_runner.py, api/main.py and
+# scripts/watchdog.py).  Until 2026-09-23 this file carried its own copy,
+# which had drifted (EOD 22:15 vs the real 22:45) and ignored weekends and
+# NYSE holidays.  Used by get_status in SQLite mode; HTTP mode gets the
+# same answer from the API.
+from config.sessions import (  # noqa: E402
+    last_session_run as _last_session_run,
+    next_session_run as _next_session_run,
+    us_calendar_note as _us_calendar_note,
+)
 
 # ── Mode detection ───────────────────────────────────────────────────────
 
@@ -201,18 +199,19 @@ def _load_watchlist() -> list[str]:
 
 
 def _last_and_next_session() -> tuple[dict | None, dict | None]:
-    """Compute last-completed and next-upcoming session from UTC clock."""
-    now = datetime.now(timezone.utc)
-    now_minutes = now.hour * 60 + now.minute
+    """Last fired / next upcoming session, calendar-aware.
 
-    last, nxt = None, None
-    for entry in _SCHEDULE:
-        entry_minutes = entry["hour"] * 60 + entry["minute"]
-        if now_minutes >= entry_minutes:
-            last = entry
-        elif nxt is None:
-            nxt = entry
-    return last, nxt
+    On a weekend or a NYSE holiday "next" is the first session of the
+    next day that actually has one (config.sessions.next_session_run),
+    with its real fire date — not a clock-only guess for today.  Each
+    dict carries ``fire_at`` (aware UTC datetime).
+    """
+    now = datetime.now(timezone.utc)
+    last = _last_session_run(now)
+    nxt = _next_session_run(now)
+    last_d = {**last[0], "fire_at": last[1]} if last else None
+    next_d = {**nxt[0], "fire_at": nxt[1]} if nxt else None
+    return last_d, next_d
 
 
 def _signal_events_has_column(column: str) -> bool:
@@ -421,7 +420,7 @@ def _sql_status() -> dict:
     watchlist = _load_watchlist()
 
     last, nxt = _last_and_next_session()
-    today = date.today()
+    today = datetime.now(timezone.utc).date()   # the schedule is UTC
 
     last_event = _query_one(
         "SELECT session, timestamp FROM signal_events "
@@ -439,11 +438,7 @@ def _sql_status() -> dict:
 
     if nxt:
         next_name = nxt["name"]
-        next_run_at = datetime(
-            today.year, today.month, today.day,
-            nxt["hour"], nxt["minute"],
-            tzinfo=timezone.utc,
-        ).isoformat()
+        next_run_at = nxt["fire_at"].isoformat()
     else:
         next_name = None
         next_run_at = None
@@ -456,6 +451,7 @@ def _sql_status() -> dict:
         "next_session": next_name,
         "next_run_at": next_run_at,
         "watchlist": watchlist,
+        "calendar_note": _us_calendar_note(today),
     }
 
 
@@ -592,6 +588,7 @@ def _format_status(data: dict) -> str:
     next_name = data.get("next_session")
     next_run_at = data.get("next_run_at")
     watchlist = data.get("watchlist") or []
+    calendar_note = data.get("calendar_note")
 
     lines = [
         "NTS System Status",
@@ -601,10 +598,14 @@ def _format_status(data: dict) -> str:
         f"  Last session:  {last_name or 'n/a'}"
         + (f" ({(last_run_at or '')[:16]})" if last_run_at else ""),
         f"  Next session:  {next_name or 'n/a'}"
-        + (f" ({(next_run_at or '')[:16]})" if next_run_at else ""),
-        "  Watchlist:     "
-        + (", ".join(watchlist) if watchlist else "empty"),
+        + (f" ({(next_run_at or '')[:16]} UTC)" if next_run_at else ""),
     ]
+    if calendar_note:
+        lines.append(f"  Today:         {calendar_note}")
+    lines.append(
+        "  Watchlist:     "
+        + (", ".join(watchlist) if watchlist else "empty")
+    )
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines.append(f"\n  Queried at:    {now_utc}")
     return "\n".join(lines)

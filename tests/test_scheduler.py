@@ -392,3 +392,77 @@ class TestSessionSlotClaim:
              patch("scheduler.daily_runner.run_batch") as mock_run_batch:
             sched._execute_run(run)
         mock_run_batch.assert_not_called()
+
+
+# ── NYSE holidays / early closes (config/sessions.py, 2026-09-23) ──────
+
+
+class TestHolidayCalendar:
+    """Labor Day 2026-09-07 fired all eight sessions on a closed market.
+    US sessions now exist only on US trading days and before the NY close;
+    XETRA sessions stay on the weekday rule."""
+
+    def _session_at(self, scheduler, dt):
+        with patch("scheduler.daily_runner.datetime") as mock_dt:
+            mock_dt.now.return_value = dt
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            return scheduler.current_session()
+
+    def test_next_run_over_labor_day_weekend_is_monday_xetra(self, scheduler):
+        friday_late = datetime(2026, 9, 4, 23, 0, 0, tzinfo=timezone.utc)
+        nrt = scheduler.next_run_time(after=friday_late)
+        # Sunday 06:00 weekly job fires first, then Monday's XETRA sessions.
+        assert nrt == datetime(2026, 9, 6, 6, 0, tzinfo=timezone.utc)
+        nrt = scheduler.next_run_time(after=nrt)
+        assert nrt == datetime(2026, 9, 7, 6, 45, tzinfo=timezone.utc)
+        assert scheduler._run_for_time(nrt)["name"] == "XETRA_PRE"
+
+    def test_no_us_session_fires_on_labor_day(self, scheduler):
+        after_xetra = datetime(2026, 9, 7, 7, 0, 0, tzinfo=timezone.utc)
+        nrt = scheduler.next_run_time(after=after_xetra)
+        assert nrt == datetime(2026, 9, 8, 6, 45, tzinfo=timezone.utc)   # Tuesday XETRA_PRE
+        for hour, minute in ((13, 0), (13, 15), (13, 45), (14, 30), (18, 0), (22, 45)):
+            assert scheduler._run_for_time(
+                datetime(2026, 9, 7, hour, minute, tzinfo=timezone.utc)) is None
+
+    def test_early_close_skips_midday_only(self, scheduler):
+        # Friday after Thanksgiving 2026: 18:00 UTC = 13:00 ET = the close.
+        assert scheduler._run_for_time(datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)) is None
+        assert scheduler._run_for_time(datetime(2026, 11, 27, 14, 30, tzinfo=timezone.utc))["name"] == "US_OPEN"
+        assert scheduler._run_for_time(datetime(2026, 11, 27, 22, 45, tzinfo=timezone.utc))["name"] == "EOD"
+        nrt = scheduler.next_run_time(after=datetime(2026, 11, 27, 14, 31, tzinfo=timezone.utc))
+        assert nrt == datetime(2026, 11, 27, 22, 45, tzinfo=timezone.utc)
+
+    def test_startup_session_on_labor_day_is_xetra_not_us(self, scheduler):
+        # 15:00 UTC on Labor Day: the clock says US_OPEN, the calendar says
+        # only XETRA_OPEN existed today → a startup run must not fire US_OPEN.
+        dt = datetime(2026, 9, 7, 15, 0, 0, tzinfo=timezone.utc)
+        assert self._session_at(scheduler, dt) == "XETRA_OPEN"
+        dt = datetime(2026, 9, 8, 15, 0, 0, tzinfo=timezone.utc)
+        assert self._session_at(scheduler, dt) == "US_OPEN"
+
+    def test_execute_run_guard_skips_us_session_on_holiday(self):
+        sched = DailyScheduler(full_watchlist=["NVDA", "META"])
+        run = next(r for r in SCHEDULE if r["name"] == "US_OPEN")
+        labor_day = datetime(2026, 9, 7, 14, 30, tzinfo=timezone.utc)
+        with patch("scheduler.daily_runner.datetime") as mock_dt, \
+             patch.object(DailyScheduler, "_claim_session_slot") as claim, \
+             patch("scheduler.daily_runner.run_batch") as mock_run_batch:
+            mock_dt.now.return_value = labor_day
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            sched._execute_run(run)
+        claim.assert_not_called()          # no session_runs row, no pollution
+        mock_run_batch.assert_not_called()
+
+    def test_execute_run_guard_lets_xetra_through_on_us_holiday(self):
+        sched = DailyScheduler(full_watchlist=["NVDA", "META"])
+        run = next(r for r in SCHEDULE if r["name"] == "XETRA_OPEN")
+        labor_day = datetime(2026, 9, 7, 7, 0, tzinfo=timezone.utc)
+        with patch("scheduler.daily_runner.datetime") as mock_dt, \
+             patch.object(DailyScheduler, "_claim_session_slot", return_value=True) as claim, \
+             patch("scheduler.daily_runner.run_batch") as mock_run_batch:
+            mock_dt.now.return_value = labor_day
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            sched._execute_run(run)
+        claim.assert_called_once()         # claimed, then skipped: no XETRA tickers
+        mock_run_batch.assert_not_called()

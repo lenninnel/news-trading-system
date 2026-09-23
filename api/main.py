@@ -28,6 +28,11 @@ if _PROJECT_ROOT not in sys.path:
 
 from config.settings import DB_PATH  # noqa: E402
 from config.sessions import SCHEDULE as _SCHEDULE  # noqa: E402
+from config.sessions import (  # noqa: E402
+    last_session_run,
+    next_session_run,
+    us_calendar_note,
+)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -113,21 +118,20 @@ def _load_watchlist() -> list[str]:
 
 
 def _last_and_next_session() -> tuple[dict | None, dict | None]:
-    """Determine last completed and next upcoming session based on UTC time."""
+    """Last fired and next upcoming session, calendar-aware.
+
+    Uses config.sessions.{last,next}_session_run, so on a weekend or a NYSE
+    holiday "next" is the first session of the next day that actually has
+    one (XETRA sessions on weekdays, US sessions on US trading days), not a
+    clock-only guess for today.  Each returned dict carries ``fire_at``
+    (aware UTC datetime) in addition to the schedule fields.
+    """
     now = datetime.now(timezone.utc)
-    today_minutes = now.hour * 60 + now.minute
-
-    last_session = None
-    next_session = None
-
-    for entry in _SCHEDULE:
-        entry_minutes = entry["hour"] * 60 + entry["minute"]
-        if today_minutes >= entry_minutes:
-            last_session = entry
-        elif next_session is None:
-            next_session = entry
-
-    return last_session, next_session
+    last = last_session_run(now)
+    nxt = next_session_run(now)
+    last_d = {**last[0], "fire_at": last[1]} if last else None
+    next_d = {**nxt[0], "fire_at": nxt[1]} if nxt else None
+    return last_d, next_d
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +154,7 @@ def status() -> dict:
     watchlist = _load_watchlist()
 
     last, nxt = _last_and_next_session()
-    today = date.today()
+    today = datetime.now(timezone.utc).date()   # the schedule is UTC
 
     # Check signal_events for the actual last run.
     # Filter out PositionManager/etc. rows that have session=NULL —
@@ -172,11 +176,7 @@ def status() -> dict:
     next_run_at = None
     if nxt:
         next_session_name = nxt["name"]
-        next_run_at = datetime(
-            today.year, today.month, today.day,
-            nxt["hour"], nxt["minute"],
-            tzinfo=timezone.utc,
-        ).isoformat()
+        next_run_at = nxt["fire_at"].isoformat()
 
     # Sessions that actually ran today (UTC). Row exists = session
     # started. We don't currently track completion separately; if a
@@ -202,6 +202,9 @@ def status() -> dict:
         "watchlist": watchlist,
         "mode": mode,
         "sessions_today": sessions_today,
+        # None on a normal US trading day; "weekend" / "US market holiday" /
+        # "US early close 13:00 ET" otherwise (config/sessions.py).
+        "calendar_note": us_calendar_note(today),
     }
 
 

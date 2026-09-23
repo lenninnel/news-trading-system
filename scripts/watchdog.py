@@ -12,10 +12,14 @@ failed — standard library only, plain-text Telegram, its own state file.
 Checks (kind → behaviour)
 -------------------------
 state  daemon         nts-trading.service is active
-state  session:D:NAME every scheduled session has claimed its session_runs
-                      slot for today once its time + grace has passed (and,
-                      since 2026-09-23, was not ABORTED by the bar-freshness
-                      gate — session_runs.note)
+state  session:D:NAME every session that exists on today's calendar
+                      (config/sessions.py: US sessions only on US trading
+                      days and before the NY close, XETRA on weekdays) has
+                      claimed its session_runs slot once its time + grace
+                      has passed (and, since 2026-09-23, was not ABORTED by
+                      the bar-freshness gate — session_runs.note).  On a
+                      NYSE holiday no US session is expected; the status
+                      block says so ("US calendar" info line).
 state  ohlc           daily_ohlc holds the last completed US trading day
                       (ingest runs 22:30 UTC, expected from 23:00 UTC on)
 state  timer:*        nts-ohlc-ingest.timer / nts-backup.timer are active
@@ -79,14 +83,14 @@ try:  # pragma: no cover - exercised implicitly
     from config.sessions import SCHEDULE as _SCHEDULE
 except Exception:  # pragma: no cover
     _SCHEDULE = [
-        {"name": "XETRA_PRE", "hour": 6, "minute": 45},
-        {"name": "XETRA_OPEN", "hour": 7, "minute": 0},
-        {"name": "PREMARKET_SCAN", "hour": 13, "minute": 0},
-        {"name": "US_PRE", "hour": 13, "minute": 15},
-        {"name": "PEAD_OPEN", "hour": 13, "minute": 45},
-        {"name": "US_OPEN", "hour": 14, "minute": 30},
-        {"name": "MIDDAY", "hour": 18, "minute": 0},
-        {"name": "EOD", "hour": 22, "minute": 45},
+        {"name": "XETRA_PRE", "hour": 6, "minute": 45, "market": "XETRA"},
+        {"name": "XETRA_OPEN", "hour": 7, "minute": 0, "market": "XETRA"},
+        {"name": "PREMARKET_SCAN", "hour": 13, "minute": 0, "market": "US"},
+        {"name": "US_PRE", "hour": 13, "minute": 15, "market": "US"},
+        {"name": "PEAD_OPEN", "hour": 13, "minute": 45, "market": "US"},
+        {"name": "US_OPEN", "hour": 14, "minute": 30, "market": "US"},
+        {"name": "MIDDAY", "hour": 18, "minute": 0, "market": "US"},
+        {"name": "EOD", "hour": 22, "minute": 45, "market": "US", "after_close": True},
     ]
 
 try:  # pragma: no cover
@@ -96,6 +100,21 @@ except Exception:  # pragma: no cover
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d
+
+# Which sessions exist on a given day — the SAME rule the daemon uses to
+# decide what to fire (config/sessions.py, 2026-09-23): US sessions only on
+# US trading days and before that day's NY close, XETRA sessions on
+# weekdays.  So on Labor Day the watchdog expects the two XETRA rows and
+# nothing else, and on the Friday after Thanksgiving it does not expect
+# MIDDAY.  Fallback (repo module missing): weekdays only, as before.
+try:  # pragma: no cover
+    from config.sessions import session_runs_on, us_calendar_note
+except Exception:  # pragma: no cover
+    def session_runs_on(entry: dict, day: date) -> tuple[bool, "str | None"]:
+        return (day.weekday() < 5), ("weekend" if day.weekday() >= 5 else None)
+
+    def us_calendar_note(day: date) -> "str | None":
+        return "weekend" if day.weekday() >= 5 else None
 
 # Sessions the daemon skips when ENABLE_PRE_SESSIONS=false (daily_runner
 # session_type == "pre_signal").
@@ -370,13 +389,17 @@ def check_timer(unit: str, probes: Probes) -> Check:
 
 
 def _due_sessions(cfg: Config, now: datetime) -> list[tuple[str, datetime]]:
-    """Sessions whose time + grace has passed today (weekdays only)."""
+    """Sessions whose time + grace has passed today and that exist on
+    today's calendar (weekday; for US sessions also a US trading day and
+    before the NY close — ``config.sessions.session_runs_on``)."""
     if now.weekday() >= 5:
         return []
     due: list[tuple[str, datetime]] = []
     for entry in cfg.schedule:
         name = entry["name"]
         if name in _PRE_SESSIONS and not cfg.pre_sessions_enabled:
+            continue
+        if not session_runs_on(entry, now.date())[0]:
             continue
         at = now.replace(hour=int(entry["hour"]), minute=int(entry["minute"]),
                          second=0, microsecond=0)
@@ -552,8 +575,20 @@ def check_disk(cfg: Config, probes: Probes) -> Check:
                  f"{free:.1f} GB free on DB volume" + ("" if ok else f" (min {cfg.disk_min_gb} GB)"))
 
 
-def info_checks(cfg: Config, conn: sqlite3.Connection | None) -> list[Check]:
+def info_checks(cfg: Config, conn: sqlite3.Connection | None,
+                now: "datetime | None" = None) -> list[Check]:
     out: list[Check] = []
+    # Calendar context so a quiet holiday reads as "expected", not "odd".
+    if now is not None:
+        note = us_calendar_note(now.date())
+        if note and note != "weekend":
+            skipped = [
+                e["name"] for e in cfg.schedule
+                if (e.get("market") or "US").upper() == "US"
+                and not session_runs_on(e, now.date())[0]
+            ]
+            detail = note + (f" — not expected today: {', '.join(skipped)}" if skipped else "")
+            out.append(Check("calendar", "US calendar", "info", None, detail))
     flag = cfg.repo_dir / "emergency_stop.flag"
     if flag.exists():
         try:
@@ -613,7 +648,7 @@ def run_checks(cfg: Config, probes: Probes, state: dict) -> list[Check]:
     checks.append(check_backup(cfg, probes))
     checks.append(check_timer(cfg.backup_timer, probes))
     checks.append(check_disk(cfg, probes))
-    checks.extend(info_checks(cfg, conn))
+    checks.extend(info_checks(cfg, conn, probes.now()))
     if conn is not None:
         conn.close()
     return checks

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### 2026-09-23 — No US sessions on NYSE holidays / early closes (dev)
+
+- **Calendar-bound schedule (`config/sessions.py`)**: every entry carries `market` (`US` / `XETRA`); `session_runs_on(entry, day)` says whether a session exists on a day — US sessions only on US trading days (`data/market_calendar.py`) and before that day's New York close (EOD is `after_close`), XETRA sessions on weekdays, deliberately not coupled to the US calendar. `next_session_run` / `last_session_run` / `us_calendar_note` built on it. Labor Day 2026-09-07 had fired all eight sessions (120 `signal_events` rows on a closed market).
+- **Scheduler (`scheduler/daily_runner.py`)**: `next_run_time`, `_run_for_time`, `current_session` and a guard at the top of `_execute_run` use that rule. A skipped session claims no `session_runs` slot and writes nothing. Lookahead 8 → 14 days.
+- **Early closes (`data/market_calendar.py`)**: `us_early_closes(year)` (Fri after Thanksgiving; Jul 3 / Dec 24 when Mon–Thu), `is_us_early_close`, `us_rth_close`, `us_rth_close_at`; `is_us_rth` ends at 13:00 on those days. Cross-checked against the published NYSE calendars 2020–2027. Only MIDDAY (18:00 UTC) falls behind an early close and is skipped; `PositionManager` / `PriceMonitor` market-hours checks end at the real close.
+- **Watchdog (`scripts/watchdog.py`)**: expects only sessions that exist today (no "session missing" on a holiday); status block gains a `US calendar:` info line. Fallback schedule carries the market keys.
+- **`/api/status` + MCP `get_status`**: `next_session` / `next_run_at` name the real next firing (date included) over weekends and holidays; `calendar_note` added. The MCP server's private schedule copy (EOD still 22:15) is removed in favour of `config.sessions`.
+- Doc: `docs/HOLIDAY_SESSIONS_2026-09-23.md`. Deploy: restart `nts-trading`, `nts-api`, `nts-mcp` after pull; no schema change.
+
 ### 2026-09-23 — Data paths + honest logging (dev)
 
 - **EOD after the ingest (`config/sessions.py`)**: EOD moves 22:15 → 22:45 UTC so it evaluates today's completed `daily_ohlc` bar (ingest timer 22:30, ~15 s) instead of yesterday's; the forward signals it hands to the next US_OPEN now rest on bar T. `_WINDOW_END` 23:00; watchdog fallback schedule updated. No unit-file change; DST-safe (close 20:00/21:00 UTC, same-day cutoff 22:00).

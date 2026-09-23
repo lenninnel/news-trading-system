@@ -271,6 +271,7 @@ _XETRA_TICKERS: list[str] = []
 # Times come from config/sessions.py (single source of truth shared
 # with api/main.py); per-session metadata stays here.
 from config.sessions import SCHEDULE as _BASE_SCHEDULE
+from config.sessions import session_runs_on as _session_runs_on
 
 _SESSION_METADATA = {
     "XETRA_PRE":      {"tickers": _XETRA_TICKERS, "workers": 2, "eod": False, "session_type": "pre_signal"},
@@ -350,11 +351,17 @@ def _is_execution_allowed() -> tuple[bool, str]:
 
 class DailyScheduler:
     """
-    Daemon that sleeps between 7 daily trading runs (weekdays, UTC).
+    Daemon that sleeps between the daily trading runs (weekdays, UTC).
 
-    Runs: XETRA_PRE (06:45), XETRA_OPEN (07:00), US_PRE (13:15),
-          PEAD_OPEN (13:45), US_OPEN (14:30), MIDDAY (18:00), EOD (22:45,
-          after the 22:30 daily_ohlc ingest).
+    Runs: XETRA_PRE (06:45), XETRA_OPEN (07:00), PREMARKET_SCAN (13:00),
+          US_PRE (13:15), PEAD_OPEN (13:45), US_OPEN (14:30), MIDDAY (18:00),
+          EOD (22:45, after the 22:30 daily_ohlc ingest).
+
+    Calendar (config/sessions.py, since 2026-09-23): US sessions exist only
+    on US trading days (data/market_calendar.py) and, except EOD, only
+    before that day's New York close — so on a NYSE holiday only the (empty)
+    XETRA sessions fire, and on an early-close day (13:00 ET) MIDDAY is
+    skipped.  The watchdog, the API and the MCP server use the same rule.
     """
 
     def __init__(self, full_watchlist: list[str] | None = None) -> None:
@@ -801,17 +808,23 @@ class DailyScheduler:
         now = after or datetime.now(timezone.utc)
         candidates: list[datetime] = []
 
-        # Look at the next 8 days — enough to cover any weekend skip + first
-        # Sunday weekly job after a Friday EOD.
-        for offset in range(8):
+        # Look at the next 14 days — enough to cover any weekend skip, the
+        # first Sunday weekly job after a Friday EOD, and the longest US
+        # holiday cluster (Christmas + weekend + New Year).
+        for offset in range(14):
             day = (now + timedelta(days=offset)).replace(
                 hour=0, minute=0, second=0, microsecond=0,
             )
-            if day.weekday() < 5:
-                for run in SCHEDULE:
-                    t = day.replace(hour=run["hour"], minute=run["minute"])
-                    if t > now:
-                        candidates.append(t)
+            # Calendar binding (config/sessions.py): US sessions exist only
+            # on US trading days and before that day's NY close (13:00 on
+            # early-close days), XETRA sessions on weekdays.  Labor Day
+            # 2026-09-07 fired all eight sessions on a closed market.
+            for run in SCHEDULE:
+                if not _session_runs_on(run, day.date())[0]:
+                    continue
+                t = day.replace(hour=run["hour"], minute=run["minute"])
+                if t > now:
+                    candidates.append(t)
             for job in WEEKLY_JOBS:
                 if day.weekday() == job["weekday"]:
                     t = day.replace(hour=job["hour"], minute=job["minute"])
@@ -840,6 +853,8 @@ class DailyScheduler:
 
         session = "CLOSED"
         for run in SCHEDULE:
+            if not _session_runs_on(run, now.date())[0]:
+                continue   # US holiday / early-close casualty (config/sessions.py)
             if now_min >= run["hour"] * 60 + run["minute"]:
                 session = run["name"]
         return session
@@ -1040,10 +1055,11 @@ class DailyScheduler:
     # ── Execution ─────────────────────────────────────────────────────
 
     def _run_for_time(self, dt: datetime) -> dict | None:
-        # Daily runs only fire on weekdays
-        if dt.weekday() < 5:
-            for run in SCHEDULE:
-                if dt.hour == run["hour"] and dt.minute == run["minute"]:
+        # Daily runs only fire on days the session exists on (weekday,
+        # and for US sessions a US trading day before the NY close).
+        for run in SCHEDULE:
+            if dt.hour == run["hour"] and dt.minute == run["minute"]:
+                if _session_runs_on(run, dt.date())[0]:
                     return run
         # Weekly jobs are weekday-specific
         for job in WEEKLY_JOBS:
@@ -1062,9 +1078,30 @@ class DailyScheduler:
                 return run
         return None
 
+    @staticmethod
+    def _session_allowed_today(run: dict) -> tuple[bool, str | None]:
+        """Calendar guard shared with next_run_time / current_session.
+
+        Belt-and-braces for callers that reach _execute_run without going
+        through the scheduling path (a future manual trigger, a startup
+        run on a day the clock-only check would accept).  Returns the
+        ``config.sessions.session_runs_on`` verdict for today (UTC).
+        """
+        return _session_runs_on(run, datetime.now(timezone.utc).date())
+
     def _execute_run(self, run: dict) -> None:
         run_name = run["name"]
         session_type = run.get("session_type", "signal")
+
+        # No US session on a NYSE holiday / behind an early close, no
+        # session at all on a weekend.  Nothing is claimed or written: an
+        # empty session_runs day is what the watchdog expects on such a
+        # day (it uses the same calendar), and signal_events stays clean.
+        allowed, why = self._session_allowed_today(run)
+        if not allowed:
+            log.info("Skipping %s — %s (no session on this day)", run_name, why)
+            print(f"[scheduler] Skipping {run_name} — {why}", flush=True)
+            return
 
         # Skip PRE sessions when disabled
         if session_type == "pre_signal":

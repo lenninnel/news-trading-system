@@ -746,3 +746,23 @@ class TestStalePriceGuard:
         assert results == []
         trader.track_trade.assert_not_called()
         assert "No price for AAPL" in caplog.text
+
+
+class TestEarlyCloseMarketHours:
+    """NYSE early-close days (13:00 ET) end the monitor's RTH window early
+    (data.market_calendar.us_rth_close, 2026-09-23)."""
+
+    @pytest.mark.parametrize("iso, expected", [
+        ("2026-11-27T12:30:00", True),    # Friday after Thanksgiving, before the 13:00 close
+        ("2026-11-27T13:00:00", False),   # at the early close
+        ("2026-11-27T14:30:00", False),   # would be RTH on a normal day
+        ("2026-12-24T15:00:00", False),   # Christmas Eve (Thu), early close
+        ("2026-11-25T15:00:00", True),    # ordinary Wednesday, full session
+    ])
+    def test_early_close_window(self, iso, expected):
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        now = _dt.fromisoformat(iso).replace(tzinfo=ZoneInfo("America/New_York"))
+        with patch("monitoring.position_manager.datetime") as mock_dt_cls:
+            mock_dt_cls.now.return_value = now
+            assert PositionManager._is_market_hours() is expected

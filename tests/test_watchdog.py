@@ -613,3 +613,60 @@ class TestConfigFromEnv:
         assert ts == datetime(2026, 8, 31, 14, 2, 11, tzinfo=timezone.utc)
         assert wd._parse_systemd_ts("") is None
         assert wd._parse_systemd_ts("n/a") is None
+
+
+# ── NYSE holidays / early closes (config/sessions.py, 2026-09-23) ──────────
+
+class TestHolidayCalendar:
+    def test_labor_day_expects_only_xetra_sessions(self, tmp_path):
+        # 15:00 UTC on Labor Day 2026: every US session time + grace has
+        # passed, none of them exist today → no "missing session" alert.
+        h = Harness(tmp_path, now=datetime(2026, 9, 7, 15, 0, tzinfo=timezone.utc),
+                    sessions=[("XETRA_PRE", "2026-09-07"), ("XETRA_OPEN", "2026-09-07")],
+                    max_ohlc="2026-09-04")   # last trading day before the holiday
+        h.run()
+        assert not any(k.startswith("session:") for k in h.state()["failing"])
+        # First run of the day → the status block; it must be all green and
+        # carry no session line at all (nothing was due, nothing ran late).
+        assert len(h.sent) == 1 and "All checks passing." in h.sent[0]
+        for name in ("PREMARKET_SCAN", "US_PRE", "PEAD_OPEN", "US_OPEN", "MIDDAY", "EOD"):
+            assert f"session {name}" not in h.sent[0]
+        assert "✓ session XETRA_OPEN: ran" in h.sent[0]
+
+    def test_labor_day_missing_xetra_session_still_alerts(self, tmp_path):
+        h = Harness(tmp_path, now=datetime(2026, 9, 7, 7, 25, tzinfo=timezone.utc),
+                    sessions=[("XETRA_PRE", "2026-09-07")], max_ohlc="2026-09-04")
+        h.run()
+        assert "NEW  session XETRA_OPEN: no session_runs row" in h.sent[0]
+        assert "session US_OPEN" not in h.sent[0]
+        assert [k for k in h.state()["failing"] if k.startswith("session:")] == \
+            ["session:2026-09-07:XETRA_OPEN"]
+
+    def test_holiday_heartbeat_names_the_calendar(self, tmp_path):
+        h = Harness(tmp_path, now=datetime(2026, 9, 7, 8, 0, tzinfo=timezone.utc),
+                    sessions=[("XETRA_PRE", "2026-09-07"), ("XETRA_OPEN", "2026-09-07")])
+        h.run("--heartbeat")
+        text = h.sent[0]
+        assert "US calendar: US market holiday" in text
+        assert "not expected today: PREMARKET_SCAN, US_PRE, PEAD_OPEN, US_OPEN, MIDDAY, EOD" in text
+
+    def test_early_close_does_not_expect_midday(self, tmp_path):
+        # Friday after Thanksgiving 2026, 18:25 UTC: MIDDAY (18:00) + grace
+        # has passed but MIDDAY does not exist behind the 13:00 ET close.
+        ran = [(n, "2026-11-27") for n in
+               ("XETRA_PRE", "XETRA_OPEN", "PREMARKET_SCAN", "US_PRE", "PEAD_OPEN", "US_OPEN")]
+        h = Harness(tmp_path, now=datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc),
+                    sessions=ran)
+        h.run("--heartbeat")
+        text = h.sent[0]
+        assert "session MIDDAY" not in text
+        assert "US calendar: US early close 13:00 ET — not expected today: MIDDAY" in text
+        # ...but EOD is still expected after its time + grace.
+        h.now = datetime(2026, 11, 27, 23, 10, tzinfo=timezone.utc)
+        h.run()
+        assert "NEW  session EOD: no session_runs row" in h.sent[-1]
+
+    def test_ordinary_day_has_no_calendar_line(self, tmp_path):
+        h = Harness(tmp_path, sessions=[("XETRA_PRE", "2026-09-01"), ("XETRA_OPEN", "2026-09-01")])
+        h.run("--heartbeat")
+        assert "US calendar" not in h.sent[0]

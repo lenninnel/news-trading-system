@@ -55,3 +55,13 @@ def test_seconds_until_open_skips_holiday_weekend():
         secs = _monitor()._seconds_until_open()
     expected = (datetime(2026, 9, 8, 9, 30, tzinfo=_ET) - fri_close).total_seconds()
     assert secs == expected
+
+
+def test_early_close_friday_after_thanksgiving():
+    # 14:30 ET = 20:30 Berlin → XETRA closed; the US leg alone decides.
+    with _frozen(datetime(2026, 11, 27, 14, 30, tzinfo=_ET)):
+        assert _monitor()._is_market_hours() is False
+        assert _monitor()._market_status() == "US closed, EU closed"
+    with _frozen(datetime(2026, 11, 27, 12, 30, tzinfo=_ET)):
+        assert _monitor()._is_market_hours() is True
+        assert _monitor()._market_status() == "US open, EU closed"

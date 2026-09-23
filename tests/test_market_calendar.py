@@ -8,6 +8,7 @@ Run:
 from __future__ import annotations
 
 import os
+import pytest
 import sys
 from datetime import date
 
@@ -123,3 +124,56 @@ def test_next_us_rth_open():
     assert next_us_rth_open(at_open) == datetime(2026, 9, 9, 9, 30, tzinfo=NY_TZ)
     labor_day = datetime(2026, 9, 7, 8, 0, tzinfo=NY_TZ)
     assert next_us_rth_open(labor_day) == datetime(2026, 9, 8, 9, 30, tzinfo=NY_TZ)
+
+
+# ── Early closes (13:00 New York) — cross-checked against the published
+# NYSE calendars 2020–2027 ─────────────────────────────────────────────
+
+from data.market_calendar import (  # noqa: E402
+    US_EARLY_CLOSE,
+    US_RTH_CLOSE,
+    is_us_early_close,
+    us_early_closes,
+    us_rth_close,
+    us_rth_close_at,
+)
+
+
+@pytest.mark.parametrize("year, expected", [
+    # Published NYSE early closings (1:00 p.m. ET).
+    (2020, {date(2020, 11, 27), date(2020, 12, 24)}),                     # Jul 3 = observed holiday
+    (2021, {date(2021, 11, 26)}),                                         # Jul 5 holiday, Dec 24 observed holiday
+    (2022, {date(2022, 11, 25)}),                                         # Jul 4 Mon, Dec 26 observed
+    (2023, {date(2023, 7, 3), date(2023, 11, 24)}),                       # Dec 24 = Sunday
+    (2024, {date(2024, 7, 3), date(2024, 11, 29), date(2024, 12, 24)}),
+    (2025, {date(2025, 7, 3), date(2025, 11, 28), date(2025, 12, 24)}),
+    (2026, {date(2026, 11, 27), date(2026, 12, 24)}),                     # Jul 3 = observed holiday
+    (2027, {date(2027, 11, 26)}),                                         # Jul 5 holiday, Dec 24 observed holiday
+])
+def test_early_closes_match_published_nyse_calendar(year, expected):
+    assert set(us_early_closes(year)) == expected
+
+
+def test_early_close_days_are_trading_days_never_holidays():
+    for year in range(2020, 2028):
+        for d in us_early_closes(year):
+            assert is_us_trading_day(d)
+            assert d not in us_market_holidays(year)
+
+
+def test_us_rth_close_per_day():
+    assert us_rth_close(date(2026, 11, 27)) == US_EARLY_CLOSE   # Fri after Thanksgiving
+    assert us_rth_close(date(2026, 12, 24)) == US_EARLY_CLOSE   # Christmas Eve (Thu)
+    assert us_rth_close(date(2026, 9, 23)) == US_RTH_CLOSE      # ordinary Wednesday
+    assert is_us_early_close(date(2026, 11, 27)) and not is_us_early_close(date(2026, 11, 25))
+    at = us_rth_close_at(date(2026, 11, 27))
+    assert at.tzinfo is not None and at.hour == 13 and at.minute == 0
+
+
+def test_is_us_rth_respects_early_close():
+    early = date(2026, 11, 27)
+    assert is_us_rth(datetime(early.year, early.month, early.day, 12, 59, tzinfo=NY_TZ))
+    assert not is_us_rth(datetime(early.year, early.month, early.day, 13, 0, tzinfo=NY_TZ))
+    assert not is_us_rth(datetime(early.year, early.month, early.day, 15, 0, tzinfo=NY_TZ))
+    # The Wednesday before is a full session.
+    assert is_us_rth(datetime(2026, 11, 25, 15, 0, tzinfo=NY_TZ))
