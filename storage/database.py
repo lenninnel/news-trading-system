@@ -93,7 +93,10 @@ portfolio_positions
     ticker          TEXT     Stock ticker symbol (UNIQUE)
     shares          INTEGER  Number of shares held
     avg_price       REAL     Weighted-average cost basis per share
-    current_value   REAL     shares × latest price
+    current_value   REAL     shares × mark_price (or × avg_price before the first mark)
+    mark_price      REAL     last mark (fill / PositionManager feed) — 2026-09-23
+    mark_source     TEXT     'fill' | 'yfinance_1m' | 'alpaca' | …
+    marked_at       TEXT     ISO-8601 UTC of the mark
     updated_at      TEXT     ISO-8601 UTC timestamp
 
 trade_history
@@ -491,6 +494,28 @@ class Database:
                     PRIMARY KEY (ticker, date)
                 );
 
+                -- Broker account snapshots (2026-09-23): what IBKR said the
+                -- account was worth, when.  Written by the daemon (every
+                -- session start, kind='session'; EOD, kind='eod') and by
+                -- the PositionManager during RTH (kind='pm', every few
+                -- minutes).  The read-only portfolio view (analytics/
+                -- portfolio_view.py) takes cash and the previous-close
+                -- equity from the newest row — API/MCP processes have no
+                -- broker connection of their own.
+                CREATE TABLE IF NOT EXISTS account_snapshots (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts                   TEXT    NOT NULL,
+                    net_liquidation      REAL    NOT NULL,
+                    total_cash           REAL,
+                    gross_position_value REAL,
+                    prev_day_equity      REAL,
+                    buying_power         REAL,
+                    source               TEXT    NOT NULL,
+                    kind                 TEXT    NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts
+                    ON account_snapshots(ts);
+
                 -- One-row-per-migration bookkeeping table.  Intentionally
                 -- lightweight (no framework) — only the PEAD signal log
                 -- registers itself here so we can answer "was this DB
@@ -679,6 +704,24 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+            # 2026-09-23: mark provenance.  current_value used to be
+            # overwritten with shares × avg_price by every broker sync
+            # (IBKRTrader.get_portfolio at each session start), wiping the
+            # PositionManager's live mark — the MCP/API view then showed
+            # now == entry for days.  The mark now lives in its own columns
+            # (price, source, time); a sync keeps it, a fill/mark sets it.
+            for col, typedef in [
+                ("mark_price",  "REAL"),
+                ("mark_source", "TEXT"),
+                ("marked_at",   "TEXT"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE portfolio_positions ADD COLUMN {col} {typedef}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
             # Migrate existing DBs: strategy attribution + execution-quality
             # split on trade_history.  Existing rows keep NULL; populated at
             # execution for new trades.  `price` is preserved as-is for
@@ -753,6 +796,16 @@ class Database:
                 VALUES (?, ?)
                 """,
                 ("20260529_pead_signal_log_benzinga_columns",
+                 datetime.now(timezone.utc).isoformat()),
+            )
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations
+                    (migration_name, applied_at)
+                VALUES (?, ?)
+                """,
+                ("20260923_portfolio_marks_account_snapshots",
                  datetime.now(timezone.utc).isoformat()),
             )
 
@@ -1118,6 +1171,9 @@ class Database:
         shares: int,
         avg_price: float,
         current_value: float,
+        *,
+        mark_price: "float | None" = None,
+        mark_source: "str | None" = None,
     ) -> None:
         """
         Insert or update a portfolio position (upsert).
@@ -1127,9 +1183,77 @@ class Database:
             shares:        Total shares held after the trade.
             avg_price:     Weighted-average cost basis per share.
             current_value: shares x latest price.
+            mark_price:    The price behind current_value, when it is a
+                           real mark (a fill, a broker/feed quote).  Left
+                           untouched when None — see sync_portfolio_position
+                           for the "shares changed, keep the mark" case.
+            mark_source:   Where the mark came from ("fill", "yfinance_1m",
+                           "alpaca", …).
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._file_lock, self._write_lock, self._connect() as conn:
+            if mark_price is not None and mark_price > 0:
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_positions
+                        (ticker, shares, avg_price, current_value, updated_at,
+                         mark_price, mark_source, marked_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        shares        = excluded.shares,
+                        avg_price     = excluded.avg_price,
+                        current_value = excluded.current_value,
+                        updated_at    = excluded.updated_at,
+                        mark_price    = excluded.mark_price,
+                        mark_source   = excluded.mark_source,
+                        marked_at     = excluded.marked_at
+                    """,
+                    (ticker, shares, avg_price, current_value, now,
+                     float(mark_price), mark_source, now),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_positions
+                        (ticker, shares, avg_price, current_value, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        shares        = excluded.shares,
+                        avg_price     = excluded.avg_price,
+                        current_value = excluded.current_value,
+                        updated_at    = excluded.updated_at
+                    """,
+                    (ticker, shares, avg_price, current_value, now),
+                )
+
+    @_retry_on_locked
+    def sync_portfolio_position(
+        self,
+        ticker: str,
+        shares: int,
+        avg_price: float,
+    ) -> dict:
+        """Broker-sync upsert that keeps the existing mark.
+
+        Used by IBKRTrader.get_portfolio (every session start, every
+        PositionManager cycle).  IBKR's position list carries no market
+        price, so the sync must not pretend it does: shares / avg_price are
+        taken from the broker, ``current_value`` is recomputed as
+        shares × mark_price when a mark exists (a fill or a PositionManager
+        mark), and shares × avg_price only for a row that has never been
+        marked.  The mark columns are never touched here.
+
+        Returns the row as written (dict).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT mark_price FROM portfolio_positions WHERE ticker = ?",
+                (ticker,),
+            ).fetchone()
+            mark = float(row["mark_price"]) if row and row["mark_price"] else None
+            price = mark if (mark and mark > 0) else float(avg_price)
+            current_value = round(shares * price, 2)
             conn.execute(
                 """
                 INSERT INTO portfolio_positions
@@ -1143,6 +1267,79 @@ class Database:
                 """,
                 (ticker, shares, avg_price, current_value, now),
             )
+        return {
+            "ticker": ticker, "shares": shares, "avg_price": avg_price,
+            "current_value": current_value, "mark_price": mark,
+            "updated_at": now,
+        }
+
+    @_retry_on_locked
+    def mark_portfolio_position(
+        self,
+        ticker: str,
+        shares: int,
+        avg_price: float,
+        price: float,
+        source: str,
+    ) -> None:
+        """Mark a position to market: current_value = shares × price, and
+        record the price, its source and the time (PositionManager, every
+        RTH cycle).  Upserts so a position the broker reports but the local
+        table does not yet hold gets a row too."""
+        if price is None or price <= 0 or shares <= 0:
+            return
+        self.set_portfolio_position(
+            ticker=ticker, shares=shares, avg_price=avg_price,
+            current_value=round(shares * float(price), 2),
+            mark_price=float(price), mark_source=source,
+        )
+
+    # ------------------------------------------------------------------
+    # Broker account snapshots (2026-09-23)
+    # ------------------------------------------------------------------
+
+    @_retry_on_locked
+    def record_account_snapshot(
+        self,
+        *,
+        net_liquidation: float,
+        total_cash: "float | None" = None,
+        gross_position_value: "float | None" = None,
+        prev_day_equity: "float | None" = None,
+        buying_power: "float | None" = None,
+        source: str = "ibkr",
+        kind: str = "session",
+        ts: "str | None" = None,
+    ) -> "int | None":
+        """Persist what the broker says the account is worth right now.
+
+        ``kind``: 'session' (daemon, every session start), 'eod' (the EOD
+        session — the previous-close reference), 'pm' (PositionManager
+        during RTH).  Zero / missing NetLiquidation is not recorded — a
+        broker hiccup must not become a $0 account in the view.
+        """
+        if net_liquidation is None or net_liquidation <= 0:
+            return None
+        ts = ts or datetime.now(timezone.utc).isoformat()
+        with self._file_lock, self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO account_snapshots
+                    (ts, net_liquidation, total_cash, gross_position_value,
+                     prev_day_equity, buying_power, source, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ts, float(net_liquidation), total_cash, gross_position_value,
+                 prev_day_equity, buying_power, source, kind),
+            )
+            return cur.lastrowid
+
+    def get_latest_account_snapshot(self) -> "dict | None":
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_snapshots ORDER BY ts DESC, id DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
 
     @_retry_on_locked
     def set_trailing_stop(self, ticker: str, trailing_stop: "float | None") -> None:

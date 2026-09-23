@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### 2026-09-23 — Portfolio view shows the truth (dev)
+
+- **Root cause of the stale `get_portfolio` / `/api/portfolio`** (identical on 09-19 and 09-23): `IBKRTrader.get_portfolio()` overwrote `portfolio_positions.current_value` with shares × avg_price at every session start and PositionManager cycle (IBKR's position list has no price), wiping the PositionManager's live mark; outside RTH nothing re-marked. "Total value" was positions only, "cash" was NetLiq − cost basis, "Daily P&L" was today's realised SELL P&L.
+- **Marks with provenance (`storage/database.py`)**: `portfolio_positions.mark_price / mark_source / marked_at` (additive). `sync_portfolio_position` (broker sync) keeps the mark and recomputes `current_value` from it; `mark_portfolio_position` (PositionManager, `yfinance_1m`), fills (`fill`) and the Alpaca sync (`alpaca`) set it.
+- **Broker account snapshots**: new table `account_snapshots`; written at every session start (`kind` session/eod, `DailyScheduler._fetch_session_account_balance`) and by the PositionManager every ≤ 5 min in RTH (`pm`). `IBKRTrader.get_account` adds `prev_day_equity` (PreviousDayEquityWithLoanValue) and `gross_position_value`.
+- **One view (`analytics/portfolio_view.py`)**: NAV = cash (broker TotalCashValue) + Σ shares × mark; daily P&L = NAV − previous close (broker previous-day equity, else last `eod` snapshot), `null` with a stated reason instead of an invented 0; realised-today kept separately; `broker_nav` / `nav_minus_broker` for reconciliation; `cash_as_of`, `marks_as_of`, per-position source/time. `/api/portfolio` and MCP `get_portfolio` (SQLite mode) both use it; legacy keys kept for the dashboard, `value` is now NAV. Tolerates pre-migration DBs.
+- Doc: `docs/PORTFOLIO_VIEW_2026-09-23.md` (before/after against IBKR NetLiq). Deploy: restart `nts-trading`, `nts-api`, `nts-mcp`; migration is additive and automatic.
+
 ### 2026-09-23 — No US sessions on NYSE holidays / early closes (dev)
 
 - **Calendar-bound schedule (`config/sessions.py`)**: every entry carries `market` (`US` / `XETRA`); `session_runs_on(entry, day)` says whether a session exists on a day — US sessions only on US trading days (`data/market_calendar.py`) and before that day's New York close (EOD is `after_close`), XETRA sessions on weekdays, deliberately not coupled to the US calendar. `next_session_run` / `last_session_run` / `us_calendar_note` built on it. Labor Day 2026-09-07 had fired all eight sessions (120 `signal_events` rows on a closed market).

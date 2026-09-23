@@ -1310,7 +1310,7 @@ class DailyScheduler:
         # which we just confirmed is connected. Fall back to the configured
         # balance if the broker query fails so a transient IBKR hiccup never
         # blocks a session.
-        account_balance = self._fetch_session_account_balance()
+        account_balance = self._fetch_session_account_balance(run_name)
 
         try:
             batch = asyncio.run(
@@ -1421,8 +1421,13 @@ class DailyScheduler:
         # (clientId=1) is separate and still disconnected inside
         # run_batch() itself.
 
-    def _fetch_session_account_balance(self) -> float:
+    def _fetch_session_account_balance(self, run_name: str | None = None) -> float:
         """Live IBKR portfolio value for this session's risk sizing.
+
+        Also records an ``account_snapshots`` row (2026-09-23): NetLiq,
+        cash, previous-day equity — the read-only portfolio view's source
+        for cash and daily P&L.  ``kind`` is 'eod' for the EOD session
+        (the previous-close reference) and 'session' otherwise.
 
         Why query the broker instead of using the configured value:
         before this fix, every session passed the hardcoded $98,412 which
@@ -1449,6 +1454,7 @@ class DailyScheduler:
                     value,
                 )
                 self._update_drawdown_peak(value)
+                self._record_account_snapshot(account, run_name)
                 return value
             log.warning(
                 "IBKR returned zero portfolio_value — using configured balance",
@@ -1458,6 +1464,23 @@ class DailyScheduler:
                 "IBKR balance fetch failed (using configured): %s", exc,
             )
         return _configured_account_balance()
+
+    @staticmethod
+    def _record_account_snapshot(account: dict, run_name: str | None) -> None:
+        """Best-effort account_snapshots row from a get_account() dict."""
+        try:
+            from storage.database import Database
+            Database().record_account_snapshot(
+                net_liquidation=float(account.get("portfolio_value") or 0.0),
+                total_cash=account.get("cash"),
+                gross_position_value=account.get("gross_position_value"),
+                prev_day_equity=account.get("prev_day_equity"),
+                buying_power=account.get("buying_power"),
+                source="ibkr",
+                kind="eod" if run_name == "EOD" else "session",
+            )
+        except Exception as exc:
+            log.warning("Account snapshot failed (non-fatal): %s", exc)
 
     def _update_drawdown_peak(self, current_value: float) -> None:
         """Ratchet portfolio peak and fire a one-time Telegram alert on halt.

@@ -564,17 +564,30 @@ class IBKRTrader:
         return self._run_in_ib_loop(_impl, timeout=dispatch_timeout)
 
     def get_account(self) -> dict:
-        """Return account summary: cash, portfolio_value, buying_power."""
+        """Return account summary: cash, portfolio_value, buying_power, plus
+        (2026-09-23) prev_day_equity (IBKR PreviousDayEquityWithLoanValue —
+        the previous-close reference for daily P&L) and
+        gross_position_value.  Missing tags come back as 0.0 / None."""
+        _TAGS = (
+            "TotalCashValue", "NetLiquidation", "BuyingPower",
+            "PreviousDayEquityWithLoanValue", "GrossPositionValue",
+        )
+
         def _impl() -> dict:
             summary = self._ib.accountSummary()
             values: dict[str, float] = {}
             for item in summary:
-                if item.tag in ("TotalCashValue", "NetLiquidation", "BuyingPower"):
-                    values[item.tag] = float(item.value)
+                if item.tag in _TAGS:
+                    try:
+                        values[item.tag] = float(item.value)
+                    except (TypeError, ValueError):
+                        continue
             return {
                 "cash": values.get("TotalCashValue", 0.0),
                 "portfolio_value": values.get("NetLiquidation", 0.0),
                 "buying_power": values.get("BuyingPower", 0.0),
+                "prev_day_equity": values.get("PreviousDayEquityWithLoanValue"),
+                "gross_position_value": values.get("GrossPositionValue"),
             }
         return self._run_in_ib_loop(_impl, timeout=15.0)
 
@@ -619,31 +632,36 @@ class IBKRTrader:
         return self._run_in_ib_loop(_impl, timeout=15.0)
 
     def get_portfolio(self) -> list[dict]:
-        """Return positions in the format expected by the coordinator."""
+        """Return positions in the format expected by the coordinator.
+
+        Syncs shares / avg_price from IBKR into portfolio_positions and
+        KEEPS the existing mark (2026-09-23, Database.sync_portfolio_position):
+        IBKR's position list carries no market price, and until now this
+        call overwrote current_value with qty × avg_entry at every session
+        start and every PositionManager cycle — wiping the live mark, so
+        the MCP/API view showed now == entry for days.  current_value is
+        recomputed as shares × mark_price when a mark exists (fill or
+        PositionManager feed) and only falls back to the entry value for a
+        never-marked row.  Why not 0.0 for that fallback:
+        PortfolioManager.can_add_position reads sum(current_value) for the
+        deployment cap; a zero clobbered the numerator and silently
+        disabled the 60 % cap (CASY breach 2026-05-05).
+        """
         positions = self.get_positions()
         result = []
         for pos in positions:
             qty = int(pos["qty"])
             avg = float(pos["avg_entry"])
-            # Entry-value approximation. Live mark-to-market is refreshed by
-            # monitoring.position_manager._mark_to_market every 60s during
-            # market hours; this write is a sane default between cycles.
-            # Why not 0.0: PortfolioManager.can_add_position reads
-            # sum(current_value) for the deployment cap. A zero clobbered
-            # the numerator and silently disabled the 60 % cap (CASY breach
-            # 2026-05-05).
-            row = {
+            row = self._db.sync_portfolio_position(
+                ticker=pos["ticker"], shares=qty, avg_price=avg,
+            )
+            result.append({
                 "ticker": pos["ticker"],
                 "shares": qty,
                 "avg_price": avg,
-                "current_value": round(qty * avg, 2),
-                "updated_at": None,
-            }
-            self._db.set_portfolio_position(
-                ticker=row["ticker"], shares=row["shares"],
-                avg_price=row["avg_price"], current_value=row["current_value"],
-            )
-            result.append(row)
+                "current_value": row["current_value"],
+                "updated_at": row.get("updated_at"),
+            })
         return result
 
     def get_orders(self) -> list[dict]:
@@ -1275,9 +1293,11 @@ class IBKRTrader:
             else:
                 total = shares
                 avg = fill_price
+            # A fill IS a mark (the price the market just gave us).
             self._db.set_portfolio_position(
                 ticker=ticker, shares=total, avg_price=avg,
                 current_value=round(total * fill_price, 2),
+                mark_price=fill_price, mark_source="fill",
             )
         else:
             if existing:
@@ -1290,5 +1310,6 @@ class IBKRTrader:
                         ticker=ticker, shares=remaining,
                         avg_price=existing["avg_price"],
                         current_value=round(remaining * fill_price, 2),
+                        mark_price=fill_price, mark_source="fill",
                     )
         return pnl

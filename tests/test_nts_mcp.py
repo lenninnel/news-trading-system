@@ -207,11 +207,14 @@ def test_db_path_falls_back_to_config_settings(monkeypatch):
 
 
 def test_get_portfolio_returns_formatted_summary(fixture_db):
+    """Legacy fixture DB (no mark columns, no account_snapshots): the view
+    falls back honestly — positions at their last current_value, cash as
+    the labelled estimate, daily P&L n/a."""
     output = asyncio.run(nts_mcp.get_portfolio())
 
     # Header and known fields
     assert "Portfolio Summary" in output
-    assert "Total value:" in output
+    assert "NAV (total):" in output
     assert "Cash:" in output
     assert "Daily P&L:" in output
 
@@ -219,8 +222,37 @@ def test_get_portfolio_returns_formatted_summary(fixture_db):
     assert "AAPL" in output
     assert "MSFT" in output
 
-    # Total value = 1850 + 2100 = 3950
-    assert "$3,950.00" in output
+    # Positions = 1850 + 2100 = 3950; cash estimate = 10000 − (1800 + 1950)
+    # = 6250; NAV = 10200.  "Total value" used to be 3950 (positions only).
+    assert "Positions:    $3,950.00" in output
+    assert "Cash:         $6,250.00  (estimate:" in output
+    assert "NAV (total):  $10,200.00" in output
+    assert "Daily P&L:    n/a" in output
+    assert "note: cash is an estimate" in output
+
+
+def test_get_portfolio_with_marks_and_snapshot(tmp_path, monkeypatch):
+    """Full schema (storage.database): NAV = broker cash + marked positions,
+    daily P&L vs the broker's previous-day equity, reconciled line."""
+    from storage.database import Database
+    path = tmp_path / "full.db"
+    db = Database(str(path))
+    db.set_portfolio_position(ticker="AAPL", shares=81, avg_price=333.45,
+                              current_value=27009.45, mark_price=333.44, mark_source="fill")
+    db.mark_portfolio_position("AAPL", 81, 333.45, 342.98, "yfinance_1m")
+    db.sync_portfolio_position("AAPL", 81, 333.45)
+    db.record_account_snapshot(net_liquidation=271095.71, total_cash=243314.33,
+                               prev_day_equity=270000.0, kind="session",
+                               ts="2026-09-23T13:15:00+00:00")
+    monkeypatch.setenv("DB_PATH", str(path))
+
+    output = asyncio.run(nts_mcp.get_portfolio())
+    assert "NAV (total):  $271,095.71  = cash + positions" in output
+    assert "Cash:         $243,314.33  (ibkr:TotalCashValue, as of 2026-09-23T13:15 UTC)" in output
+    assert "Positions:    $27,781.38" in output
+    assert "Daily P&L:    $+1,095.71 (+0.41%)  vs previous close $270,000.00" in output
+    assert "Broker NetLiq: $271,095.71 as of 2026-09-23T13:15 UTC  (view − broker: $+0.00)" in output
+    assert "AAPL   81 shares  entry=$333.45  now=$342.98  pnl=+2.9%  [yfinance_1m" in output
 
 
 def test_get_portfolio_no_positions(tmp_path, monkeypatch):

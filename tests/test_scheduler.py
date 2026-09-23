@@ -466,3 +466,40 @@ class TestHolidayCalendar:
             sched._execute_run(run)
         claim.assert_called_once()         # claimed, then skipped: no XETRA tickers
         mock_run_batch.assert_not_called()
+
+
+# ── Broker account snapshots per session (analytics/portfolio_view) ────
+
+
+class TestAccountSnapshot:
+    def _trader(self, prev=270000.0):
+        trader = MagicMock()
+        trader.get_account.return_value = {
+            "cash": 243314.33, "portfolio_value": 271095.71, "buying_power": 0.0,
+            "prev_day_equity": prev, "gross_position_value": 27781.38,
+        }
+        return trader
+
+    def test_session_balance_records_snapshot_kind(self, scheduler, tmp_path):
+        from storage.database import Database
+        db = Database(str(tmp_path / "s.db"))
+        scheduler._position_manager_trader = self._trader()
+        with patch("storage.database.Database", return_value=db), \
+             patch.object(DailyScheduler, "_update_drawdown_peak"):
+            assert scheduler._fetch_session_account_balance("US_OPEN") == 271095.71
+            assert scheduler._fetch_session_account_balance("EOD") == 271095.71
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, net_liquidation, total_cash, prev_day_equity "
+                "FROM account_snapshots ORDER BY id"
+            ).fetchall()
+        assert [tuple(r) for r in rows] == [
+            ("session", 271095.71, 243314.33, 270000.0),
+            ("eod", 271095.71, 243314.33, 270000.0),
+        ]
+
+    def test_snapshot_failure_does_not_break_the_session(self, scheduler):
+        scheduler._position_manager_trader = self._trader()
+        with patch("storage.database.Database", side_effect=RuntimeError("db down")), \
+             patch.object(DailyScheduler, "_update_drawdown_peak"):
+            assert scheduler._fetch_session_account_balance("US_OPEN") == 271095.71

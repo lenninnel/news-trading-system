@@ -164,6 +164,22 @@ class TestIBKRAccount:
         assert result["cash"] == 50000.0
         assert result["portfolio_value"] == 100000.0
         assert result["buying_power"] == 150000.0
+        assert result["prev_day_equity"] is None          # tag absent → None, never 0
+
+    def test_get_account_reads_previous_day_equity(self):
+        """prev_day_equity / gross_position_value (2026-09-23) feed the
+        portfolio view's daily P&L against the previous close."""
+        trader, mock_ib, _ = _make_trader()
+        mock_ib.accountSummary.return_value = [
+            MagicMock(tag="TotalCashValue", value="243314.33"),
+            MagicMock(tag="NetLiquidation", value="271095.71"),
+            MagicMock(tag="PreviousDayEquityWithLoanValue", value="270000.00"),
+            MagicMock(tag="GrossPositionValue", value="27781.38"),
+            MagicMock(tag="Cushion", value="0.9"),   # unrelated tag ignored
+        ]
+        result = trader.get_account()
+        assert result["prev_day_equity"] == 270000.0
+        assert result["gross_position_value"] == 27781.38
 
     def test_get_positions(self):
         """get_positions returns list of position dicts."""
@@ -181,14 +197,17 @@ class TestIBKRAccount:
         assert result[0]["qty"] == 100
         assert result[0]["avg_entry"] == 150.0
 
-    def test_get_portfolio_writes_entry_value_not_zero(self):
-        """get_portfolio must write current_value = qty × avg_entry to the DB.
+    def test_get_portfolio_syncs_shares_and_keeps_the_mark(self):
+        """get_portfolio syncs shares/avg_price via Database.sync_portfolio_position
+        and never writes current_value itself (2026-09-23).
 
-        Regression guard for the 2026-05-05 CASY breach: the prior
-        hardcoded current_value=0.0 zeroed the numerator of
-        PortfolioManager.can_add_position's deployment-cap check, silently
-        disabling the 60 % cap. The entry-value approximation is the
-        contract.
+        Two regressions guarded here: the 2026-05-05 CASY breach (a
+        hardcoded current_value=0.0 zeroed the deployment-cap numerator —
+        the sync's never-marked fallback is the entry value, never 0), and
+        the 2026-09-19/23 stale portfolio view (the sync overwrote the
+        PositionManager's live mark with qty × avg_entry at every session
+        start — the sync now keeps the mark and recomputes current_value
+        from it).
         """
         trader, mock_ib, mock_db = _make_trader()
         mock_pos = MagicMock()
@@ -197,16 +216,28 @@ class TestIBKRAccount:
         mock_pos.position = 100
         mock_pos.avgCost = 150.0
         mock_ib.positions.return_value = [mock_pos]
+        mock_db.sync_portfolio_position.return_value = {
+            "ticker": "AAPL", "shares": 100, "avg_price": 150.0,
+            "current_value": 16000.0,       # 100 × a live mark of 160.0 kept by the DB
+            "mark_price": 160.0, "updated_at": "2026-09-23T14:30:00+00:00",
+        }
 
         result = trader.get_portfolio()
-        assert result[0]["current_value"] == 15000.0  # 100 × 150.0
+        assert result[0]["current_value"] == 16000.0   # the mark, not 100 × 150
 
-        mock_db.set_portfolio_position.assert_called_once()
+        mock_db.sync_portfolio_position.assert_called_once_with(
+            ticker="AAPL", shares=100, avg_price=150.0,
+        )
+        mock_db.set_portfolio_position.assert_not_called()   # no clobber path left
+
+    def test_sync_position_records_fill_as_mark(self):
+        """A fill writes mark_price=fill price, mark_source='fill'."""
+        trader, _, mock_db = _make_trader()
+        mock_db.get_portfolio_position.return_value = None
+        trader._sync_position("AAPL", "BUY", 81, 333.44)
         kwargs = mock_db.set_portfolio_position.call_args.kwargs
-        assert kwargs["ticker"] == "AAPL"
-        assert kwargs["shares"] == 100
-        assert kwargs["avg_price"] == 150.0
-        assert kwargs["current_value"] == 15000.0  # never 0.0
+        assert kwargs["current_value"] == round(81 * 333.44, 2)
+        assert kwargs["mark_price"] == 333.44 and kwargs["mark_source"] == "fill"
 
 
 # ── Order placement ──────────────────────────────────────────────────────────

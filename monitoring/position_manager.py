@@ -66,6 +66,12 @@ _STALE_REALERT_MINUTES = 60
 # outage is escalated to Telegram (3 × 60s = ~3 minutes).
 _RECONNECT_ALERT_AFTER = 3
 
+# Broker account snapshot cadence during RTH (2026-09-23): every cycle
+# would be 390 rows/day for nothing — cash only moves on a fill.  Five
+# minutes keeps the read-only portfolio view (analytics/portfolio_view.py)
+# within one poll of a stop-loss exit.
+_ACCOUNT_SNAPSHOT_INTERVAL_S = 300.0
+
 # Stuck-order cooldown: after a stop/TP SELL hits IBKR's STOP_MAX_WAIT and
 # is left in flight, we don't want to evaluate the same position again on
 # the next 60s cycle (which would submit a duplicate order). Wait this
@@ -136,6 +142,9 @@ class PositionManager:
         # Signal logger for audit trail
         from analytics.signal_logger import SignalLogger
         self._signal_logger = SignalLogger(db=db)
+
+        # monotonic time of the last account snapshot (see _snapshot_account)
+        self._last_account_snapshot: float = 0.0
 
         # Direct DB handle so we can mark-to-market portfolio_positions every
         # cycle. Without this the EOD P&L summary reads stale current_value
@@ -274,6 +283,10 @@ class PositionManager:
         tickers = [p["ticker"] for p in positions]
         log.info("PM heartbeat: cycle running, %d positions to evaluate: %s",
                  len(positions), tickers)
+        # Broker account snapshot (cash, NetLiq, previous-day equity) for
+        # the read-only portfolio view — also with zero positions, so cash
+        # after the last exit is current.
+        self._snapshot_account()
         if not positions:
             log.info("PM heartbeat: _check_all_positions EXIT (no positions)")
             return []
@@ -313,11 +326,14 @@ class PositionManager:
         avg_price: float,
         current_price: float,
     ) -> None:
-        """Update portfolio_positions.current_value with the live mark.
+        """Write the live mark (price, source, time) and current_value.
 
-        Runs once per ticker per 60s cycle during market hours. Without it,
-        the column is whatever was written at the last broker sync — which
-        for IBKR paper is 0.0 (no market data subscription).
+        Runs once per ticker per 60s cycle during market hours.  This is
+        the SAME price the stop/trailing evaluation below uses, so the
+        portfolio view shows positions at the price the exits are judged
+        on.  Since 2026-09-23 the mark survives the broker sync
+        (Database.sync_portfolio_position keeps mark_*), so outside RTH
+        the view carries the last RTH mark instead of the entry price.
         """
         if shares <= 0 or current_price <= 0:
             return
@@ -327,17 +343,57 @@ class PositionManager:
                 from storage.database import Database
                 db = Database()
                 self._db = db
-            db.set_portfolio_position(
-                ticker=ticker,
-                shares=shares,
-                avg_price=avg_price,
-                current_value=round(shares * current_price, 2),
+            db.mark_portfolio_position(
+                ticker=ticker, shares=shares, avg_price=avg_price,
+                price=current_price, source="yfinance_1m",
             )
         except Exception as exc:
             log.warning(
                 "Mark-to-market write failed for %s (non-fatal): %s",
                 ticker, exc,
             )
+
+    def _snapshot_account(self) -> None:
+        """Record the broker's account values at most every
+        _ACCOUNT_SNAPSHOT_INTERVAL_S seconds (best-effort, never raises).
+
+        The API / MCP processes have no broker connection; this row is
+        where they read cash and the previous-close equity from.
+        """
+        if time.monotonic() - self._last_account_snapshot < _ACCOUNT_SNAPSHOT_INTERVAL_S:
+            return
+        get_account = getattr(self._trader, "get_account", None)
+        if get_account is None:
+            return
+        try:
+            account = get_account() or {}
+            net_liq = float(account.get("portfolio_value") or 0.0)
+            if net_liq <= 0:
+                log.warning("PM account snapshot: broker returned no NetLiquidation — not recorded")
+                return
+            db = self._db
+            if db is None:
+                from storage.database import Database
+                db = Database()
+                self._db = db
+            db.record_account_snapshot(
+                net_liquidation=net_liq,
+                total_cash=account.get("cash"),
+                gross_position_value=account.get("gross_position_value"),
+                prev_day_equity=account.get("prev_day_equity"),
+                buying_power=account.get("buying_power"),
+                source="ibkr",
+                kind="pm",
+            )
+            self._last_account_snapshot = time.monotonic()
+            log.info("PM account snapshot: NetLiq $%.2f cash $%.2f prev-close %s",
+                     net_liq, float(account.get("cash") or 0.0),
+                     account.get("prev_day_equity"))
+        except Exception as exc:
+            # Throttle failures too: a disconnected Gateway must not add a
+            # warning to every 60 s cycle on top of the reconnect alerts.
+            self._last_account_snapshot = time.monotonic()
+            log.warning("PM account snapshot failed (non-fatal): %s", exc)
 
     def _persist_trailing_stop(self, ticker: str, stop_price: float) -> None:
         """Best-effort DB write for the trailing-stop value.

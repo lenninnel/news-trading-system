@@ -766,3 +766,63 @@ class TestEarlyCloseMarketHours:
         with patch("monitoring.position_manager.datetime") as mock_dt_cls:
             mock_dt_cls.now.return_value = now
             assert PositionManager._is_market_hours() is expected
+
+
+class TestMarkProvenanceAndAccountSnapshot:
+    """2026-09-23: the mark carries price/source/time and survives the
+    broker sync; the PM records broker account snapshots at most every
+    _ACCOUNT_SNAPSHOT_INTERVAL_S during RTH."""
+
+    def test_mark_to_market_writes_provenance_that_survives_sync(self):
+        from storage.database import Database
+        db = Database()
+        pm = PositionManager(trader=_make_trader(), db=db)
+        pm._mark_to_market("AAPL", 81, 333.45, 342.98)
+        row = db.get_portfolio_position("AAPL")
+        assert row["mark_price"] == 342.98
+        assert row["mark_source"] == "yfinance_1m"
+        assert row["marked_at"] is not None
+        assert row["current_value"] == round(81 * 342.98, 2)
+        # what IBKRTrader.get_portfolio does at the next session start
+        db.sync_portfolio_position("AAPL", 81, 333.45)
+        row = db.get_portfolio_position("AAPL")
+        assert row["current_value"] == round(81 * 342.98, 2)   # not 81 × 333.45
+
+    def test_account_snapshot_written_once_per_interval(self):
+        from storage.database import Database
+        import monitoring.position_manager as pm_mod
+        db = Database()
+        with db._connect() as conn:
+            conn.execute("DELETE FROM account_snapshots")
+        trader = _make_trader()
+        trader.get_account.return_value = {
+            "cash": 243314.33, "portfolio_value": 271095.71, "buying_power": 0.0,
+            "prev_day_equity": 270000.0, "gross_position_value": 27781.38,
+        }
+        pm = PositionManager(trader=trader, db=db)
+        pm._check_all_positions()                                   # first cycle → snapshot
+        pm._check_all_positions()                                   # seconds later → none
+        pm._last_account_snapshot -= pm_mod._ACCOUNT_SNAPSHOT_INTERVAL_S + 1
+        pm._check_all_positions()                                   # interval elapsed → snapshot
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT net_liquidation, total_cash, prev_day_equity, kind FROM account_snapshots"
+            ).fetchall()
+        assert [tuple(r) for r in rows] == [
+            (271095.71, 243314.33, 270000.0, "pm"),
+            (271095.71, 243314.33, 270000.0, "pm"),
+        ]
+
+    def test_account_snapshot_skips_zero_netliq_and_never_raises(self):
+        from storage.database import Database
+        db = Database()
+        with db._connect() as conn:
+            conn.execute("DELETE FROM account_snapshots")
+        trader = _make_trader()
+        trader.get_account.return_value = {"cash": 0.0, "portfolio_value": 0.0}
+        pm = PositionManager(trader=trader, db=db)
+        pm._snapshot_account()
+        trader.get_account.side_effect = TimeoutError("gateway")
+        pm._last_account_snapshot = 0.0
+        pm._snapshot_account()             # must not raise
+        assert db.get_latest_account_snapshot() is None

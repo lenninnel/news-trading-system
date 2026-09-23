@@ -254,60 +254,26 @@ async def _fetch_portfolio() -> dict:
 
 
 def _sql_portfolio() -> dict:
-    """SQLite equivalent of GET /api/portfolio.
-
-    Mirrors api/main.py's shape exactly: {value, cash, daily_pnl,
-    daily_pnl_pct, positions[]}.
+    """SQLite equivalent of GET /api/portfolio — the same
+    analytics.portfolio_view.build_portfolio_view the API uses, so both
+    modes render one truth: NAV = cash + positions at their live marks,
+    daily P&L against the previous close (docs/PORTFOLIO_VIEW_2026-09-23.md).
+    Returns {} when the DB cannot be opened (the formatter says so).
     """
-    positions = _query(
-        "SELECT ticker, shares, avg_price, current_value "
-        "FROM portfolio_positions ORDER BY ticker"
-    )
-    total_value = sum((p.get("current_value") or 0) for p in positions)
-
-    today_str = date.today().isoformat()
-    pnl_row = _query_one(
-        "SELECT COALESCE(SUM(pnl), 0) AS daily_pnl FROM trade_history "
-        "WHERE date(created_at) = date(?)",
-        (today_str,),
-    )
-    daily_pnl = (pnl_row or {}).get("daily_pnl") or 0.0
-    daily_pnl_pct = (daily_pnl / total_value * 100) if total_value else 0.0
-
-    pos_list: list[dict] = []
-    for p in positions:
-        shares = p.get("shares") or 0
-        avg_price = p.get("avg_price") or 0.0
-        current_value = p.get("current_value") or 0.0
-        current_price = (current_value / shares) if shares else 0.0
-        cost = avg_price * shares if shares else 0
-        pnl_pct = ((current_value - cost) / cost * 100) if cost else 0.0
-        pos_list.append({
-            "ticker": p.get("ticker"),
-            "shares": shares,
-            "entry": round(avg_price, 2),
-            "current": round(current_price, 2),
-            "pnl_pct": round(pnl_pct, 1),
-        })
-
-    total_invested = sum(
-        (p.get("avg_price") or 0) * (p.get("shares") or 0)
-        for p in positions
-    )
-    account_row = _query_one(
-        "SELECT account_balance FROM risk_calculations "
-        "ORDER BY id DESC LIMIT 1"
-    )
-    account_balance = (account_row or {}).get("account_balance") or 10_000.0
-    cash = account_balance - total_invested
-
-    return {
-        "value": round(total_value, 2),
-        "daily_pnl": round(daily_pnl, 2),
-        "daily_pnl_pct": round(daily_pnl_pct, 2),
-        "positions": pos_list,
-        "cash": round(cash, 2),
-    }
+    from analytics.portfolio_view import build_portfolio_view, open_readonly
+    path = _resolve_db_path()
+    try:
+        conn = open_readonly(path)
+    except sqlite3.Error as exc:
+        log.warning("nts_mcp portfolio: cannot open %s read-only: %s", path, exc)
+        return {}
+    try:
+        return build_portfolio_view(conn)
+    except Exception as exc:
+        log.warning("nts_mcp portfolio view failed: %s", exc)
+        return {}
+    finally:
+        conn.close()
 
 
 async def _fetch_signals(days: int, strategy: str, limit: int) -> list[dict]:
@@ -493,24 +459,53 @@ def _sql_signal_detail(ticker_upper: str) -> list[dict]:
 # ── Format layer — pure, no I/O, works on either backend's data ─────────
 
 
+def _short_ts(ts: Any) -> str:
+    return (str(ts)[:16] + " UTC") if ts else "n/a"
+
+
 def _format_portfolio(data: dict) -> str:
     if not data:
         return "Portfolio Summary\n" + "─" * 40 + "\n  No portfolio data available."
 
-    total_value = data.get("value") or 0
-    cash = data.get("cash") or 0
-    daily_pnl = data.get("daily_pnl") or 0
-    daily_pnl_pct = data.get("daily_pnl_pct") or 0
+    nav = data.get("value") or 0
+    cash = data.get("cash")
+    positions_value = data.get("positions_value")
+    if positions_value is None:   # older API without the split
+        positions_value = sum((p.get("current") or 0) * (p.get("shares") or 0)
+                              for p in (data.get("positions") or []))
+    daily_pnl = data.get("daily_pnl")
+    daily_pnl_pct = data.get("daily_pnl_pct")
     positions = data.get("positions") or []
 
     lines = [
         "Portfolio Summary",
         "─" * 40,
-        f"  Total value:  ${total_value:,.2f}",
-        f"  Cash:         ${cash:,.2f}",
-        f"  Daily P&L:    ${daily_pnl:+,.2f} ({daily_pnl_pct:+.2f}%)",
-        "",
+        f"  NAV (total):  ${nav:,.2f}  = cash + positions",
+        f"  Cash:         ${(cash or 0):,.2f}"
+        + (f"  ({data['cash_source']}, as of {_short_ts(data.get('cash_as_of'))})"
+           if data.get("cash_source") else ""),
+        f"  Positions:    ${positions_value:,.2f}"
+        + (f"  (marks as of {_short_ts(data.get('marks_as_of'))})"
+           if data.get("marks_as_of") else ""),
     ]
+    if daily_pnl is None:
+        lines.append(f"  Daily P&L:    n/a — {data.get('daily_pnl_basis') or 'unavailable'}")
+    else:
+        lines.append(
+            f"  Daily P&L:    ${daily_pnl:+,.2f} ({(daily_pnl_pct or 0):+.2f}%)"
+            f"  vs previous close ${(data.get('prev_close_nav') or 0):,.2f}"
+        )
+    if data.get("realized_today") is not None:
+        lines.append(f"  Realized today: ${data['realized_today']:+,.2f}"
+                     f"   Unrealized: ${(data.get('unrealized_pnl') or 0):+,.2f}")
+    if data.get("broker_nav") is not None:
+        diff = data.get("nav_minus_broker")
+        lines.append(
+            f"  Broker NetLiq: ${data['broker_nav']:,.2f} as of "
+            f"{_short_ts(data.get('broker_nav_as_of'))}"
+            + (f"  (view − broker: ${diff:+,.2f})" if diff is not None else "")
+        )
+    lines.append("")
     if positions:
         lines.append(f"Positions ({len(positions)}):")
         for p in positions:
@@ -519,13 +514,18 @@ def _format_portfolio(data: dict) -> str:
             entry = p.get("entry") or 0.0
             current = p.get("current") or 0.0
             pnl_pct = p.get("pnl_pct") or 0.0
+            src = p.get("mark_source")
+            when = p.get("marked_at")
             lines.append(
                 f"  {ticker:<6} {shares} shares  "
                 f"entry=${entry:.2f}  now=${current:.2f}  "
                 f"pnl={pnl_pct:+.1f}%"
+                + (f"  [{src} {str(when)[:16]}]" if src else "")
             )
     else:
         lines.append("No open positions.")
+    for note in data.get("notes") or []:
+        lines.append(f"  note: {note}")
     return "\n".join(lines)
 
 

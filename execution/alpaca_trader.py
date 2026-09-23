@@ -322,12 +322,14 @@ class AlpacaTrader:
                 "current_value": float(pos.market_value),
                 "updated_at": None,
             }
-            # Keep local DB in sync
+            # Keep local DB in sync — Alpaca's market_value is a real mark.
+            mark = (row["current_value"] / row["shares"]) if row["shares"] else None
             self._db.set_portfolio_position(
                 ticker=row["ticker"],
                 shares=row["shares"],
                 avg_price=row["avg_price"],
                 current_value=row["current_value"],
+                mark_price=mark, mark_source="alpaca",
             )
             result.append(row)
         return result

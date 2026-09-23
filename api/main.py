@@ -26,6 +26,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from analytics.portfolio_view import build_portfolio_view, open_readonly  # noqa: E402
 from config.settings import DB_PATH  # noqa: E402
 from config.sessions import SCHEDULE as _SCHEDULE  # noqa: E402
 from config.sessions import (  # noqa: E402
@@ -255,61 +256,26 @@ def signals(
 
 @app.get("/api/portfolio")
 def portfolio() -> dict:
-    positions = _query("SELECT * FROM portfolio_positions ORDER BY ticker")
+    """Portfolio summary — NAV = cash + positions at their live marks.
 
-    total_value = sum(p.get("current_value", 0) or 0 for p in positions)
-
-    account_row = _query_one(
-        "SELECT account_balance FROM risk_calculations ORDER BY id DESC LIMIT 1"
-    )
-    account_balance = account_row["account_balance"] if account_row else None
-
-    # Daily PnL from trade_history
-    today_str = date.today().isoformat()
-    pnl_row = _query_one(
-        "SELECT COALESCE(SUM(pnl), 0) AS daily_pnl FROM trade_history "
-        "WHERE date(created_at) = date(?)",
-        (today_str,),
-    )
-    daily_pnl = pnl_row["daily_pnl"] if pnl_row else 0.0
-    daily_pnl_pct = (daily_pnl / account_balance * 100) if account_balance else 0.0
-
-    pos_list = []
-    for p in positions:
-        shares = p.get("shares", 0)
-        avg_price = p.get("avg_price", 0)
-        current_value = p.get("current_value", 0) or 0
-        current_price = (current_value / shares) if shares else 0
-        cost = avg_price * shares if shares else 0
-        pnl_pct = ((current_value - cost) / cost * 100) if cost else 0
-        pos_list.append({
-            "ticker": p.get("ticker"),
-            "shares": shares,
-            "entry": avg_price,
-            "current": round(current_price, 2),
-            "pnl_pct": round(pnl_pct, 1),
-        })
-
-    # Cash estimate: account balance minus invested
-    total_invested = sum(
-        (p.get("avg_price", 0) or 0) * (p.get("shares", 0) or 0)
-        for p in positions
-    )
-    if account_balance is None:
-        logger.warning(
-            "portfolio endpoint: no risk_calculations rows, cash defaulting to 0"
-        )
-        cash = 0.0
-    else:
-        cash = account_balance - total_invested
-
-    return {
-        "value": round(total_value, 2),
-        "daily_pnl": round(daily_pnl, 2),
-        "daily_pnl_pct": round(daily_pnl_pct, 2),
-        "positions": pos_list,
-        "cash": round(cash, 2),
-    }
+    Computed by analytics.portfolio_view.build_portfolio_view, the same
+    function the MCP get_portfolio tool uses in SQLite mode, so the
+    dashboard, the API and the MCP server show one truth.  Legacy keys
+    (value, cash, daily_pnl, daily_pnl_pct, positions) are kept for the
+    dashboard; ``value`` is now NAV (it used to be positions only), and
+    ``daily_pnl`` is NAV minus the previous close (None until the daemon
+    has recorded a broker account snapshot) instead of today's realised
+    SELL P&L.  See docs/PORTFOLIO_VIEW_2026-09-23.md.
+    """
+    try:
+        conn = open_readonly(_DB_PATH)
+    except sqlite3.Error as exc:
+        logger.warning("portfolio endpoint: cannot open DB read-only (%s)", exc)
+        conn = sqlite3.connect(_DB_PATH)
+    try:
+        return build_portfolio_view(conn)
+    finally:
+        conn.close()
 
 
 @app.get("/api/trades")
