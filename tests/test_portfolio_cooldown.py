@@ -308,7 +308,8 @@ class TestHolidayAwareGap:
 
 
 # ===========================================================================
-# 1c. Trailing-stop exits — opt-in only
+# 1c. Trailing-stop exits — covered by default since 921f6a6 (2026-09-23),
+#     switchable off via REENTRY_LOCK_INCLUDE_TRAILING
 # ===========================================================================
 
 class TestTrailingStopOption:
@@ -331,11 +332,26 @@ class TestTrailingStopOption:
         conn.commit()
         conn.close()
 
-    def test_trailing_exit_does_not_lock_by_default(self, tmp_path):
+    def test_default_flag_is_on(self):
+        """Config default flipped to True in 921f6a6 — pin it so a silent
+        revert shows up here rather than in production behaviour."""
+        from config.settings import REENTRY_LOCK_INCLUDE_TRAILING
+        assert REENTRY_LOCK_INCLUDE_TRAILING is True
+
+    def test_trailing_exit_locks_by_default(self, tmp_path):
         db = _new_db(tmp_path)
         self._seed_trailing_exit(db)
         pm = _make_pm(db)
-        assert pm._reentry_lock_status("MSFT") is None
+        lock = pm._reentry_lock_status("MSFT")
+        assert lock is not None
+        assert lock["exit_kind"] == "trailing_stop"
+
+    def test_trailing_exit_does_not_lock_when_disabled(self, tmp_path):
+        db = _new_db(tmp_path)
+        self._seed_trailing_exit(db)
+        pm = _make_pm(db)
+        with patch("execution.portfolio_manager.REENTRY_LOCK_INCLUDE_TRAILING", False):
+            assert pm._reentry_lock_status("MSFT") is None
 
     def test_trailing_exit_locks_when_enabled(self, tmp_path):
         db = _new_db(tmp_path)
