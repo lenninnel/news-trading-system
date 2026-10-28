@@ -41,6 +41,54 @@ NEWSAPI_URL: str = "https://newsapi.org/v2/everything"
 MAX_HEADLINES: int = 10
 
 # ---------------------------------------------------------------------------
+# News input hygiene (2026-10-28, KW44 review)
+# ---------------------------------------------------------------------------
+# The KW44 review found NewsCatalyst voting on headlines that were on
+# average 29-77 h old (max 163 h), re-scored up to 23 times over two
+# weeks, and partly unrelated to the company ("cvx-linalg 1.1.2" counted
+# as Chevron news).  Two switches, both reversible via environment:
+#
+#   NEWS_MAX_AGE_HOURS      drop NewsAPI articles whose publishedAt is
+#                           older than this; also sent as the API's
+#                           ``from`` window.  0 disables the age filter.
+#   NEWS_RELEVANCE_FILTER   keep only headlines that name the company
+#                           (alias list below) or carry the ticker as a
+#                           case-sensitive standalone token; search is
+#                           restricted to titles.  "false" restores the
+#                           pre-2026-10-28 query (q=<ticker>, any field).
+NEWS_MAX_AGE_HOURS: float = float(os.environ.get("NEWS_MAX_AGE_HOURS", "72"))
+NEWS_RELEVANCE_FILTER: bool = os.environ.get(
+    "NEWS_RELEVANCE_FILTER", "true"
+).lower() in ("true", "1", "yes")
+
+# Company names that make a headline count for a ticker.  Matched
+# case-sensitively as whole words.  Deliberately no people (Musk, Dimon,
+# Zuckerberg): their headlines are often about other companies.
+NEWS_COMPANY_ALIASES: dict[str, list[str]] = {
+    "AAPL": ["Apple"],
+    "MSFT": ["Microsoft"],
+    "AMZN": ["Amazon"],
+    "META": ["Meta Platforms", "Meta", "Facebook", "Instagram", "WhatsApp"],
+    "JPM":  ["JPMorgan", "JP Morgan", "J.P. Morgan"],
+    "BAC":  ["Bank of America", "BofA"],
+    "XOM":  ["Exxon", "ExxonMobil", "Exxon Mobil"],
+    "CVX":  ["Chevron"],
+    "PFE":  ["Pfizer"],
+    "TSLA": ["Tesla"],
+    "VRT":  ["Vertiv"],
+    # PEAD universe (US names)
+    "CASY": ["Casey's", "Caseys"],
+    "TXRH": ["Texas Roadhouse"],
+    "DECK": ["Deckers", "Hoka", "UGG"],
+    "TRGP": ["Targa"],
+    "CACI": ["CACI"],
+    "MEDP": ["Medpace"],
+    "UFPI": ["UFP Industries"],
+    "TOL":  ["Toll Brothers"],
+    "PBR":  ["Petrobras"],
+}
+
+# ---------------------------------------------------------------------------
 # Sentiment → numeric score mapping
 # ---------------------------------------------------------------------------
 
