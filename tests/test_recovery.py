@@ -480,7 +480,9 @@ class TestNewsFeedFallback(unittest.TestCase):
         from data.news_feed import NewsFeed
         from utils.network_recovery import ResponseCache
 
-        fake = ["Cached headline 1", "Cached headline 2"]
+        # Headlines must name the company: the relevance filter
+        # (2026-10-28) drops cached items that are not about AAPL.
+        fake = ["Apple cached headline 1", "AAPL cached headline 2"]
         cache = ResponseCache(max_age_seconds=3600)
         cache.set("newsapi", "headlines:AAPL", fake)
 

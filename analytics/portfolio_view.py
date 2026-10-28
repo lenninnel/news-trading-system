@@ -25,7 +25,9 @@ Definitions used here
   written by the daemon / PositionManager).  Without any snapshot yet the
   view falls back to the old estimate (NetLiquidation − cost basis) and
   says so in ``cash_source``.
-* value (NAV) = cash + positions_value.
+* value (NAV) = cash + positions_value + accruals, where accruals =
+  NetLiquidation − TotalCashValue − GrossPositionValue of the same
+  broker snapshot (accrued interest/dividends; 0 when a tag is missing).
 * daily_pnl = NAV − previous close NAV.  Previous close = the broker's
   PreviousDayEquityWithLoanValue from the newest snapshot; if that tag is
   missing, the NetLiquidation of the last ``kind='eod'`` snapshot before
@@ -192,7 +194,23 @@ def build_portfolio_view(conn: sqlite3.Connection, *, now: datetime | None = Non
             cash_source = "unavailable"
             notes.append("cash unavailable (no account snapshot, no risk_calculations row)")
 
-    nav = cash + positions_value
+    # Broker items that are neither cash nor positions (accrued interest,
+    # accrued dividends, ...), from the same snapshot: NetLiquidation −
+    # TotalCashValue − GrossPositionValue.  Without them the view NAV sat
+    # below the broker's previous-close equity and showed a phantom daily
+    # loss (2026-10-27: −$382 with zero positions).  2026-10-28.
+    accruals = 0.0
+    if snap:
+        gpv = _f(snap.get("gross_position_value"))
+        if broker_nav is not None and cash is not None and gpv is not None:
+            accruals = broker_nav - cash - gpv
+            if abs(accruals) >= 0.01:
+                notes.append(
+                    f"NAV includes broker accruals {accruals:+,.2f} "
+                    "(NetLiquidation − cash − gross positions)"
+                )
+
+    nav = cash + positions_value + accruals
 
     # ── P&L ──────────────────────────────────────────────────────────────
     rt = _rows(conn, "SELECT COALESCE(SUM(pnl), 0) AS pnl FROM trade_history "
@@ -224,6 +242,7 @@ def build_portfolio_view(conn: sqlite3.Connection, *, now: datetime | None = Non
         "cost_basis": _r(cost_basis),
         "unrealized_pnl": _r(positions_value - cost_basis),
         "realized_today": _r(realized_today),
+        "accruals": _r(accruals),
         "prev_close_nav": _r(prev_close_nav),
         "daily_pnl_basis": daily_pnl_basis,
         "cash_source": cash_source,

@@ -279,10 +279,14 @@ def _sql_portfolio() -> dict:
 async def _fetch_signals(days: int, strategy: str, limit: int) -> list[dict]:
     if _http_mode():
         params = {"days": days, "limit": limit}
+        if strategy:
+            # Server-side filter (API since 2026-10-28) so LIMIT applies
+            # after filtering.  The client-side pass below stays as a
+            # safety net for an older API that ignores the parameter.
+            params["strategy"] = strategy
         data = await _api_get("/api/signals", params=params)
         if not isinstance(data, list):
             return []
-        # The FastAPI doesn't support a strategy filter — do it client-side.
         if strategy:
             up = strategy.upper()
             data = [s for s in data if (s.get("strategy") or "").upper() == up]
@@ -308,6 +312,53 @@ def _sql_signals(days: int, strategy: str, limit: int) -> list[dict]:
         f"ORDER BY id DESC LIMIT ?",
         tuple(params + [limit]),
     )
+
+
+async def _fetch_trades(days: int, limit: int) -> list[dict]:
+    if _http_mode():
+        data = await _api_get("/api/trades", params={"days": days, "limit": limit})
+        rows = (data or {}).get("trades") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        # An older API ignores ``days`` — enforce the window here too.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return [r for r in rows if (r.get("timestamp") or "") >= cutoff]
+    return _sql_trades(days, limit)
+
+
+def _sql_trades(days: int, limit: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    return _query(
+        "SELECT ticker, action, shares, price, stop_loss, take_profit, pnl, "
+        "created_at AS timestamp FROM trade_history "
+        "WHERE created_at >= ? ORDER BY id DESC LIMIT ?",
+        (cutoff, limit),
+    )
+
+
+def _format_trades(rows: list[dict], days: int) -> str:
+    if not rows:
+        return f"No trades in the last {days} day(s)."
+    sells = [r for r in rows if (r.get("action") or "").upper() == "SELL"]
+    realized = sum(float(r.get("pnl") or 0) for r in sells)
+    wins = sum(1 for r in sells if float(r.get("pnl") or 0) > 0)
+    lines = [
+        f"Trades in the last {days} day(s): {len(rows)} row(s), "
+        f"{len(sells)} closed, realized ${realized:+,.2f}, "
+        f"{wins}/{len(sells)} closed in profit\n"
+    ]
+    for r in rows:
+        ts = (r.get("timestamp") or "")[:16]
+        price = r.get("price")
+        sl, tp = r.get("stop_loss"), r.get("take_profit")
+        pnl = r.get("pnl")
+        levels = f"  SL={sl:.2f} TP={tp:.2f}" if sl and tp else ""
+        pnl_str = f"  pnl=${float(pnl):+,.2f}" if (r.get("action") or "").upper() == "SELL" else ""
+        lines.append(
+            f"  {ts}  {(r.get('ticker') or '???'):<6} {(r.get('action') or '?'):<4} "
+            f"{int(r.get('shares') or 0):>5} @ ${float(price or 0):.2f}{levels}{pnl_str}"
+        )
+    return "\n".join(lines)
 
 
 async def _fetch_performance() -> dict:
@@ -723,6 +774,23 @@ async def get_signals(days: int = 7, strategy: str = "", limit: int = 50) -> str
     except httpx.HTTPError as exc:
         return _http_error(exc)
     return _format_signals(rows, days)
+
+
+@server.tool()
+async def get_trades(days: int = 30, limit: int = 100) -> str:
+    """Executed trades (BUY and SELL rows) with realized P&L.
+
+    Args:
+        days: Look-back window in days (1-365). Default 30.
+        limit: Max rows (1-200). Default 100.
+    """
+    days = max(1, min(365, days))
+    limit = max(1, min(200, limit))
+    try:
+        rows = await _fetch_trades(days, limit)
+    except httpx.HTTPError as exc:
+        return _http_error(exc)
+    return _format_trades(rows, days)
 
 
 @server.tool()

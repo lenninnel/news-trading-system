@@ -39,15 +39,17 @@ Degraded-mode activations are also logged at WARNING level.
 from __future__ import annotations
 
 import logging
+import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
+from config import settings as _settings
 from config.settings import MAX_HEADLINES, NEWSAPI_KEY, NEWSAPI_URL, get_search_term
 from utils.api_recovery import APIRecovery, CircuitOpenError
 from utils.network_recovery import NetworkMonitor, ResponseCache, get_cache
-from utils.timeparse import normalise_published
+from utils.timeparse import normalise_published, parse_utc
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +177,20 @@ class NewsFeed:
         return [a["text"] for a in self.fetch_articles(ticker)]
 
     def fetch_articles(self, ticker: str) -> list[dict]:
+        """
+        Fetch recent, relevant articles for *ticker* with publication time.
+
+        Every path (live, 24h cache, degraded cache) goes through
+        :func:`filter_articles` (age window + company relevance, see
+        ``config.settings.NEWS_MAX_AGE_HOURS`` / ``NEWS_RELEVANCE_FILTER``)
+        and is capped at ``max_headlines`` afterwards.  A cached batch
+        therefore ages out naturally instead of being re-served for 24 h.
+        """
+        raw = self._fetch_articles_raw(ticker)
+        kept = filter_articles(ticker, raw)
+        return kept[: self.max_headlines]
+
+    def _fetch_articles_raw(self, ticker: str) -> list[dict]:
         """
         Fetch recent articles mentioning *ticker* with their publication time.
 
@@ -367,14 +383,22 @@ class NewsFeed:
         is logged once per response — it must be visible as missing,
         never defaulted to the fetch time.
         """
-        search_term = get_search_term(ticker)
         params = {
-            "q":        search_term,
+            "q":        build_news_query(ticker),
             "language": "en",
             "sortBy":   "publishedAt",
             "pageSize": self.max_headlines,
             "apiKey":   self.api_key,
         }
+        if _settings.NEWS_RELEVANCE_FILTER:
+            # Title-only search; fetch extra rows because the relevance
+            # filter drops some.  One request either way (budget is per
+            # request, not per article).
+            params["searchIn"] = "title"
+            params["pageSize"] = min(100, self.max_headlines * 3)
+        if _settings.NEWS_MAX_AGE_HOURS > 0:
+            since = datetime.now(timezone.utc) - timedelta(hours=_settings.NEWS_MAX_AGE_HOURS)
+            params["from"] = since.strftime("%Y-%m-%dT%H:%M:%S")
         response = requests.get(NEWSAPI_URL, params=params, timeout=15)
         response.raise_for_status()
         articles = response.json().get("articles", [])
@@ -436,6 +460,94 @@ class NewsFeed:
             )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# News hygiene: query + filter (2026-10-28)
+# ---------------------------------------------------------------------------
+
+def _aliases(ticker: str) -> list[str]:
+    t = ticker.upper()
+    names = list(_settings.NEWS_COMPANY_ALIASES.get(t, []))
+    company = _settings.TICKER_TO_COMPANY.get(t)
+    if company and company not in names:
+        names.append(company)
+    return names
+
+
+def build_news_query(ticker: str) -> str:
+    """NewsAPI ``q`` for *ticker*.
+
+    With the relevance filter on: quoted company names OR the bare ticker
+    (``"Chevron" OR CVX``).  Off: the legacy search term (ticker, or the
+    company name for German listings).
+    """
+    if not _settings.NEWS_RELEVANCE_FILTER:
+        return get_search_term(ticker)
+    t = ticker.upper()
+    parts = [f'"{n}"' for n in _aliases(t)]
+    if "." not in t:  # "SAP.XETRA" as a search token returns junk
+        parts.append(t)
+    return " OR ".join(parts) if parts else get_search_term(ticker)
+
+
+def is_relevant_headline(ticker: str, text: str) -> bool:
+    """True when *text* names the company or carries the ticker as a token.
+
+    Case-sensitive whole-word match, so "cvx-linalg 1.1.2" is not
+    Chevron and "metadata" is not Meta.  The ticker token must be
+    upper-case and stand alone (``(CVX)``, ``CVX:``, ``$CVX``).
+    """
+    if not text:
+        return False
+    t = ticker.upper()
+    base = t.split(".")[0]
+    if len(base) >= 2 and re.search(rf"(?<![A-Za-z0-9-]){re.escape(base)}(?![A-Za-z0-9-])", text):
+        return True
+    for name in _aliases(t):
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", text):
+            return True
+    return False
+
+
+def filter_articles(ticker: str, articles: list[dict], now: datetime | None = None) -> list[dict]:
+    """Drop articles that are too old or not about *ticker*.
+
+    * Age: ``published_at`` older than ``NEWS_MAX_AGE_HOURS`` → dropped.
+      Articles without a timestamp are kept (age unknown, recorded as
+      such downstream via ``news_ts_missing``).
+    * Relevance: see :func:`is_relevant_headline` (when enabled).
+    * Duplicate titles inside one batch are collapsed.
+    """
+    now = now or datetime.now(timezone.utc)
+    max_age = _settings.NEWS_MAX_AGE_HOURS
+    out: list[dict] = []
+    seen: set[str] = set()
+    too_old = irrelevant = dupes = 0
+    for a in articles or []:
+        text = (a.get("text") or "").strip()
+        if not text:
+            continue
+        if max_age > 0:
+            dt = parse_utc(a.get("published_at"))
+            if dt is not None and (now - dt) > timedelta(hours=max_age):
+                too_old += 1
+                continue
+        if _settings.NEWS_RELEVANCE_FILTER and not is_relevant_headline(ticker, text):
+            irrelevant += 1
+            continue
+        key = text.casefold()
+        if key in seen:
+            dupes += 1
+            continue
+        seen.add(key)
+        out.append(a)
+    if too_old or irrelevant or dupes:
+        log.info(
+            "NewsAPI filter %s: kept %d, dropped %d too old (>%sh), %d irrelevant, %d duplicate",
+            ticker.upper(), len(out), too_old, max_age, irrelevant, dupes,
+        )
+    return out
 
 
 def _is_429_error(exc: Exception) -> bool:

@@ -2946,6 +2946,20 @@ class Coordinator:
                                     "[%s] Cached signal executed: %s %d shares @ %.2f",
                                     ticker, risk["direction"], risk["shares"], current_price,
                                 )
+                                # 2026-10-28: stamp the cached US_PRE row the
+                                # trade came from (it was never updated, so
+                                # signal_events showed 0 executed signals).
+                                if execution and execution.get("trade_id") and cached.get("id"):
+                                    try:
+                                        # Already inside ``async with db_lock``.
+                                        self.db.mark_signal_executed(
+                                            cached["id"], execution["trade_id"],
+                                        )
+                                    except Exception as exc:
+                                        log.warning(
+                                            "[%s] signal_events executed-stamp failed "
+                                            "(non-fatal): %s", ticker, exc,
+                                        )
                                 # Register / clear position metadata so the
                                 # per-strategy and per-sector caps see meaningful
                                 # tags on the next gate check.
