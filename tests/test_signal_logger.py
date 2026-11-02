@@ -252,7 +252,7 @@ class TestOutcomeTracker:
         result = run_outcome_tracker(db=signal_db, now=now)
         assert result.filled == {"price_3d": 1, "price_5d": 1, "price_10d": 1}
 
-        row = lgr.get_signals("AAPL", days=60)[0]
+        row = lgr.get_signals("AAPL", days=3650)[0]
         closes = {r["date"]: r["close"] for r in signal_db.get_daily_ohlc("AAPL", "2026-08-01", "2026-09-30")}
         assert row["price_3d"] == pytest.approx(closes["2026-09-04"])   # +3d = Fri
         assert row["price_5d"] == pytest.approx(closes["2026-09-04"])   # +5d = Sun → Fri
@@ -275,7 +275,7 @@ class TestOutcomeTracker:
         result = run_outcome_tracker(db=signal_db, now=datetime(2026, 9, 15, tzinfo=timezone.utc))
         assert result.total_filled == 0
         assert result.pending == 1
-        row = lgr.get_signals("AAPL", days=60)[0]
+        row = lgr.get_signals("AAPL", days=3650)[0]
         assert row["price_3d"] is None
         assert row["outcome_status"] is None
 
@@ -286,7 +286,7 @@ class TestOutcomeTracker:
 
         result = run_outcome_tracker(db=signal_db)
         assert result.unevaluable == {"no_store_bars": 1}
-        row = lgr.get_signals("VNA.DE", days=60)[0]
+        row = lgr.get_signals("VNA.DE", days=3650)[0]
         assert row["outcome_status"] == "unevaluable"
         assert row["outcome_note"] == "no_store_bars"
         assert row["price_3d"] is None   # never a fake 0.0
@@ -304,7 +304,7 @@ class TestOutcomeTracker:
 
         result = run_outcome_tracker(db=signal_db)
         assert result.unevaluable == {"sentinel": 1}
-        row = lgr.get_signals("SESSION", days=60)[0]
+        row = lgr.get_signals("SESSION", days=3650)[0]
         assert row["outcome_status"] == "unevaluable"
         assert row["outcome_note"] == "sentinel"
         assert row["price_5d"] is None
@@ -321,7 +321,7 @@ class TestOutcomeTracker:
 
         result = run_outcome_tracker(db=signal_db, now=datetime(2026, 9, 15, 23, tzinfo=timezone.utc))
         assert result.entry_backfilled == 1
-        row = lgr.get_signals("AAPL", days=60)[0]
+        row = lgr.get_signals("AAPL", days=3650)[0]
         closes = {r["date"]: r["close"] for r in signal_db.get_daily_ohlc("AAPL", "2026-08-01", "2026-09-30")}
         assert row["price_at_signal"] == pytest.approx(closes["2026-08-31"])
         assert row["outcome_note"] == "entry_backfilled_from_store"
@@ -334,7 +334,7 @@ class TestOutcomeTracker:
         lgr.log(_make_signal(timestamp=old_ts, ticker="VNA.DE", price_at_signal=30.0))
         result = run_outcome_tracker(db=signal_db, dry_run=True)
         assert result.unevaluable == {"no_store_bars": 1}
-        assert lgr.get_signals("VNA.DE", days=60)[0]["outcome_status"] is None
+        assert lgr.get_signals("VNA.DE", days=3650)[0]["outcome_status"] is None
 
 
 # ── Report tests ─────────────────────────────────────────────────────────
