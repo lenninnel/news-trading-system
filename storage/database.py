@@ -2271,6 +2271,31 @@ class Database:
             logger.warning("get_cached_signal(%s) failed: %s", ticker, exc)
             return None
 
+    @_retry_on_locked
+    def mark_signal_executed(self, signal_event_id: int, trade_id: "str | int | None") -> bool:
+        """Stamp an analysis-session signal_events row as executed.
+
+        The US_OPEN fast path trades on a *cached* US_PRE row
+        (``get_cached_signal``) and never writes a signal_events row of
+        its own, so before 2026-10-28 every executed signal still read
+        ``trade_executed=0`` (KW44 review: 0 of 35 gate-passed Combined
+        signals flagged, 7 real buys).  Called right after a successful
+        ``track_trade``; never raises.
+        """
+        if not signal_event_id:
+            return False
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE signal_events SET trade_executed = 1, "
+                    "trade_id = COALESCE(?, trade_id) WHERE id = ?",
+                    (None if trade_id is None else str(trade_id), int(signal_event_id)),
+                )
+                return cur.rowcount == 1
+        except Exception as exc:
+            logger.warning("mark_signal_executed(%s) failed: %s", signal_event_id, exc)
+            return False
+
     @staticmethod
     def is_price_stale(
         current_price: float,

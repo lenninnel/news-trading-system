@@ -492,6 +492,7 @@ def test_tools_are_directly_importable_coroutines():
         nts_mcp.get_performance,
         nts_mcp.get_status,
         nts_mcp.get_signal_detail,
+        nts_mcp.get_trades,
     ):
         assert inspect.iscoroutinefunction(fn), f"{fn} is not a coroutine"
 
