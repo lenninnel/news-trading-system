@@ -2494,32 +2494,46 @@ class Database:
 # Sector / peer lookups (sourced from config/sector_map.json)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SECTOR_MAP_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "config",
-    "sector_map.json",
+_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config",
 )
+# Tracked seed (git) and the weekly job's output (untracked, gitignored,
+# 2026-11-02).  Until then the Sunday job rewrote the tracked file, which
+# left the VPS checkout dirty and blocked every ``git pull``.
+_SECTOR_MAP_PATH = os.path.join(_CONFIG_DIR, "sector_map.json")
+_SECTOR_MAP_RUNTIME_PATH = os.path.join(_CONFIG_DIR, "runtime", "sector_map.json")
 _SECTOR_MAP_CACHE: dict | None = None
 _SECTOR_MAP_MTIME: float | None = None
+_SECTOR_MAP_SOURCE: str | None = None
+
+
+def _sector_map_source() -> str:
+    """The weekly job's runtime file when present, else the tracked seed."""
+    if os.path.exists(_SECTOR_MAP_RUNTIME_PATH):
+        return _SECTOR_MAP_RUNTIME_PATH
+    return _SECTOR_MAP_PATH
 
 
 def _load_sector_map() -> dict:
     """Load (and memoise) the sector map. Reloads when the file changes on disk."""
-    global _SECTOR_MAP_CACHE, _SECTOR_MAP_MTIME
+    global _SECTOR_MAP_CACHE, _SECTOR_MAP_MTIME, _SECTOR_MAP_SOURCE
+    path = _sector_map_source()
     try:
-        mtime = os.path.getmtime(_SECTOR_MAP_PATH)
+        mtime = os.path.getmtime(path)
     except OSError:
         _SECTOR_MAP_CACHE = {}
         _SECTOR_MAP_MTIME = None
+        _SECTOR_MAP_SOURCE = None
         return _SECTOR_MAP_CACHE
-    if _SECTOR_MAP_CACHE is None or mtime != _SECTOR_MAP_MTIME:
+    if _SECTOR_MAP_CACHE is None or mtime != _SECTOR_MAP_MTIME or path != _SECTOR_MAP_SOURCE:
         try:
-            with open(_SECTOR_MAP_PATH) as fh:
+            with open(path) as fh:
                 _SECTOR_MAP_CACHE = json.load(fh) or {}
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("could not read sector_map.json: %s", exc)
+            logger.warning("could not read %s: %s", path, exc)
             _SECTOR_MAP_CACHE = {}
         _SECTOR_MAP_MTIME = mtime
+        _SECTOR_MAP_SOURCE = path
     return _SECTOR_MAP_CACHE
 
 

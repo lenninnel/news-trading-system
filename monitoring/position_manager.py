@@ -144,7 +144,10 @@ class PositionManager:
         self._signal_logger = SignalLogger(db=db)
 
         # monotonic time of the last account snapshot (see _snapshot_account)
-        self._last_account_snapshot: float = 0.0
+        # -inf, not 0.0: time.monotonic() counts from host boot, so 0.0
+        # suppressed the first snapshot for the first 5 min after a reboot
+        # (2026-11-02).
+        self._last_account_snapshot: float = float("-inf")
 
         # Direct DB handle so we can mark-to-market portfolio_positions every
         # cycle. Without this the EOD P&L summary reads stale current_value
