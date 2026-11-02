@@ -52,8 +52,13 @@ log = logging.getLogger(__name__)
 # ── Paths ────────────────────────────────────────────────────────────────
 CONFIG_DIR = _REPO_ROOT / "config"
 WATCHLIST_PATH = CONFIG_DIR / "watchlist.yaml"
-SECTOR_MAP_PATH = CONFIG_DIR / "sector_map.json"
-CORRELATION_MATRIX_PATH = CONFIG_DIR / "correlation_matrix.json"
+# Output goes to config/runtime/ (gitignored, 2026-11-02).  The tracked
+# config/sector_map.json is only the seed read when no runtime file exists
+# yet; rewriting it every Sunday kept the VPS checkout dirty.
+RUNTIME_DIR = CONFIG_DIR / "runtime"
+SECTOR_MAP_SEED_PATH = CONFIG_DIR / "sector_map.json"
+SECTOR_MAP_PATH = RUNTIME_DIR / "sector_map.json"
+CORRELATION_MATRIX_PATH = RUNTIME_DIR / "correlation_matrix.json"
 
 # ── Tunables ─────────────────────────────────────────────────────────────
 CORRELATION_LOOKBACK_DAYS = 30
@@ -251,10 +256,12 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def load_sector_map() -> dict[str, dict]:
-    if not SECTOR_MAP_PATH.exists():
+    """Runtime map if present, else the tracked seed (first run after deploy)."""
+    path = SECTOR_MAP_PATH if SECTOR_MAP_PATH.exists() else SECTOR_MAP_SEED_PATH
+    if not path.exists():
         return {}
     try:
-        with open(SECTOR_MAP_PATH) as fh:
+        with open(path) as fh:
             return json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
         log.warning("could not parse sector_map.json: %s", exc)

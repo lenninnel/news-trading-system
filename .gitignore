@@ -33,3 +33,6 @@ nts_research/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Runtime output of the weekly sector_correlation job (2026-11-02)
+config/runtime/
