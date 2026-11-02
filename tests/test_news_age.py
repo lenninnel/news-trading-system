@@ -89,7 +89,10 @@ class TestNewsFeedTimestamps:
         assert all(parse_utc(a["fetched_at"]) is not None for a in out)
         assert "2/3 article(s) for AAPL without a usable publishedAt" in caplog.text
 
-    def test_fetch_articles_live_and_both_cache_forms(self):
+    def test_fetch_articles_live_and_both_cache_forms(self, monkeypatch):
+        # Fixed 2026-09-02 timestamps: switch the age window off — this
+        # test is about timestamp plumbing, not hygiene (test_news_hygiene).
+        monkeypatch.setattr("config.settings.NEWS_MAX_AGE_HOURS", 0.0)
         from data.news_feed import _newsapi_cache
         from utils.network_recovery import get_cache
         feed = self._feed()

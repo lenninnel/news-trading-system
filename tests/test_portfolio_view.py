@@ -188,3 +188,19 @@ def test_legacy_db_without_mark_columns_or_snapshots(tmp_path):
     assert v["cash"] == 10000.0 - 1800.0
     assert v["value"] == 1850.0 + 8200.0
     assert v["daily_pnl"] is None
+
+
+def test_no_positions_no_phantom_daily_loss(db):
+    """2026-10-27 prod: 0 positions, TotalCashValue 273,592.20, NetLiq
+    273,974.28 = previous close → view showed −$382 daily P&L.  The
+    difference is broker accruals, not a loss."""
+    db.record_account_snapshot(net_liquidation=273974.28, total_cash=273592.20,
+                               gross_position_value=0.0, prev_day_equity=273974.28,
+                               kind="eod", ts="2026-10-26T22:45:00+00:00")
+    with sqlite3.connect(db.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        v = build_portfolio_view(conn, now=datetime(2026, 10, 27, 7, 15, tzinfo=timezone.utc))
+    assert v["nav"] == pytest.approx(273974.28)
+    assert v["daily_pnl"] == pytest.approx(0.0)
+    assert v["accruals"] == pytest.approx(382.08)
+    assert v["nav_minus_broker"] == pytest.approx(0.0)

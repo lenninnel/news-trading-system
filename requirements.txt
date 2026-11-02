@@ -44,5 +44,5 @@ ib_insync
 nest_asyncio
 
 # ── MCP server (Claude integration) ─────────────────────────────────────────
-mcp
+mcp<2  # 2026-10-28: mcp 2.x renamed FastMCP → MCPServer; nts_mcp.py is v1 code
 httpx

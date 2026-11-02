@@ -214,6 +214,7 @@ def signals(
     limit: int = Query(50, ge=1, le=500),
     ticker: str | None = Query(None),
     days: int = Query(7, ge=1, le=365),
+    strategy: str | None = Query(None),
 ) -> list[dict]:
     clauses = ["timestamp >= ?"]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -222,6 +223,11 @@ def signals(
     if ticker:
         clauses.append("ticker = ?")
         params.append(ticker.upper())
+    # 2026-10-28: server-side strategy filter.  Filtering after LIMIT on
+    # the client capped e.g. "NewsCatalyst, 60 days" at ~2 days of rows.
+    if strategy:
+        clauses.append("UPPER(COALESCE(strategy, '')) = ?")
+        params.append(strategy.upper())
 
     where = "WHERE " + " AND ".join(clauses)
 
@@ -279,13 +285,28 @@ def portfolio() -> dict:
 
 
 @app.get("/api/trades")
-def trades(limit: int = Query(default=50, ge=1, le=200)) -> dict:
-    """Return closed trade history from the trade_history table."""
-    rows = _query(
-        "SELECT ticker, action, shares, price, stop_loss, take_profit, pnl, created_at "
-        "FROM trade_history ORDER BY id DESC LIMIT ?",
-        (limit,),
-    )
+def trades(
+    limit: int = Query(default=50, ge=1, le=200),
+    days: int | None = Query(default=None, ge=1, le=3650),
+) -> dict:
+    """Return trade history (BUY and SELL rows) from trade_history.
+
+    ``days`` (optional, 2026-10-28) restricts to rows created in the last
+    N days; omitted = no time filter (previous behaviour).
+    """
+    if days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = _query(
+            "SELECT ticker, action, shares, price, stop_loss, take_profit, pnl, created_at "
+            "FROM trade_history WHERE created_at >= ? ORDER BY id DESC LIMIT ?",
+            (cutoff, limit),
+        )
+    else:
+        rows = _query(
+            "SELECT ticker, action, shares, price, stop_loss, take_profit, pnl, created_at "
+            "FROM trade_history ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
     trade_list = []
     for r in rows:
         shares = r.get("shares", 0)
