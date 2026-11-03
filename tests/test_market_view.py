@@ -51,6 +51,7 @@ def test_market_view(conn):
     (row,) = m["tickers"]
     assert row["ticker"] == "AAA" and row["held"] and row["regime"] == "TRENDING_UP"
     assert row["latest_signal"]["signal"] == "HOLD"
+    assert row["position"]["stop_loss"] == 110.0 and row["position"]["entry"] == 120.0
 
 
 def test_ticker_chart(conn):

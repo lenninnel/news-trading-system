@@ -145,6 +145,42 @@ def _held(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute(f"SELECT ticker FROM portfolio_positions WHERE {qty} > 0")}
 
 
+def _position_levels(open_lots: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Entry (share-weighted), first entry date and the latest stop/target
+    of the BUY lots since the last SELL."""
+    if not open_lots:
+        return None
+    sh = sum(l["shares"] or 0 for l in open_lots)
+    cost = sum((l["shares"] or 0) * (l["price"] or 0) for l in open_lots)
+    last = open_lots[-1]
+    return {
+        "shares": sh,
+        "entry": _r(cost / sh, 2) if sh else None,
+        "entry_date": open_lots[0]["date"],
+        "stop_loss": last["stop_loss"],
+        "take_profit": last["take_profit"],
+    }
+
+
+def _open_lots_all(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    if "trade_history" not in _tables(conn):
+        return {}
+    lots: dict[str, list[dict[str, Any]]] = {}
+    for t, action, shares, price, stop, tp, ts in conn.execute(
+        "SELECT ticker, action, shares, price, stop_loss, take_profit, created_at "
+        "FROM trade_history ORDER BY created_at, id"
+    ):
+        a = (action or "").upper()
+        if a == "BUY":
+            lots.setdefault(t, []).append({
+                "shares": shares, "price": price, "date": (ts or "")[:10],
+                "stop_loss": _r(stop, 2), "take_profit": _r(tp, 2),
+            })
+        elif a == "SELL":
+            lots.pop(t, None)
+    return lots
+
+
 def build_market_view(
     conn: sqlite3.Connection,
     benchmarks=("SPY", "QQQ"),
@@ -168,6 +204,7 @@ def build_market_view(
     since = (now - timedelta(days=5)).isoformat()
     sigs = _latest_signals(conn, since)
     regimes = _ticker_regimes(conn, since)
+    lots = _open_lots_all(conn)
 
     rows = []
     for t in names:
@@ -177,6 +214,7 @@ def build_market_view(
             "ticker": t,
             **block,
             "held": t in held,
+            "position": _position_levels(lots.get(t, [])) if t in held else None,
             "regime": regimes.get(t),
             "latest_signal": sigs.get(t),
         })
@@ -268,18 +306,7 @@ def build_ticker_chart(
                 best[s["date"]] = s
         signals = [best[d] for d in sorted(best)]
 
-    position = None
-    if open_lots and ticker in _held(conn):
-        sh = sum(l["shares"] or 0 for l in open_lots)
-        cost = sum((l["shares"] or 0) * (l["price"] or 0) for l in open_lots)
-        last = open_lots[-1]
-        position = {
-            "shares": sh,
-            "entry": _r(cost / sh, 2) if sh else None,
-            "entry_date": open_lots[0]["date"],
-            "stop_loss": last["stop_loss"],
-            "take_profit": last["take_profit"],
-        }
+    position = _position_levels(open_lots) if ticker in _held(conn) else None
 
     return {
         "ticker": ticker,
