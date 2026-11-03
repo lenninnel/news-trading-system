@@ -41,6 +41,20 @@ NEWSAPI_URL: str = "https://newsapi.org/v2/everything"
 MAX_HEADLINES: int = 10
 
 # ---------------------------------------------------------------------------
+# Performance reporting (2026-11-03)
+# ---------------------------------------------------------------------------
+# Benchmarks stored in daily_ohlc next to the US-20 universe, but never part
+# of the trading universe or its freshness gate.
+BENCHMARK_TICKERS: list[str] = [
+    t.strip().upper()
+    for t in os.environ.get("BENCHMARK_TICKERS", "SPY,QQQ").split(",")
+    if t.strip()
+]
+# First day of the IBKR paper account (the Alpaca-era $10k/$98k test balances
+# before it are not part of the track record).
+NTS_INCEPTION_DATE: str = os.environ.get("NTS_INCEPTION_DATE", "2026-05-04")
+
+# ---------------------------------------------------------------------------
 # News input hygiene (2026-10-28, KW44 review)
 # ---------------------------------------------------------------------------
 # The KW44 review found NewsCatalyst voting on headlines that were on

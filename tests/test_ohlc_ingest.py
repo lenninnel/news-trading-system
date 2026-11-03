@@ -480,3 +480,29 @@ def test_run_stamps_source_on_rows(tmp_db, monkeypatch):
     assert rc == 0 and alerts == []
     row = tmp_db.get_daily_ohlc("AAPL", fresh_day, fresh_day)[0]
     assert row["source"] == "alpaca"
+
+
+def test_benchmarks_are_ingested_but_not_fatal(monkeypatch):
+    """SPY/QQQ land in daily_ohlc for the performance page; a failure is
+    reported, never fatal, and they are not part of the US-20 universe."""
+    import scripts.ingest_ohlc as ing
+
+    class Feed:
+        def get_daily_aggs(self, t, s, e):
+            if t == "QQQ":
+                raise RuntimeError("boom")
+            return [{"date": "2026-11-02", "open": 1, "high": 2, "low": 1, "close": 2,
+                     "adj_close": 2, "volume": 1}]
+
+    class DB:
+        rows = []
+        def upsert_daily_ohlc(self, bars):
+            self.rows.extend(bars)
+            return len(bars)
+
+    monkeypatch.setattr(ing, "BENCHMARK_TICKERS", ["SPY", "QQQ"])
+    db = DB()
+    failed = ing.ingest_benchmarks(Feed(), db, "alpaca", "2026-11-01", "2026-11-02")
+    assert failed == ["QQQ"]
+    assert [r["ticker"] for r in db.rows] == ["SPY"]
+    assert "SPY" not in ing.build_us20_universe()
