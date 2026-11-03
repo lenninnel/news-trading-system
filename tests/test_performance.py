@@ -115,3 +115,14 @@ def test_empty_db_is_safe(tmp_path):
     c = sqlite3.connect(db.db_path)
     s = build_performance_summary(c)
     assert s["nav_points"] == 0 and s["returns"]["portfolio"]["inception"] is None
+
+
+def test_returns_end_on_last_common_day_when_benchmark_lags(conn):
+    # Today's benchmark bar is not ingested yet; the live NAV is.
+    conn.execute("DELETE FROM daily_ohlc WHERE date = '2026-11-03'")
+    conn.commit()
+    s = build_performance_summary(conn, live_nav=123_456.0, now=datetime(2026, 11, 3, 18, tzinfo=timezone.utc))
+    assert s["current_nav"] == 123_456.0 and s["current_date"] == "2026-11-03"
+    assert s["returns_as_of"] == "2026-11-02"
+    assert s["returns"]["portfolio"]["1w"]["end"] != 123_456.0
+    assert s["returns"]["SPY"]["1w"]["end_date"] == "2026-11-02"
