@@ -382,7 +382,20 @@ def build_performance_summary(
     closes = benchmark_closes(conn, benchmarks, (_parse_day(inception) - timedelta(days=10)).isoformat())
     bench_series = {t: sorted(c.items()) for t, c in closes.items()}
 
-    returns = {"portfolio": period_returns(pts, inception)}
+    # 2026-11-03: compare over identical end dates.  Today's NAV is live,
+    # today's benchmark bar only arrives with the 22:30 UTC ingest; until
+    # then the returns table ends at the last day all series share.  The
+    # header numbers (current_nav) stay live.
+    last_bench = [s[-1][0] for s in bench_series.values() if s]
+    returns_as_of = pts[-1][0] if pts else None
+    pts_cmp = pts
+    if pts and last_bench:
+        cut = min(min(last_bench), pts[-1][0])
+        trimmed = [p for p in pts if p[0] <= cut]
+        if len(trimmed) >= 2:
+            pts_cmp, returns_as_of = trimmed, trimmed[-1][0]
+
+    returns = {"portfolio": period_returns(pts_cmp, inception)}
     for t, ser in bench_series.items():
         # Benchmark periods use the portfolio's own base and end dates so the
         # comparison covers the identical window.
@@ -392,7 +405,7 @@ def build_performance_summary(
                 br[key] = None
                 continue
             b0 = _value_on_or_before(ser, pr["start_date"])
-            b1 = _value_on_or_before(ser, pts[-1][0])
+            b1 = _value_on_or_before(ser, pts_cmp[-1][0])
             br[key] = (
                 {"start_date": b0[0], "end_date": b1[0], "return": _r(b1[1] / b0[1] - 1)}
                 if b0 and b1 and b0[0] != b1[0] else None
@@ -409,6 +422,7 @@ def build_performance_summary(
         "current_date": pts[-1][0] if pts else None,
         "nav_points": len(pts),
         "returns": returns,
+        "returns_as_of": returns_as_of,
         "drawdown": dd,
         "drawdown_series": dd_series,
         "risk": risk_stats(pts, bench_series.get("SPY")),

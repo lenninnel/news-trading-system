@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from analytics.market_view import build_market_view, build_ticker_chart  # noqa: E402
 from analytics.performance import build_equity_history, build_performance_summary  # noqa: E402
 from analytics.portfolio_view import build_portfolio_view, open_readonly  # noqa: E402
 from config.settings import BENCHMARK_TICKERS, DB_PATH, NTS_INCEPTION_DATE  # noqa: E402
@@ -321,6 +322,30 @@ def performance_summary() -> dict:
             conn, inception=NTS_INCEPTION_DATE,
             benchmarks=tuple(BENCHMARK_TICKERS), live_nav=live,
         )
+    finally:
+        conn.close()
+
+
+@app.get("/api/market")
+def market() -> dict:
+    """Benchmarks, market regime and per-ticker overview (2026-11-03).
+    See analytics/market_view.py."""
+    conn = _open_ro()
+    try:
+        return build_market_view(conn, benchmarks=tuple(BENCHMARK_TICKERS))
+    finally:
+        conn.close()
+
+
+@app.get("/api/chart/{ticker}")
+def chart(ticker: str, days: int = Query(365, ge=30, le=1825)) -> dict:
+    """Daily bars + trades + Combined BUY-type signals + open position
+    levels for one ticker (2026-11-03)."""
+    if not ticker.replace(".", "").replace("-", "").isalnum() or len(ticker) > 12:
+        raise HTTPException(status_code=400, detail="invalid ticker")
+    conn = _open_ro()
+    try:
+        return build_ticker_chart(conn, ticker, days=days)
     finally:
         conn.close()
 
