@@ -125,3 +125,22 @@ def test_mcp_signals_http_sends_strategy(monkeypatch):
     monkeypatch.setattr(nts_mcp.httpx, "AsyncClient", _Client)
     asyncio.run(nts_mcp.get_signals(days=60, strategy="NewsCatalyst"))
     assert seen["params"]["strategy"] == "NewsCatalyst"
+
+
+def test_mcp_track_record_sqlite(db_path):
+    out = asyncio.run(nts_mcp.get_track_record())
+    # fixture has no NAV history → explicit message, no crash
+    assert "No track record" in out or "Track record since" in out
+
+
+def test_api_performance_fills_dashboard_fields(db_path):
+    perf = api_main.performance()
+    for k in ("avg_confidence", "buy_today", "weak_buy_today", "hold_today"):
+        assert k in perf
+
+
+def test_api_performance_summary_and_history_shape(db_path):
+    s = api_main.performance_summary()
+    assert {"returns", "drawdown", "risk", "trades", "monthly"} <= set(s)
+    h = api_main.equity_history()
+    assert "points" in h and "benchmarks" in h

@@ -26,8 +26,9 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from analytics.performance import build_equity_history, build_performance_summary  # noqa: E402
 from analytics.portfolio_view import build_portfolio_view, open_readonly  # noqa: E402
-from config.settings import DB_PATH  # noqa: E402
+from config.settings import BENCHMARK_TICKERS, DB_PATH, NTS_INCEPTION_DATE  # noqa: E402
 from config.sessions import SCHEDULE as _SCHEDULE  # noqa: E402
 from config.sessions import (  # noqa: E402
     last_session_run,
@@ -284,6 +285,46 @@ def portfolio() -> dict:
         conn.close()
 
 
+def _open_ro() -> sqlite3.Connection:
+    try:
+        return open_readonly(_DB_PATH)
+    except sqlite3.Error as exc:
+        logger.warning("cannot open DB read-only (%s)", exc)
+        return sqlite3.connect(_DB_PATH)
+
+
+@app.get("/api/equity-history")
+def equity_history() -> dict:
+    """Daily NAV since inception + SPY/QQQ rebased to 100 on the first NAV day.
+
+    See analytics/performance.py for how the series is built (2026-11-03).
+    """
+    conn = _open_ro()
+    try:
+        live = build_portfolio_view(conn).get("nav")
+        return build_equity_history(
+            conn, inception=NTS_INCEPTION_DATE,
+            benchmarks=tuple(BENCHMARK_TICKERS), live_nav=live,
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/api/performance-summary")
+def performance_summary() -> dict:
+    """Period returns vs benchmarks, drawdown, risk ratios, monthly returns,
+    closed-trade statistics and exposure (2026-11-03)."""
+    conn = _open_ro()
+    try:
+        live = build_portfolio_view(conn).get("nav")
+        return build_performance_summary(
+            conn, inception=NTS_INCEPTION_DATE,
+            benchmarks=tuple(BENCHMARK_TICKERS), live_nav=live,
+        )
+    finally:
+        conn.close()
+
+
 @app.get("/api/trades")
 def trades(
     limit: int = Query(default=50, ge=1, le=200),
@@ -375,9 +416,27 @@ def performance() -> dict:
     )
     sessions_today = len(sessions_rows)
 
+    # 2026-11-03: fields the dashboard KPI cards read but the endpoint never
+    # returned (AVG CONFIDENCE always showed 0 %).  From today's Combined
+    # rows in signal_events, the table every session writes.
+    combined_today = _query(
+        "SELECT signal, confidence FROM signal_events "
+        "WHERE strategy = 'Combined' AND date(timestamp) = date(?)",
+        (today_str,),
+    )
+    confs = [r["confidence"] for r in combined_today if r.get("confidence") is not None]
+    avg_confidence = round(sum(confs) / len(confs) * 100, 1) if confs else None
+    weak_buy_today = sum(1 for r in combined_today if (r.get("signal") or "") == "WEAK BUY")
+    buy_today = sum(1 for r in combined_today if (r.get("signal") or "") == "BUY")
+    hold_today = sum(1 for r in combined_today if (r.get("signal") or "") == "HOLD")
+
     return {
         "total_trades": total_trades,
         "win_rate": win_rate,
+        "avg_confidence": avg_confidence,
+        "buy_today": buy_today,
+        "weak_buy_today": weak_buy_today,
+        "hold_today": hold_today,
         "sharpe": None,
         "max_drawdown": None,
         "signals_today": signals_today,

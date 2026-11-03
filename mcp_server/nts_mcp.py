@@ -361,6 +361,68 @@ def _format_trades(rows: list[dict], days: int) -> str:
     return "\n".join(lines)
 
 
+async def _fetch_track_record() -> dict:
+    if _http_mode():
+        data = await _api_get("/api/performance-summary")
+        return data if isinstance(data, dict) else {}
+    try:
+        from analytics.performance import build_performance_summary
+        from analytics.portfolio_view import build_portfolio_view, open_readonly
+        from config.settings import BENCHMARK_TICKERS, NTS_INCEPTION_DATE
+    except Exception as exc:  # pragma: no cover - import guard
+        log.warning("track record: imports failed: %s", exc)
+        return {}
+    path = _resolve_db_path()
+    try:
+        conn = open_readonly(path)
+    except sqlite3.Error:
+        return {}
+    try:
+        live = build_portfolio_view(conn).get("nav")
+        return build_performance_summary(
+            conn, inception=NTS_INCEPTION_DATE,
+            benchmarks=tuple(BENCHMARK_TICKERS), live_nav=live,
+        )
+    finally:
+        conn.close()
+
+
+def _pct(v: Any) -> str:
+    return "n/a" if v is None else f"{v * 100:+.2f}%"
+
+
+def _format_track_record(d: dict) -> str:
+    if not d or not d.get("nav_points"):
+        return "No track record available."
+    r = d.get("returns", {})
+    names = [k for k in r if k != "portfolio"]
+    head = f"  {'period':<10}{'NTS':>10}" + "".join(f"{n:>10}" for n in names)
+    lines = [
+        f"Track record since {d.get('inception')} (NAV ${d.get('inception_nav'):,.2f} → "
+        f"${d.get('current_nav'):,.2f} on {d.get('current_date')}, {d.get('nav_points')} daily points)\n",
+        head,
+    ]
+    for key in ("1w", "1m", "3m", "6m", "ytd", "inception"):
+        p = (r.get("portfolio") or {}).get(key)
+        row = f"  {key:<10}{_pct(p and p.get('return')):>10}"
+        for n in names:
+            b = (r.get(n) or {}).get(key)
+            row += f"{_pct(b and b.get('return')):>10}"
+        lines.append(row)
+    dd, rk, tr = d.get("drawdown", {}), d.get("risk", {}), d.get("trades", {})
+    lines += [
+        "",
+        f"  Max drawdown {_pct(dd.get('max_drawdown'))} ({dd.get('max_drawdown_peak_date')} → "
+        f"{dd.get('max_drawdown_trough_date')}), current {_pct(dd.get('current_drawdown'))}",
+        f"  Volatility {_pct(rk.get('volatility'))} p.a., Sharpe {rk.get('sharpe')}, "
+        f"Sortino {rk.get('sortino')}, beta vs SPY {rk.get('beta')}",
+        f"  Closed trades {tr.get('closed_trades')}, win rate {_pct(tr.get('win_rate'))}, "
+        f"profit factor {tr.get('profit_factor')}, expectancy ${tr.get('expectancy')}, "
+        f"avg hold {tr.get('avg_holding_days')} d",
+    ]
+    return "\n".join(lines)
+
+
 async def _fetch_performance() -> dict:
     if _http_mode():
         data = await _api_get("/api/performance")
@@ -791,6 +853,17 @@ async def get_trades(days: int = 30, limit: int = 100) -> str:
     except httpx.HTTPError as exc:
         return _http_error(exc)
     return _format_trades(rows, days)
+
+
+@server.tool()
+async def get_track_record() -> str:
+    """Track record since inception: period returns (1W–inception) vs SPY/QQQ,
+    drawdown, volatility, Sharpe/Sortino, beta and closed-trade statistics."""
+    try:
+        data = await _fetch_track_record()
+    except httpx.HTTPError as exc:
+        return _http_error(exc)
+    return _format_track_record(data)
 
 
 @server.tool()

@@ -75,6 +75,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from config.settings import (  # noqa: E402
+    BENCHMARK_TICKERS,
     OHLC_BACKFILL_YEARS,
     OHLC_EXTREME_MOVE_PCT,
     OHLC_SOURCE,
@@ -262,7 +263,31 @@ def build_feed(source: str):
 # Main
 # ---------------------------------------------------------------------------
 
-def run(mode: str, years: int | None = None) -> int:
+def ingest_benchmarks(feed, db, source: str, start: str, end: str) -> list[str]:
+    """Upsert BENCHMARK_TICKERS (SPY, QQQ) into daily_ohlc.
+
+    Reporting only (performance page): not part of the US-20 universe, the
+    freshness gate or any strategy.  Failures are logged and returned, never
+    fatal for the trading data.  2026-11-03.
+    """
+    failed: list[str] = []
+    for ticker in BENCHMARK_TICKERS:
+        try:
+            bars = feed.get_daily_aggs(ticker, start, end)
+        except Exception as exc:
+            logger.warning("benchmark %s fetch failed: %s", ticker, exc)
+            failed.append(ticker)
+            continue
+        for b in bars or []:
+            b["ticker"] = ticker
+            b["source"] = source
+        bars, _ = flag_bars(bars or [], OHLC_EXTREME_MOVE_PCT)
+        n = db.upsert_daily_ohlc(bars) if bars else 0
+        logger.info("benchmark %s: upserted %d rows", ticker, n)
+    return failed
+
+
+def run(mode: str, years: int | None = None, benchmarks_only: bool = False) -> int:
     source = OHLC_SOURCE
     try:
         feed = build_feed(source)
@@ -293,6 +318,10 @@ def run(mode: str, years: int | None = None) -> int:
     logger.info("Date range: %s..%s (mode=%s)", start, end, mode)
 
     db = Database()
+
+    if benchmarks_only:
+        failed = ingest_benchmarks(feed, db, source, start, end)
+        return 1 if failed else 0
 
     total_rows = 0
     total_flagged = 0
@@ -344,6 +373,10 @@ def run(mode: str, years: int | None = None) -> int:
         for t, d, f in flagged_detail:
             logger.info("  %s %s %s", t, d, f)
 
+    bench_failed = ingest_benchmarks(feed, db, source, start, end)
+    if bench_failed:
+        logger.warning("benchmark fetch failed for %s (reporting only, run continues)", bench_failed)
+
     expected, stale = check_freshness(db, universe, end)
     if stale:
         stale_str = ", ".join(f"{t}={d or 'no rows'}" for t, d in stale)
@@ -383,6 +416,11 @@ def main(argv: list[str] | None = None) -> int:
             "Ignored in --incremental mode; the nightly path is unaffected."
         ),
     )
+    parser.add_argument(
+        "--benchmarks-only", action="store_true",
+        help="Only fetch BENCHMARK_TICKERS (SPY, QQQ) for the chosen window; "
+             "the US-20 universe and its freshness gate are untouched.",
+    )
     args = parser.parse_args(argv)
     if args.years is not None and args.years <= 0:
         parser.error("--years must be a positive integer")
@@ -390,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--years is only valid with --backfill")
     mode = "backfill" if args.backfill else "incremental"
     try:
-        return run(mode, years=args.years)
+        return run(mode, years=args.years, benchmarks_only=args.benchmarks_only)
     except Exception as exc:
         logger.exception("Ingest crashed")
         _alert_failure(f"crashed with {type(exc).__name__}: {exc}")
