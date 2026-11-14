@@ -541,6 +541,30 @@ def test_api_base_strips_trailing_slash(monkeypatch):
     assert nts_mcp._api_base() == "http://example.test:8001"
 
 
+def test_api_base_defaults_to_loopback_when_env_unset(monkeypatch):
+    """Unset NTS_API_URL → SQLite mode, and the base falls back to loopback
+    (no public server address is baked into the module)."""
+    monkeypatch.delenv("NTS_API_URL", raising=False)
+    assert nts_mcp._http_mode() is False
+    assert nts_mcp._api_base() == "http://127.0.0.1:8001"
+    assert nts_mcp._api_base() == nts_mcp.DEFAULT_API_URL
+
+
+def test_api_base_env_overrides_default(monkeypatch):
+    monkeypatch.setenv("NTS_API_URL", "http://nts-vps:8001")
+    assert nts_mcp._http_mode() is True
+    assert nts_mcp._api_base() == "http://nts-vps:8001"
+    assert nts_mcp._api_base() != nts_mcp.DEFAULT_API_URL
+
+
+def test_module_docstring_has_no_hardcoded_public_ip():
+    import re
+    doc = nts_mcp.__doc__ or ""
+    public = [ip for ip in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", doc)
+              if not ip.startswith("127.")]
+    assert public == []
+
+
 # ── HTTP-mode tests ──────────────────────────────────────────────────────
 #
 # Pattern: set NTS_API_URL, then monkeypatch httpx.AsyncClient with a
