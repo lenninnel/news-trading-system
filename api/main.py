@@ -5,6 +5,13 @@ Serves as the bridge between the trading bot and the React dashboard.
 All endpoints are GET-only — the API never controls the trading system.
 
 Start:  uvicorn api.main:app --host 0.0.0.0 --port 8001
+
+Environment
+-----------
+    NTS_CORS_ORIGINS  Comma-separated list of browser origins allowed to
+                      call the API (e.g. ``http://nts-vps:3000``). When
+                      unset only the local dev origins on port 3000 are
+                      allowed and a WARNING is logged at startup.
 """
 
 from __future__ import annotations
@@ -45,14 +52,37 @@ _START_TIME = time.monotonic()
 
 app = FastAPI(title="News Trading API", version="1.0.0")
 
+# Dev-only fallback. Every deployed origin (Tailscale name, VPS host, hosted
+# dashboard) must come from NTS_CORS_ORIGINS — no server address is
+# hard-coded here so the repo stays free of infrastructure details.
+DEFAULT_CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+
+def _cors_origins() -> list[str]:
+    """Return the allowed CORS origins.
+
+    Reads ``NTS_CORS_ORIGINS`` (comma-separated; blanks and surrounding
+    whitespace are ignored). Falls back to :data:`DEFAULT_CORS_ORIGINS`
+    and logs a WARNING when the variable is unset or empty, so a
+    deployment that forgot to set it is visible in the journal.
+    """
+    raw = os.environ.get("NTS_CORS_ORIGINS", "")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if origins:
+        return origins
+    logger.warning(
+        "NTS_CORS_ORIGINS is not set — CORS allows only %s. "
+        "Set NTS_CORS_ORIGINS=<origin>[,<origin>...] for the dashboard host.",
+        ", ".join(DEFAULT_CORS_ORIGINS),
+    )
+    return list(DEFAULT_CORS_ORIGINS)
+
+
+_CORS_ORIGINS = _cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "https://news-trading-system-production.up.railway.app",
-        "http://195.201.124.154:3000",
-    ],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET"],
     allow_headers=["*"],

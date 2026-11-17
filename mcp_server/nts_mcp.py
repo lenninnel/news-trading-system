@@ -12,7 +12,7 @@ Backend selection
   The tools make async ``httpx`` calls against the NTS FastAPI service
   (``api.main``). This is the mode Claude Desktop runs in: it spawns
   the server in stdio transport on the Mac and points it at the live
-  Hetzner API at ``http://195.201.124.154:8001``, so tools read the
+  VPS API over Tailscale (``http://nts-vps:8001``), so tools read the
   *production* database without needing a local SQLite copy.
 
 * ``NTS_API_URL`` unset  → SQLite mode.
@@ -37,7 +37,9 @@ Usage as a server
 Environment
 -----------
     NTS_API_URL   Base URL of the NTS FastAPI service. When set, every
-                  tool uses HTTP (httpx) instead of SQLite.
+                  tool uses HTTP (httpx) instead of SQLite. Unset →
+                  SQLite mode; ``_api_base()`` then falls back to
+                  ``DEFAULT_API_URL`` (loopback :8001) for ad-hoc use.
     DB_PATH       SQLite path (SQLite mode only). Defaults to
                   config.settings.DB_PATH, then to a project-root fallback.
     NTS_MCP_PORT  Override SSE port at runtime.
@@ -74,6 +76,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 # deployment/nts-mcp.service.
 DEFAULT_SSE_PORT = 8003
 
+# Fallback API base when NTS_API_URL is unset. The API binds :8001 on the
+# same host, so loopback is the only address that is safe to bake in.
+DEFAULT_API_URL = "http://127.0.0.1:8001"
+
 # HTTP client timeout (seconds). 15 is generous — the FastAPI endpoints are
 # all read-only SQLite queries so they return in sub-second under load.
 HTTP_TIMEOUT = 15
@@ -103,8 +109,13 @@ def _http_mode() -> bool:
 
 
 def _api_base() -> str:
-    """Return the configured API base URL with any trailing slash trimmed."""
-    return os.environ.get("NTS_API_URL", "").strip().rstrip("/")
+    """Return the API base URL with any trailing slash trimmed.
+
+    ``NTS_API_URL`` when set, otherwise :data:`DEFAULT_API_URL`. Backend
+    selection is *not* affected by the fallback — see :func:`_http_mode`.
+    """
+    configured = os.environ.get("NTS_API_URL", "").strip()
+    return (configured or DEFAULT_API_URL).rstrip("/")
 
 
 # ── HTTP helper ──────────────────────────────────────────────────────────
@@ -126,7 +137,7 @@ async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
 
 def _http_error(exc: Exception) -> str:
     """Convert an httpx exception into a friendly single-line MCP error."""
-    base = _api_base() or "<unset>"
+    base = _api_base()
     if isinstance(exc, httpx.ConnectError):
         return f"Error: cannot reach NTS API at {base} — connection refused."
     if isinstance(exc, httpx.TimeoutException):
